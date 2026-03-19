@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+
+   <!-- ========== View Category ========== -->
+   <extension point="org.eclipse.ui.views">
+      <category
+         id="com.anthropic.eclipse.claude"
+         name="Claude AI">
+      </category>
+   </extension>
+
+   <!-- ========== Views ========== -->
+   <extension point="org.eclipse.ui.views">
+      <!-- NEW: Main Claude Code Conversation View -->
+      <view
+         id="com.anthropic.eclipse.claude.views.ClaudeConversationView"
+         name="Claude Code"
+         class="com.anthropic.eclipse.claude.views.ClaudeConversationView"
+         category="com.anthropic.eclipse.claude"
+         icon="icons/claude.png"
+         allowMultiple="true">
+      </view>
+      <!-- Legacy: Chat View (kept for compatibility) -->
+      <view
+         id="com.anthropic.eclipse.claude.views.ClaudeChatView"
+         name="Claude AI Chat (Legacy)"
+         class="com.anthropic.eclipse.claude.views.ClaudeChatView"
+         category="com.anthropic.eclipse.claude"
+         icon="icons/claude.png"
+         allowMultiple="false">
+      </view>
+      <!-- Legacy: CLI View (kept for compatibility) -->
+      <view
+         id="com.anthropic.eclipse.claude.cli.ClaudeCodeView"
+         name="Claude Code CLI (Legacy)"
+         class="com.anthropic.eclipse.claude.cli.ClaudeCodeView"
+         category="com.anthropic.eclipse.claude"
+         icon="icons/claude.png"
+         allowMultiple="false">
+      </view>
+   </extension>
+
+   <!-- ========== Commands ========== -->
+   <extension point="org.eclipse.ui.commands">
+      <!-- New unified commands -->
+      <command
+         id="com.anthropic.eclipse.claude.commands.openConversation"
+         name="Open Claude Code"
+         description="Open Claude Code conversation panel">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.newSession"
+         name="New Claude Session"
+         description="Start a new Claude conversation">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.resumeSession"
+         name="Resume Claude Session"
+         description="Resume a previous conversation">
+      </command>
+      <!-- Existing commands (kept) -->
+      <command
+         id="com.anthropic.eclipse.claude.commands.openChat"
+         name="Open Claude Chat (Legacy)"
+         description="Open Claude AI Chat panel">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.sendSelection"
+         name="Send Selection to Claude"
+         description="Send selected code to Claude for analysis">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.explainCode"
+         name="Explain Code"
+         description="Ask Claude to explain selected code">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.reviewCode"
+         name="Review Code"
+         description="Ask Claude to review selected code">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.refactorCode"
+         name="Refactor with Claude (Diff View)"
+         description="Ask Claude to refactor code and show result in diff viewer">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.openCLI"
+         name="Open Claude Code CLI (Legacy)"
+         description="Open the Claude Code CLI panel">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.runCLIOnFile"
+         name="Run Claude Code on File"
+         description="Run Claude Code CLI analysis on current file">
+      </command>
+      <command
+         id="com.anthropic.eclipse.claude.commands.focusToggle"
+         name="Toggle Claude Code Focus"
+         description="Toggle keyboard focus between the active editor and the Claude Code panel">
+      </command>
+   </extension>
+
+   <!-- ========== Handlers ========== -->
+   <extension point="org.eclipse.ui.handlers">
+      <!-- New handlers -->
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.openConversation"
+         class="com.anthropic.eclipse.claude.handlers.OpenConversationHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.newSession"
+         class="com.anthropic.eclipse.claude.handlers.NewSessionHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.resumeSession"
+         class="com.anthropic.eclipse.claude.handlers.ResumeSessionHandler">
+      </handler>
+      <!-- Existing handlers (kept) -->
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.openChat"
+         class="com.anthropic.eclipse.claude.handlers.OpenChatHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.sendSelection"
+         class="com.anthropic.eclipse.claude.handlers.SendSelectionHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.explainCode"
+         class="com.anthropic.eclipse.claude.handlers.ExplainCodeHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.reviewCode"
+         class="com.anthropic.eclipse.claude.handlers.ReviewCodeHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.refactorCode"
+         class="com.anthropic.eclipse.claude.handlers.RefactorCodeHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.openCLI"
+         class="com.anthropic.eclipse.claude.handlers.OpenCLIViewHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.runCLIOnFile"
+         class="com.anthropic.eclipse.claude.handlers.RunCLIOnFileHandler">
+      </handler>
+      <handler
+         commandId="com.anthropic.eclipse.claude.commands.focusToggle"
+         class="com.anthropic.eclipse.claude.handlers.FocusToggleHandler">
+      </handler>
+   </extension>
+
+   <!-- ========== Key Bindings ========== -->
+   <extension point="org.eclipse.ui.bindings">
+      <key
+         commandId="com.anthropic.eclipse.claude.commands.openConversation"
+         schemeId="org.eclipse.ui.defaultAcceleratorConfiguration"
+         sequence="M1+M2+C">
+      </key>
+      <key
+         commandId="com.anthropic.eclipse.claude.commands.sendSelection"
+         schemeId="org.eclipse.ui.defaultAcceleratorConfiguration"
+         sequence="M1+M2+S">
+      </key>
+      <key
+         commandId="com.anthropic.eclipse.claude.commands.refactorCode"
+         schemeId="org.eclipse.ui.defaultAcceleratorConfiguration"
+         sequence="M1+M2+R">
+      </key>
+      <key
+         commandId="com.anthropic.eclipse.claude.commands.openCLI"
+         schemeId="org.eclipse.ui.defaultAcceleratorConfiguration"
+         sequence="M1+M2+L">
+      </key>
+      <key
+         commandId="com.anthropic.eclipse.claude.commands.focusToggle"
+         schemeId="org.eclipse.ui.defaultAcceleratorConfiguration"
+         sequence="M1+ESCAPE">
+      </key>
+   </extension>
+
+   <!-- ========== Menus ========== -->
+   <extension point="org.eclipse.ui.menus">
+      <!-- Context Menu (right-click in editor) -->
+      <menuContribution locationURI="popup:org.eclipse.ui.popup.any?after=additions">
+         <menu id="com.anthropic.eclipse.claude.contextmenu" label="Claude Code" icon="icons/claude.png">
+            <command commandId="com.anthropic.eclipse.claude.commands.sendSelection"    label="Ask Claude about Selection"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.explainCode"      label="Explain this Code"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.reviewCode"       label="Review this Code"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.refactorCode"     label="Refactor with Diff View..."/>
+            <separator name="sep1"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.openConversation" label="Open Claude Code Panel"/>
+         </menu>
+      </menuContribution>
+
+      <!-- Main Menu Bar -->
+      <menuContribution locationURI="menu:org.eclipse.ui.main.menu?after=additions">
+         <menu id="com.anthropic.eclipse.claude.mainmenu" label="Claude Code">
+            <command commandId="com.anthropic.eclipse.claude.commands.openConversation" label="Open Claude Code Panel"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.newSession"       label="New Session"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.resumeSession"    label="Resume Session"/>
+            <separator name="sep1"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.sendSelection"    label="Send Selection"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.explainCode"      label="Explain Code"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.reviewCode"       label="Review Code"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.refactorCode"     label="Refactor + Diff View..."/>
+            <separator name="sep2"/>
+            <command commandId="com.anthropic.eclipse.claude.commands.runCLIOnFile"     label="Run Claude Code on Current File"/>
+         </menu>
+      </menuContribution>
+
+      <!-- Toolbar -->
+      <menuContribution locationURI="toolbar:org.eclipse.ui.main.toolbar?after=additions">
+         <toolbar id="com.anthropic.eclipse.claude.toolbar">
+            <command
+               commandId="com.anthropic.eclipse.claude.commands.openConversation"
+               icon="icons/claude.png"
+               tooltip="Open Claude Code (Ctrl+Shift+C)">
+            </command>
+         </toolbar>
+      </menuContribution>
+
+      <!-- Status Bar contribution -->
+      <menuContribution locationURI="toolbar:org.eclipse.ui.trim.status">
+         <control
+            class="com.anthropic.eclipse.claude.views.ClaudeStatusBarContribution"
+            id="com.anthropic.eclipse.claude.statusbar">
+         </control>
+      </menuContribution>
+   </extension>
+
+   <!-- ========== Preferences ========== -->
+   <extension point="org.eclipse.ui.preferencePages">
+      <page
+         id="com.anthropic.eclipse.claude.preferences.ClaudePreferencePage"
+         name="Claude AI"
+         class="com.anthropic.eclipse.claude.preferences.ClaudePreferencePage">
+      </page>
+   </extension>
+
+   <extension point="org.eclipse.core.runtime.preferences">
+      <initializer class="com.anthropic.eclipse.claude.preferences.PreferenceInitializer"/>
+   </extension>
+
+   <!-- ========== Editor Annotations (for inline edit highlighting) ========== -->
+   <extension point="org.eclipse.ui.editors.annotationTypes">
+      <type name="com.anthropic.eclipse.claude.annotation.added"/>
+      <type name="com.anthropic.eclipse.claude.annotation.removed"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.editors.markerAnnotationSpecification">
+      <specification
+         annotationType="com.anthropic.eclipse.claude.annotation.added"
+         label="Claude - Added Code"
+         colorPreferenceKey="claudeAddedColor"
+         colorPreferenceValue="204,255,204"
+         highlightPreferenceKey="claudeAddedHighlight"
+         highlightPreferenceValue="true"
+         overviewRulerPreferenceKey="claudeAddedOverviewRuler"
+         overviewRulerPreferenceValue="true"
+         textPreferenceKey="claudeAddedText"
+         textPreferenceValue="true">
+      </specification>
+      <specification
+         annotationType="com.anthropic.eclipse.claude.annotation.removed"
+         label="Claude - Removed Code"
+         colorPreferenceKey="claudeRemovedColor"
+         colorPreferenceValue="255,204,204"
+         highlightPreferenceKey="claudeRemovedHighlight"
+         highlightPreferenceValue="true"
+         overviewRulerPreferenceKey="claudeRemovedOverviewRuler"
+         overviewRulerPreferenceValue="true"
+         textPreferenceKey="claudeRemovedText"
+         textPreferenceValue="true">
+      </specification>
+   </extension>
+
+</plugin>

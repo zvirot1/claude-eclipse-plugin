@@ -1,0 +1,29 @@
+package com.anthropic.eclipse.claude.preferences;
+
+public class PreferenceConstants {
+    // Existing API settings
+    public static final String API_KEY = "apiKey";
+    public static final String MODEL = "model";
+    public static final String MAX_TOKENS = "maxTokens";
+    public static final String SYSTEM_PROMPT = "systemPrompt";
+
+    // CLI settings
+    public static final String CLI_PATH = "cliPath";
+    public static final String PERMISSION_MODE = "permissionMode";
+    public static final String AUTO_APPROVE_TOOLS = "autoApproveTools";
+    public static final String MAX_TURNS = "maxTurns";
+
+    // UI settings
+    public static final String SHOW_STREAMING = "showStreaming";
+    public static final String SHOW_COST = "showCost";
+    public static final String DEFAULT_WORKING_DIR = "defaultWorkingDir";
+    public static final String THEME_MODE = "themeMode"; // "auto", "light", "dark"
+
+    // Mode
+    public static final String USE_CLI_MODE = "useCliMode";
+    public static final String SESSION_HISTORY_LIMIT = "sessionHistoryLimit";
+
+    // Input behavior
+    public static final String ENTER_TO_SEND = "enterToSend";              // true = Enter sends (default)
+    public static final String AUTO_SAVE_BEFORE_TOOLS = "autoSaveBeforeTools"; // save dirty editors before CLI file tools
+}

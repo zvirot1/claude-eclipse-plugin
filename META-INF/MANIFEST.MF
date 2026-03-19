@@ -1,0 +1,30 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Claude AI Plugin
+Bundle-SymbolicName: com.anthropic.eclipse.claude;singleton:=true
+Bundle-Version: 1.0.0.qualifier
+Bundle-Activator: com.anthropic.eclipse.claude.Activator
+Bundle-Vendor: Anthropic (Unofficial)
+Require-Bundle: org.eclipse.ui,
+ org.eclipse.core.runtime,
+ org.eclipse.ui.editors,
+ org.eclipse.ui.workbench.texteditor,
+ org.eclipse.jface,
+ org.eclipse.jface.text,
+ org.eclipse.core.resources,
+ org.eclipse.ui.ide,
+ org.eclipse.equinox.security,
+ org.eclipse.compare,
+ org.eclipse.jdt.core;resolution:=optional
+Bundle-RequiredExecutionEnvironment: JavaSE-11
+Bundle-ActivationPolicy: lazy
+Export-Package: com.anthropic.eclipse.claude.api,
+ com.anthropic.eclipse.claude.diff,
+ com.anthropic.eclipse.claude.cli,
+ com.anthropic.eclipse.claude.model,
+ com.anthropic.eclipse.claude.session,
+ com.anthropic.eclipse.claude.util,
+ com.anthropic.eclipse.claude.views,
+ com.anthropic.eclipse.claude.views.widgets,
+ com.anthropic.eclipse.claude.handlers,
+ com.anthropic.eclipse.claude.preferences
