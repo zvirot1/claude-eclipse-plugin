@@ -109,7 +109,9 @@ public class MarkdownRenderer {
             // Code blocks are rendered as separate CodeBlockComposite widgets by
             // MessageComposite.finalizeContent() — we must NOT render them here too
             // or they would appear twice (once inline, once as the widget).
-            if (line.trim().startsWith("```")) {
+            // Strip invisible Unicode characters (RTL mark, etc.) for fence detection
+            String trimmedLine = line.trim().replaceAll("[\\u200F\\u200E\\u200B\\u200C\\u200D\\uFEFF]", "");
+            if (trimmedLine.startsWith("```")) {
                 if (!inCodeBlock) {
                     // Opening fence: add one blank separator line so surrounding text
                     // has a visual gap before the CodeBlockComposite widget below.
