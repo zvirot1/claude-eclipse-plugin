@@ -10,6 +10,8 @@ import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Label;
+import org.eclipse.swt.widgets.Menu;
+import org.eclipse.swt.widgets.MenuItem;
 
 import com.anthropic.eclipse.claude.model.MessageBlock;
 import com.anthropic.eclipse.claude.model.MessageBlock.ToolCallSegment;
@@ -26,6 +28,12 @@ public class MessageComposite extends Composite {
     private final List<ToolCallComposite> toolCallWidgets = new ArrayList<>();
     private final List<CodeBlockComposite> codeBlockWidgets = new ArrayList<>();
     private boolean hasStreamedText = false; // true if any text was rendered during streaming
+
+    /** Callback for fork action from context menu. */
+    public interface ForkCallback {
+        void forkFromMessage(MessageBlock block);
+    }
+    private ForkCallback forkCallback;
 
     // Colors
     private Color userBgColor;
@@ -89,6 +97,9 @@ public class MessageComposite extends Composite {
 
         // If the message already has content (non-streaming), render it
         renderExistingContent();
+
+        // Context menu with Fork option
+        createContextMenu();
 
         addDisposeListener(e -> {
             userBgColor.dispose();
@@ -275,6 +286,24 @@ public class MessageComposite extends Composite {
      */
     public MessageBlock getMessageBlock() {
         return messageBlock;
+    }
+
+    /** Set the callback for fork action. */
+    public void setForkCallback(ForkCallback callback) {
+        this.forkCallback = callback;
+    }
+
+    private void createContextMenu() {
+        Menu menu = new Menu(this);
+        MenuItem forkItem = new MenuItem(menu, SWT.PUSH);
+        forkItem.setText("\u2442 Fork from here");  // ⑂ fork symbol
+        forkItem.addListener(SWT.Selection, e -> {
+            if (forkCallback != null) {
+                forkCallback.forkFromMessage(messageBlock);
+            }
+        });
+        setMenu(menu);
+        contentArea.setMenu(menu);
     }
 
     // ==================== Internal ====================

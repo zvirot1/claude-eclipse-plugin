@@ -958,6 +958,69 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     }
 
     /**
+     * Fork the conversation from a specific message. Creates a new session
+     * with messages copied up to (and including) the selected message,
+     * then starts a fresh CLI process.
+     */
+    private void forkFromMessage(MessageBlock forkPoint) {
+        // Collect messages up to and including the fork point
+        List<MessageBlock> allMessages = model.getMessages();
+        List<MessageBlock> forkedMessages = new ArrayList<>();
+        for (MessageBlock msg : allMessages) {
+            forkedMessages.add(msg);
+            if (msg == forkPoint) break;
+        }
+
+        if (forkedMessages.isEmpty()) return;
+
+        // Save current session before forking
+        saveCurrentSession();
+
+        // Stop current CLI
+        if (cliManager.isRunning()) {
+            cliManager.stop();
+        }
+
+        // Clear current model and UI
+        model.clear();
+        Activator.getDefault().getCheckpointManager().clearCheckpoints();
+
+        // Create new model
+        ConversationModel oldModel = model;
+        model = new ConversationModel();
+        model.addListener(this);
+        cliManager.removeMessageListener(oldModel);
+        cliManager.addMessageListener(model);
+        Activator.getDefault().setConversationModel(model);
+
+        // Reset title
+        partNameSet = false;
+        setPartName("Claude Code (Fork)");
+
+        // Replay forked messages into the new model (fires UI events)
+        final List<MessageBlock> history = forkedMessages;
+        final ConversationModel modelRef = model;
+        Display.getDefault().asyncExec(() -> {
+            // Clear welcome message widgets
+            for (MessageComposite widget : new ArrayList<>(messageWidgetMap.values())) {
+                if (!widget.isDisposed()) widget.dispose();
+            }
+            messageWidgetMap.clear();
+            toolCallWidgetById.clear();
+            welcomeBlock = null;
+            if (messageContainer != null && !messageContainer.isDisposed()) {
+                messageContainer.layout(true, true);
+            }
+        });
+        // loadHistory fires events → asyncExec → queued after the clear above
+        new Thread(() -> {
+            modelRef.loadHistory(history);
+            // After history is loaded, start fresh CLI
+            Display.getDefault().asyncExec(() -> autoStartCli());
+        }, "Claude-Fork-Loader").start();
+    }
+
+    /**
      * Public method to resume a session by ID (called by ResumeSessionHandler).
      */
     public void resumeSession(String sessionId) {
@@ -1171,6 +1234,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // Hide welcome message on first real interaction
             dismissWelcomeMessage();
             MessageComposite widget = new MessageComposite(messageContainer, block);
+            widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
             scrollToBottom();
         });
@@ -1205,6 +1269,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         asyncExec(() -> {
             hideThinkingIndicator();
             MessageComposite widget = new MessageComposite(messageContainer, block);
+            widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
             scrollToBottom();
         });
