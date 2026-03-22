@@ -112,14 +112,16 @@ public class MessageComposite extends Composite {
 
     private void createRoleHeader() {
         ThemeManager tm = ThemeManager.getInstance();
+
+        // Role label — click to show Fork menu
         Label roleLabel = new Label(this, SWT.NONE);
         String roleText;
         switch (messageBlock.getRole()) {
             case USER:
-                roleText = "\uD83D\uDC64 You";  // person emoji
+                roleText = "\uD83D\uDC64 You  \u25BE";  // person emoji + ▾ dropdown arrow
                 break;
             case ASSISTANT:
-                roleText = "\u2728 Claude";  // sparkles emoji
+                roleText = "\u2728 Claude  \u25BE";  // sparkles emoji + ▾ dropdown arrow
                 break;
             case SYSTEM:
                 roleText = "\u2699 System";  // gear emoji
@@ -133,10 +135,38 @@ public class MessageComposite extends Composite {
         roleLabel.setText(roleText);
         roleLabel.setForeground(roleColor);
         roleLabel.setBackground(getBackground());
+        roleLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        roleLabel.setCursor(getDisplay().getSystemCursor(SWT.CURSOR_HAND));
 
         Font boldFont = new Font(getDisplay(), tm.getUIFontName(), 10, SWT.BOLD);
         roleLabel.setFont(boldFont);
         roleLabel.addDisposeListener(e -> boldFont.dispose());
+
+        // Click on role label → show Fork popup menu
+        roleLabel.addListener(SWT.MouseDown, e -> {
+            Menu popup = new Menu(roleLabel.getShell(), SWT.POP_UP);
+            MenuItem forkItem = new MenuItem(popup, SWT.PUSH);
+            forkItem.setText("\u2442 Fork from here");
+            forkItem.addListener(SWT.Selection, ev -> {
+                if (forkCallback != null) {
+                    forkCallback.forkFromMessage(messageBlock);
+                }
+            });
+            MenuItem copyItem = new MenuItem(popup, SWT.PUSH);
+            copyItem.setText("Copy message text");
+            copyItem.addListener(SWT.Selection, ev -> {
+                String text = messageBlock.getFullText();
+                if (text != null && !text.isEmpty()) {
+                    org.eclipse.swt.dnd.Clipboard cb = new org.eclipse.swt.dnd.Clipboard(getDisplay());
+                    cb.setContents(new Object[]{text},
+                        new org.eclipse.swt.dnd.Transfer[]{org.eclipse.swt.dnd.TextTransfer.getInstance()});
+                    cb.dispose();
+                }
+            });
+            org.eclipse.swt.graphics.Point loc = roleLabel.toDisplay(e.x, e.y + roleLabel.getSize().y);
+            popup.setLocation(loc);
+            popup.setVisible(true);
+        });
     }
 
     private void renderExistingContent() {
@@ -176,6 +206,12 @@ public class MessageComposite extends Composite {
         ToolCallComposite tcWidget = new ToolCallComposite(contentArea, toolCall);
         tcWidget.setBackground(getBackground());
         toolCallWidgets.add(tcWidget);
+        // Propagate context menu to new widget
+        Menu menu = getMenu();
+        if (menu != null) {
+            applyMenuToChildren(tcWidget, menu);
+            tcWidget.setMenu(menu);
+        }
         relayoutParent();
         return tcWidget;
     }
@@ -303,7 +339,17 @@ public class MessageComposite extends Composite {
             }
         });
         setMenu(menu);
-        contentArea.setMenu(menu);
+        applyMenuToChildren(this, menu);
+    }
+
+    /** Recursively apply context menu to all child controls. */
+    private void applyMenuToChildren(Composite parent, Menu menu) {
+        for (org.eclipse.swt.widgets.Control child : parent.getChildren()) {
+            child.setMenu(menu);
+            if (child instanceof Composite) {
+                applyMenuToChildren((Composite) child, menu);
+            }
+        }
     }
 
     // ==================== Internal ====================
@@ -312,6 +358,12 @@ public class MessageComposite extends Composite {
         if (currentTextWidget == null || currentTextWidget.isFinalized()) {
             currentTextWidget = new StreamingTextWidget(contentArea, SWT.NONE);
             currentTextWidget.setBackground(getBackground());
+            // Propagate context menu to new widget
+            Menu menu = getMenu();
+            if (menu != null) {
+                applyMenuToChildren(currentTextWidget, menu);
+                currentTextWidget.setMenu(menu);
+            }
         }
     }
 
