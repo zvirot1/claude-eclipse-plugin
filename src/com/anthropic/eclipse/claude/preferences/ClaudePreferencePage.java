@@ -28,13 +28,13 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
             getFieldEditorParent()
         ));
 
-        addField(new ComboFieldEditor(
+        addField(new EditableComboFieldEditor(
             PreferenceConstants.MODEL,
             "Model:",
-            new String[][] {
-                {"claude-sonnet-4-5 (Recommended)", "claude-sonnet-4-5"},
-                {"claude-opus-4-5 (Most Capable)", "claude-opus-4-5"},
-                {"claude-haiku-4-5 (Fastest)", "claude-haiku-4-5-20251001"},
+            new String[] {
+                "default", "sonnet", "opus", "haiku",
+                "claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5",
+                "claude-sonnet-4-5-20250514", "claude-opus-4-5-20250514",
             },
             getFieldEditorParent()
         ));

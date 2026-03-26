@@ -4,6 +4,7 @@ import org.eclipse.swt.SWT;
 import org.eclipse.swt.custom.StyledText;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.Point;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
@@ -49,6 +50,17 @@ public class StreamingTextWidget extends Composite {
         Color textFg = tm.getColor(tm.bodyTextColor);
         styledText.setForeground(textFg);
         styledText.addDisposeListener(e -> { font.dispose(); textFg.dispose(); });
+    }
+
+    @Override
+    public Point computeSize(int wHint, int hHint, boolean changed) {
+        if (wHint == SWT.DEFAULT && getParent() != null && !getParent().isDisposed()) {
+            int parentWidth = getParent().getClientArea().width;
+            if (parentWidth > 0) {
+                wHint = parentWidth;
+            }
+        }
+        return super.computeSize(wHint, hHint, changed);
     }
 
     /**
@@ -99,6 +111,9 @@ public class StreamingTextWidget extends Composite {
             // Reapply orientation and alignment AFTER setText
             styledText.setOrientation(orientation);
             styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
+            if (orientation == SWT.RIGHT_TO_LEFT && !isDisposed()) {
+                setOrientation(SWT.RIGHT_TO_LEFT);
+            }
             updateHeight();
         }
     }
@@ -112,6 +127,10 @@ public class StreamingTextWidget extends Composite {
         int orientation = detectOrientation(text);
         styledText.setOrientation(orientation);
         styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
+        // On Windows, also set orientation on parent composites for proper layout
+        if (orientation == SWT.RIGHT_TO_LEFT && !isDisposed()) {
+            setOrientation(SWT.RIGHT_TO_LEFT);
+        }
         styledText.redraw();
     }
 

@@ -12,7 +12,7 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
 
         // Existing API settings
         store.setDefault(PreferenceConstants.API_KEY, "");
-        store.setDefault(PreferenceConstants.MODEL, "claude-sonnet-4-5");
+        store.setDefault(PreferenceConstants.MODEL, "sonnet");
         store.setDefault(PreferenceConstants.MAX_TOKENS, 4096);
         store.setDefault(PreferenceConstants.SYSTEM_PROMPT,
             "You are a helpful coding assistant. When analyzing code, be concise and precise. " +

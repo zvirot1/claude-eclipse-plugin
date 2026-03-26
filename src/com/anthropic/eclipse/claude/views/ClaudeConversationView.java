@@ -109,9 +109,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     // Thinking indicator (shown while waiting for Claude's first response token)
     private Composite thinkingIndicator;
     private Label thinkingLabel;
-    private int thinkingDotsState = 0;
-    // Animation frames — may be swapped at runtime to show "Extended thinking…"
-    private volatile String[] thinkingFrames = buildNormalThinkingFrames();
+    private org.eclipse.swt.widgets.Canvas thinkingDotsCanvas;
+    private int thinkingAnimFrame = 0;
+    private boolean extendedThinking = false;
 
     // State
     private final Map<MessageBlock, MessageComposite> messageWidgetMap = new LinkedHashMap<>();
@@ -378,9 +378,16 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             public void controlResized(org.eclipse.swt.events.ControlEvent e) {
                 if (!messageContainer.isDisposed()) {
                     int cw = scrolledMessages.getClientArea().width;
-                    messageContainer.layout(true, true);
-                    scrolledMessages.setMinSize(
-                        messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT));
+                    if (cw > 0) {
+                        // Force width constraint on messageContainer so children wrap text
+                        Object ld = messageContainer.getLayoutData();
+                        if (ld instanceof org.eclipse.swt.layout.GridData) {
+                            ((org.eclipse.swt.layout.GridData) ld).widthHint = cw;
+                        }
+                        messageContainer.layout(true, true);
+                        scrolledMessages.setMinSize(
+                            messageContainer.computeSize(cw, SWT.DEFAULT));
+                    }
                 }
             }
         });
@@ -1244,15 +1251,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     public void onExtendedThinkingStarted() {
         touchStreamActivity(); // thinking is activity — reset timeout clock
         asyncExec(() -> {
-            // Switch the thinking indicator to "🧠 Extended thinking..." frames.
-            // If the indicator isn't showing yet (shouldn't happen normally) start it now.
+            // Switch the thinking indicator to "🧠 Extended thinking..." text.
             if (thinkingIndicator == null || thinkingIndicator.isDisposed()) {
                 showThinkingIndicator();
             }
-            thinkingFrames = buildExtendedThinkingFrames();
-            // Update label text immediately so the change is visible without waiting for next tick
+            extendedThinking = true;
             if (thinkingLabel != null && !thinkingLabel.isDisposed()) {
-                thinkingLabel.setText(thinkingFrames[0]);
+                thinkingLabel.setText("\uD83E\uDDE0 Extended thinking\u2026");
             }
         });
     }
@@ -2657,62 +2662,60 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     }
 
     /**
-     * Shows an animated "Claude is thinking..." indicator in the chat.
-     * Called after sending a user message, hidden when the first response token arrives.
+     * Shows an animated thinking indicator with 3 pulsing orange dots + text.
+     * Matches the IntelliJ plugin's CSS thinkingPulse animation.
      */
-    private static String[] buildNormalThinkingFrames() {
-        return new String[]{
-            "\u2728 Claude is thinking\u2026",
-            "\u2728 Claude is thinking\u00B7",
-            "\u2728 Claude is thinking\u00B7\u00B7",
-            "\u2728 Claude is thinking\u00B7\u00B7\u00B7"
-        };
-    }
-
-    private static String[] buildExtendedThinkingFrames() {
-        return new String[]{
-            "\uD83E\uDDE0 Extended thinking\u2026",
-            "\uD83E\uDDE0 Extended thinking\u00B7",
-            "\uD83E\uDDE0 Extended thinking\u00B7\u00B7",
-            "\uD83E\uDDE0 Extended thinking\u00B7\u00B7\u00B7"
-        };
-    }
-
     private void showThinkingIndicator() {
         if (thinkingIndicator != null && !thinkingIndicator.isDisposed()) return;
 
-        // Reset to normal frames when a new indicator is created
-        thinkingFrames = buildNormalThinkingFrames();
+        extendedThinking = false;
 
         thinkingIndicator = new Composite(messageContainer, SWT.NONE);
-        GridLayout layout = new GridLayout(1, false);
-        layout.marginLeft = 12;
-        layout.marginTop = 4;
-        layout.marginBottom = 4;
-        thinkingIndicator.setLayout(layout);
+        org.eclipse.swt.layout.RowLayout rowLayout = new org.eclipse.swt.layout.RowLayout(SWT.HORIZONTAL);
+        rowLayout.center = true;
+        rowLayout.spacing = 8;
+        rowLayout.marginLeft = 14;
+        rowLayout.marginTop = 10;
+        rowLayout.marginBottom = 6;
+        thinkingIndicator.setLayout(rowLayout);
         thinkingIndicator.setLayoutData(new GridData(SWT.FILL, SWT.BEGINNING, true, false));
         thinkingIndicator.setBackground(messageContainer.getBackground());
 
+        // 3 pulsing dots (Canvas)
+        thinkingDotsCanvas = new org.eclipse.swt.widgets.Canvas(thinkingIndicator, SWT.DOUBLE_BUFFERED);
+        thinkingDotsCanvas.setLayoutData(new org.eclipse.swt.layout.RowData(22, 14));
+        thinkingDotsCanvas.setBackground(thinkingIndicator.getBackground());
+        thinkingDotsCanvas.addPaintListener(e -> {
+            int frame = thinkingAnimFrame;
+            Color orange = new Color(217, 119, 87);  // Claude orange
+            for (int i = 0; i < 3; i++) {
+                int alpha = (frame % 3 == i) ? 255 : 80;
+                e.gc.setAlpha(alpha);
+                e.gc.setBackground(orange);
+                e.gc.fillOval(i * 7, 4, 5, 5);
+            }
+            orange.dispose();
+        });
+
+        // Text label
         thinkingLabel = new Label(thinkingIndicator, SWT.NONE);
         thinkingLabel.setBackground(thinkingIndicator.getBackground());
-
-        ThemeManager tm = ThemeManager.getInstance();
-        Color dimColor = tm.getColor(tm.dimTextColor);
+        Color dimColor = new Color(128, 128, 128);
         thinkingLabel.setForeground(dimColor);
-        thinkingLabel.setText(thinkingFrames[0]);
+        thinkingLabel.addDisposeListener(ev -> dimColor.dispose());
+        thinkingLabel.setText("\u2728 Claude is thinking\u2026");
 
-        thinkingDotsState = 0;
-        Runnable animator = new Runnable() {
+        // Animation timer: 470ms per frame (1.4s total cycle / 3 dots)
+        thinkingAnimFrame = 0;
+        Display.getDefault().timerExec(470, new Runnable() {
             @Override
             public void run() {
-                if (thinkingLabel == null || thinkingLabel.isDisposed()) return;
-                String[] frames = thinkingFrames; // read volatile field each tick
-                thinkingDotsState = (thinkingDotsState + 1) % frames.length;
-                thinkingLabel.setText(frames[thinkingDotsState]);
-                Display.getDefault().timerExec(350, this);
+                if (thinkingDotsCanvas == null || thinkingDotsCanvas.isDisposed()) return;
+                thinkingAnimFrame = (thinkingAnimFrame + 1) % 3;
+                thinkingDotsCanvas.redraw();
+                Display.getDefault().timerExec(470, this);
             }
-        };
-        Display.getDefault().timerExec(350, animator);
+        });
 
         scrollToBottom();
     }
@@ -2725,6 +2728,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             thinkingIndicator.dispose();
             thinkingIndicator = null;
             thinkingLabel = null;
+            thinkingDotsCanvas = null;
             messageContainer.layout(true, true);
         }
     }

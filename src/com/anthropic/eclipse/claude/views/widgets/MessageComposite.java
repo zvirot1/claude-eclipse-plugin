@@ -6,6 +6,7 @@ import java.util.List;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.Point;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
@@ -108,6 +109,12 @@ public class MessageComposite extends Composite {
             systemBgColor.dispose();
             roleColor.dispose();
         });
+    }
+
+    @Override
+    public Point computeSize(int wHint, int hHint, boolean changed) {
+        // Always force re-computation to respect width constraints for text wrapping
+        return super.computeSize(wHint, hHint, true);
     }
 
     private void createRoleHeader() {
