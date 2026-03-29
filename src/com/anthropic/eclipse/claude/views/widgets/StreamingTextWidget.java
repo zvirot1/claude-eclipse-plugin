@@ -103,7 +103,7 @@ public class StreamingTextWidget extends Composite {
             // For RTL: fix leading punctuation (AI generates "?text" instead of "text?")
             // and prepend RTL Mark to set bidi base direction on macOS
             String renderText = (orientation == SWT.RIGHT_TO_LEFT)
-                    ? "\u200F" + moveLeadingPunctuationToEnd(text)
+                    ? "\u200F" + text  // RTL Mark sets base paragraph direction
                     : text;
             // Render markdown FIRST (MarkdownRenderer.render calls widget.setText which
             // resets orientation/alignment to defaults — we must reapply them afterward).
@@ -113,6 +113,12 @@ public class StreamingTextWidget extends Composite {
             styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
             if (orientation == SWT.RIGHT_TO_LEFT && !isDisposed()) {
                 setOrientation(SWT.RIGHT_TO_LEFT);
+                // On Windows, propagate RTL to all parent composites for proper layout
+                Composite parent = getParent();
+                while (parent != null && !(parent instanceof org.eclipse.swt.custom.ScrolledComposite)) {
+                    parent.setOrientation(SWT.RIGHT_TO_LEFT);
+                    parent = parent.getParent();
+                }
             }
             updateHeight();
         }
@@ -127,9 +133,14 @@ public class StreamingTextWidget extends Composite {
         int orientation = detectOrientation(text);
         styledText.setOrientation(orientation);
         styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
-        // On Windows, also set orientation on parent composites for proper layout
+        // Propagate RTL to all parent composites (needed on Windows)
         if (orientation == SWT.RIGHT_TO_LEFT && !isDisposed()) {
             setOrientation(SWT.RIGHT_TO_LEFT);
+            Composite parent = getParent();
+            while (parent != null && !(parent instanceof org.eclipse.swt.custom.ScrolledComposite)) {
+                parent.setOrientation(SWT.RIGHT_TO_LEFT);
+                parent = parent.getParent();
+            }
         }
         styledText.redraw();
     }
@@ -156,16 +167,41 @@ public class StreamingTextWidget extends Composite {
      * at the start of the string (English convention). This moves them to the end
      * so they appear correctly at the visual left in RTL rendering.
      */
-    private static String moveLeadingPunctuationToEnd(String text) {
+    /**
+     * Fix punctuation placement in RTL text.
+     * Claude sometimes generates "?text" instead of "text?" for Hebrew.
+     * Move leading punctuation to end, and wrap trailing punctuation with
+     * directional marks so BiDi algorithm places them correctly.
+     */
+    private static String fixRtlPunctuation(String text) {
         if (text == null || text.isEmpty()) return text;
-        int i = 0;
-        while (i < text.length() && "?!".indexOf(text.charAt(i)) >= 0) {
-            i++;
+        String[] lines = text.split("\n", -1);
+        StringBuilder result = new StringBuilder();
+        for (int lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+            String line = lines[lineIdx];
+            // Move leading punctuation to end
+            int i = 0;
+            while (i < line.length() && "?!.,:;".indexOf(line.charAt(i)) >= 0) {
+                i++;
+            }
+            if (i > 0 && i < line.length()) {
+                line = line.substring(i) + line.substring(0, i);
+            }
+            // Wrap trailing punctuation with LRM (U+200E) to anchor it at visual end (left in RTL)
+            if (!line.isEmpty()) {
+                int end = line.length() - 1;
+                while (end >= 0 && "?!.,:;".indexOf(line.charAt(end)) >= 0) {
+                    end--;
+                }
+                if (end < line.length() - 1) {
+                    // Insert LRM before trailing punctuation
+                    line = line.substring(0, end + 1) + "\u200E" + line.substring(end + 1);
+                }
+            }
+            result.append(line);
+            if (lineIdx < lines.length - 1) result.append("\n");
         }
-        if (i > 0 && i < text.length()) {
-            return text.substring(i) + text.substring(0, i);
-        }
-        return text;
+        return result.toString();
     }
 
     /**
