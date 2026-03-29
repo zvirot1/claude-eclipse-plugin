@@ -415,8 +415,10 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void handleResult(CliMessage.ResultMessage result) {
-        // Reset streaming mode so the next turn can work in either streaming or non-streaming mode
-        usingStreamEvents = false;
+        // NOTE: Do NOT reset usingStreamEvents here. The CLI sends a redundant
+        // assistant snapshot AFTER the result message. If we reset the flag,
+        // handleAssistantMessage would process that snapshot and duplicate the text.
+        // The flag is reset in handleMessageStart when a new streaming turn begins.
 
         // Update usage
         cumulativeUsage.addUsage(
