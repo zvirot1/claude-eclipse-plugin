@@ -183,6 +183,7 @@ public class MessageComposite extends Composite {
                 if (textSeg.getLength() > 0) {
                     ensureTextWidget();
                     currentTextWidget.appendText(textSeg.getText());
+                    hasStreamedText = true; // Prevent finalizeContent() from re-adding this text
                 }
             } else if (seg instanceof MessageBlock.ToolCallSegment) {
                 addToolCallWidget((MessageBlock.ToolCallSegment) seg);
