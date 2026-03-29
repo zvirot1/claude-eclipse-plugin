@@ -113,15 +113,8 @@ public class StreamingTextWidget extends Composite {
             // Reapply orientation and alignment AFTER setText
             styledText.setOrientation(orientation);
             styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
-            if (orientation == SWT.RIGHT_TO_LEFT && !isDisposed()) {
-                setOrientation(SWT.RIGHT_TO_LEFT);
-                // On Windows, propagate RTL to all parent composites for proper layout
-                Composite parent = getParent();
-                while (parent != null && !(parent instanceof org.eclipse.swt.custom.ScrolledComposite)) {
-                    parent.setOrientation(SWT.RIGHT_TO_LEFT);
-                    parent = parent.getParent();
-                }
-            }
+            // Only set RTL on the StyledText itself — do NOT propagate to parent
+            // composites, as that flips the entire layout (tool calls, buttons, headers)
             updateHeight();
         }
     }
@@ -135,15 +128,7 @@ public class StreamingTextWidget extends Composite {
         int orientation = detectOrientation(text);
         styledText.setOrientation(orientation);
         styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
-        // Propagate RTL to all parent composites (needed on Windows)
-        if (orientation == SWT.RIGHT_TO_LEFT && !isDisposed()) {
-            setOrientation(SWT.RIGHT_TO_LEFT);
-            Composite parent = getParent();
-            while (parent != null && !(parent instanceof org.eclipse.swt.custom.ScrolledComposite)) {
-                parent.setOrientation(SWT.RIGHT_TO_LEFT);
-                parent = parent.getParent();
-            }
-        }
+        // Only set RTL on StyledText — don't propagate to parents
         styledText.redraw();
     }
 
