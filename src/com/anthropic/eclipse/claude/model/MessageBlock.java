@@ -31,9 +31,13 @@ public class MessageBlock {
         this.timestamp = System.currentTimeMillis();
     }
 
+    private volatile boolean complete = false;
+
     public Role getRole() { return role; }
     public long getTimestamp() { return timestamp; }
     public List<ContentSegment> getSegments() { return segments; }
+    public boolean isComplete() { return complete; }
+    public void setComplete(boolean complete) { this.complete = complete; }
 
     /**
      * Add a segment to this message.

@@ -96,8 +96,13 @@ public class MessageComposite extends Composite {
         contentArea.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
         contentArea.setBackground(getBackground());
 
-        // If the message already has content (non-streaming), render it
-        renderExistingContent();
+        // If the message already has content (non-streaming), render it.
+        // Skip for ASSISTANT messages that are still being streamed — the streaming
+        // path (appendStreamingText) will handle those. Rendering here AND streaming
+        // would duplicate the first few tokens (e.g., "HiHi!" instead of "Hi!").
+        if (messageBlock.getRole() != MessageBlock.Role.ASSISTANT || messageBlock.isComplete()) {
+            renderExistingContent();
+        }
 
         // Context menu with Fork option
         createContextMenu();

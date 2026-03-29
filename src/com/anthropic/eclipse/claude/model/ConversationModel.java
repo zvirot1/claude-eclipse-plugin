@@ -531,6 +531,7 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void fireAssistantMessageCompleted(MessageBlock block) {
+        block.setComplete(true);
         for (IConversationListener l : listeners) {
             try { l.onAssistantMessageCompleted(block); } catch (Exception e) { logError(e); }
         }
