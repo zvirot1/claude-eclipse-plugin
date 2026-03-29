@@ -29,6 +29,7 @@ public class MessageComposite extends Composite {
     private final List<ToolCallComposite> toolCallWidgets = new ArrayList<>();
     private final List<CodeBlockComposite> codeBlockWidgets = new ArrayList<>();
     private boolean hasStreamedText = false; // true if any text was rendered during streaming
+    private boolean finalized = false; // prevent double finalization
 
     /** Callback for fork action from context menu. */
     public interface ForkCallback {
@@ -200,7 +201,7 @@ public class MessageComposite extends Composite {
      * Append streaming text delta to current text widget.
      */
     public void appendStreamingText(String delta) {
-        if (isDisposed()) return;
+        if (isDisposed() || finalized) return;
         ensureTextWidget();
         currentTextWidget.appendText(delta);
         hasStreamedText = true;
@@ -286,6 +287,9 @@ public class MessageComposite extends Composite {
      * populate from the MessageBlock first.
      */
     public void finalizeContent() {
+        if (finalized) return; // Prevent double finalization
+        finalized = true;
+
         // If streaming was disabled, the text widget may be empty or not exist.
         // Populate it from the MessageBlock's accumulated text.
         // BUT: if text was already rendered during streaming (hasStreamedText),

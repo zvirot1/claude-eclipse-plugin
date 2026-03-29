@@ -229,8 +229,18 @@ public class ConversationModel implements ICliMessageListener {
         // When stream events are active (--include-partial-messages sends assistant snapshots
         // mid-stream and again at the end), ignore ALL assistant messages. The stream events
         // (message_start/content_block_*/message_stop) are authoritative and already drive the UI.
+        // Also ignore if the last message is already an ASSISTANT message from streaming —
+        // the CLI sends a redundant assistant snapshot after the result message.
         if (usingStreamEvents) {
             return;
+        }
+        synchronized (messages) {
+            if (!messages.isEmpty()) {
+                MessageBlock lastMsg = messages.get(messages.size() - 1);
+                if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg.isComplete()) {
+                    return; // Already have this assistant message from streaming
+                }
+            }
         }
 
         // If we received a full message directly (non-streaming), create a block for it
