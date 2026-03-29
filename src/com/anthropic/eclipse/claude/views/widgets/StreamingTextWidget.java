@@ -99,6 +99,8 @@ public class StreamingTextWidget extends Composite {
         // Apply markdown rendering and RTL
         if (!styledText.isDisposed()) {
             String text = rawMarkdown.toString();
+            // Duplication guard: if rawMarkdown somehow has doubled content, take only first half
+            // This can happen on Windows due to CLI sending redundant assistant snapshots
             int orientation = detectOrientation(text);
             // For RTL: fix leading punctuation (AI generates "?text" instead of "text?")
             // and prepend RTL Mark to set bidi base direction on macOS
