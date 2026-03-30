@@ -23,6 +23,8 @@ import org.eclipse.swt.dnd.Clipboard;
 import org.eclipse.swt.dnd.ImageTransfer;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.GC;
+import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.graphics.ImageData;
 import org.eclipse.swt.graphics.ImageLoader;
 import org.eclipse.swt.layout.GridData;
@@ -309,7 +311,7 @@ public class AttachmentManager {
             images.add(pngBytes);
             String name = "Image " + images.size();
             imageNames.add(name);
-            addChip(name + " (" + (pngBytes.length / 1024) + " KB)", () -> {
+            addImageChip(imageData, name + " (" + (pngBytes.length / 1024) + " KB)", () -> {
                 int i = images.indexOf(pngBytes);
                 if (i >= 0) {
                     images.remove(i);
@@ -377,6 +379,59 @@ public class AttachmentManager {
         Font chipFont = new Font(Display.getDefault(), "Segoe UI", 8, SWT.NORMAL);
         chipLabel.setFont(chipFont);
         chipLabel.addDisposeListener(e -> chipFont.dispose());
+
+        Button removeBtn = new Button(chip, SWT.FLAT);
+        removeBtn.setText("\u00D7");
+        removeBtn.setBackground(chipBg);
+        removeBtn.addListener(SWT.Selection, e -> {
+            onRemove.run();
+            chip.dispose();
+            refresh();
+        });
+    }
+
+    private void addImageChip(ImageData imageData, String tooltipText, Runnable onRemove) {
+        ThemeManager tmChip = ThemeManager.getInstance();
+        Color chipBg = tmChip.getColor(tmChip.chipBg);
+        Composite chip = new Composite(attachmentBar, SWT.BORDER);
+        GridLayout chipLayout = new GridLayout(3, false);
+        chipLayout.marginWidth = 4;
+        chipLayout.marginHeight = 2;
+        chipLayout.horizontalSpacing = 4;
+        chip.setLayout(chipLayout);
+        chip.setBackground(chipBg);
+        chip.addDisposeListener(e -> chipBg.dispose());
+
+        // Create scaled thumbnail (max 40x40, preserve aspect ratio)
+        int maxThumb = 40;
+        int origW = imageData.width;
+        int origH = imageData.height;
+        double scale = Math.min((double) maxThumb / origW, (double) maxThumb / origH);
+        if (scale > 1.0) scale = 1.0;
+        int thumbW = Math.max(1, (int)(origW * scale));
+        int thumbH = Math.max(1, (int)(origH * scale));
+
+        Image fullImage = new Image(Display.getDefault(), imageData);
+        Image thumbImage = new Image(Display.getDefault(), thumbW, thumbH);
+        GC gc = new GC(thumbImage);
+        gc.setAntialias(SWT.ON);
+        gc.setInterpolation(SWT.HIGH);
+        gc.drawImage(fullImage, 0, 0, origW, origH, 0, 0, thumbW, thumbH);
+        gc.dispose();
+        fullImage.dispose();
+
+        Label imgLabel = new Label(chip, SWT.NONE);
+        imgLabel.setImage(thumbImage);
+        imgLabel.setBackground(chipBg);
+        imgLabel.setToolTipText(tooltipText);
+        imgLabel.addDisposeListener(e -> thumbImage.dispose());
+
+        Label textLabel = new Label(chip, SWT.NONE);
+        textLabel.setText(tooltipText);
+        textLabel.setBackground(chipBg);
+        Font chipFont = new Font(Display.getDefault(), "Segoe UI", 8, SWT.NORMAL);
+        textLabel.setFont(chipFont);
+        textLabel.addDisposeListener(e -> chipFont.dispose());
 
         Button removeBtn = new Button(chip, SWT.FLAT);
         removeBtn.setText("\u00D7");

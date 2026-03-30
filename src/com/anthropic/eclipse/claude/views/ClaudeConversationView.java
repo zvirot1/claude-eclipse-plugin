@@ -101,6 +101,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private ScrolledComposite scrolledMessages;
     private Composite messageContainer;
     private Text inputField;
+    private long pendingRestoreHkl = 0; // keyboard layout to restore after sending
+    private volatile boolean blockLanguageChange = false; // block WM_INPUTLANGCHANGEREQUEST during send
     private CostStatusBar costBar;
     private Label connectionStatus;
     private Button sendButton;
@@ -436,7 +438,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         GridData inputGd = new GridData(SWT.FILL, SWT.FILL, true, false);
         inputGd.heightHint = 48;
         inputField.setLayoutData(inputGd);
-        inputField.setMessage("Ask Claude... (Enter = send, Shift+Enter = newline, / = commands)");
+        inputField.setMessage("Ask Claude... (Enter = send, Shift+Enter = newline, Ctrl+Alt+I = paste image)");
         inputField.setBackground(inputBgColor);
         ThemeManager tmInput = ThemeManager.getInstance();
         Color inputTextColor = tmInput.getColor(tmInput.inputText);
@@ -534,19 +536,25 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         contextLine.addDisposeListener(e -> { hintColor.dispose(); hintFont.dispose(); });
         inputField.addListener(SWT.KeyDown, e -> {
-            if (e.keyCode == SWT.CR || e.keyCode == SWT.LF) {
+            if (e.keyCode == SWT.CR || e.keyCode == SWT.LF || e.keyCode == SWT.KEYPAD_CR) {
                 boolean enterToSend = Activator.getDefault().getPreferenceStore()
                         .getBoolean(PreferenceConstants.ENTER_TO_SEND);
                 boolean shiftDown = (e.stateMask & SWT.SHIFT) != 0;
                 boolean shouldSend = enterToSend ? !shiftDown : shiftDown;
-                if (!shouldSend) return;
-                // Don't send if autocomplete is open - Enter there selects the command
-                if (autocompletePopup != null && !autocompletePopup.isDisposed()
-                        && autocompletePopup.isVisible()) {
-                    return;
+                if (shouldSend) {
+                    // Don't send if autocomplete is open - Enter there selects the command
+                    if (autocompletePopup != null && !autocompletePopup.isDisposed()
+                            && autocompletePopup.isVisible()) {
+                        return;
+                    }
+                    e.doit = false;
+                    handleInput();
+                } else {
+                    // Newline: on Windows the native Text widget ignores Shift+Enter,
+                    // so we insert the newline manually at the caret position.
+                    e.doit = false;
+                    inputField.insert("\n");
                 }
-                e.doit = false;
-                handleInput();
             }
         });
 
@@ -567,12 +575,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             } else {
                 dismissAutocomplete();
             }
-            // RTL auto-detection: update both orientation and text direction on every change
-            // setTextDirection is needed on macOS where setOrientation alone doesn't reflow
-            int orientation = StreamingTextWidget.detectOrientation(text);
-            inputField.setOrientation(orientation);
-            inputField.setTextDirection(orientation);
-            inputField.redraw();
+            // RTL auto-detection: update both orientation and text direction on every change.
+            // Skip when text is empty so that clearing the field after sending doesn't
+            // reset the keyboard language back to English.
+            if (!text.isEmpty()) {
+                int orientation = StreamingTextWidget.detectOrientation(text);
+                inputField.setOrientation(orientation);
+                inputField.setTextDirection(orientation);
+                inputField.redraw();
+            }
         });
 
         // Handle keyboard navigation in autocomplete popup
@@ -590,7 +601,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                         autocompleteTable.setSelection(idx - 1);
                     }
                     e2.doit = false;
-                } else if (e2.keyCode == SWT.TAB || (e2.keyCode == SWT.CR && autocompleteTable.getSelectionIndex() >= 0)) {
+                } else if (e2.keyCode == SWT.TAB || ((e2.keyCode == SWT.CR || e2.keyCode == SWT.KEYPAD_CR) && autocompleteTable.getSelectionIndex() >= 0)) {
                     int idx = autocompleteTable.getSelectionIndex();
                     if (idx >= 0) {
                         String selected = autocompleteTable.getItem(idx).getText(0);
@@ -604,6 +615,120 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 }
             }
         });
+
+        // Ctrl+Alt+I: paste image from clipboard (explicit shortcut).
+        inputField.addListener(SWT.KeyDown, e -> {
+            if ((e.stateMask & SWT.MOD1) != 0
+                    && (e.stateMask & SWT.ALT) != 0
+                    && e.keyCode == 'i') {
+                e.doit = false;
+                if (attachmentManager != null) {
+                    attachmentManager.pasteImage();
+                }
+            }
+        });
+
+        // Ctrl+V image paste: platform-specific handling.
+        // On Windows, the native Text widget (Win32 Edit control) swallows Ctrl+V
+        // KeyDown before SWT's Display.addFilter can see it, so we subclass the
+        // native window to intercept WM_PASTE (0x0302) directly.
+        // On macOS/Linux, Display.addFilter works normally for Cmd+V / Ctrl+V.
+        if (SWT.getPlatform().equals("win32")) {
+            try {
+                long hwnd = inputField.handle;
+                final long[] oldWndProc = new long[1];
+                final AttachmentManager amRef = attachmentManager;
+                final ClaudeConversationView self = this;
+                org.eclipse.swt.internal.Callback callback = new org.eclipse.swt.internal.Callback(
+                    new Object() {
+                        @SuppressWarnings("unused")
+                        long wndProc(long hWnd, long msg, long wParam, long lParam) {
+                            if (msg == 0x0302 /* WM_PASTE */) {
+                                Clipboard cb = new Clipboard(Display.getDefault());
+                                try {
+                                    if (cb.getContents(ImageTransfer.getInstance()) != null) {
+                                        if (amRef != null) {
+                                            amRef.pasteImage();
+                                        }
+                                        return 0;
+                                    }
+                                } finally {
+                                    cb.dispose();
+                                }
+                            }
+                            // Block keyboard language changes during send operation
+                            if (msg == 0x0050 /* WM_INPUTLANGCHANGEREQUEST */ && self.blockLanguageChange) {
+                                return 0;
+                            }
+                            if (msg == 0x0007 /* WM_SETFOCUS */ && self.pendingRestoreHkl != 0) {
+                                long result = org.eclipse.swt.internal.win32.OS.CallWindowProc(
+                                        oldWndProc[0], hWnd, (int)msg, wParam, lParam);
+                                org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(self.pendingRestoreHkl, 0);
+                                return result;
+                            }
+                            return org.eclipse.swt.internal.win32.OS.CallWindowProc(
+                                    oldWndProc[0], hWnd, (int)msg, wParam, lParam);
+                        }
+                    }, "wndProc", 4);
+                long newWndProc = callback.getAddress();
+                oldWndProc[0] = org.eclipse.swt.internal.win32.OS.SetWindowLongPtr(
+                        hwnd, org.eclipse.swt.internal.win32.OS.GWL_WNDPROC, newWndProc);
+                inputField.addDisposeListener(ev -> callback.dispose());
+            } catch (Throwable t) {
+                // Fallback: if native subclassing fails, Ctrl+Alt+I still works
+                System.err.println("Could not install WM_PASTE hook: " + t.getMessage());
+            }
+        } else {
+            // macOS / Linux: Display.addFilter sees Cmd+V / Ctrl+V normally.
+            final Text inputRef = inputField;
+            Display.getDefault().addFilter(SWT.KeyDown, e -> {
+                boolean isPasteKey = (e.stateMask & SWT.MOD1) != 0
+                        && (e.stateMask & SWT.ALT) == 0
+                        && (e.stateMask & SWT.SHIFT) == 0
+                        && (e.keyCode == 'v' || e.character == 0x16);
+                if (isPasteKey && !inputRef.isDisposed() && inputRef.isFocusControl()) {
+                    Clipboard cb = new Clipboard(Display.getDefault());
+                    try {
+                        if (cb.getContents(ImageTransfer.getInstance()) != null) {
+                            e.type = SWT.None;
+                            e.doit = false;
+                            if (attachmentManager != null) {
+                                attachmentManager.pasteImage();
+                            }
+                        }
+                    } finally {
+                        cb.dispose();
+                    }
+                }
+            });
+        }
+
+        // Preserve keyboard language: save on every keystroke, restore on FocusIn.
+        // On Windows, response rendering can cause the input field to briefly lose
+        // focus and the keyboard layout to reset to English.
+        // Preserve keyboard language after sending a message.
+        // pendingRestoreHkl is set in handleInput() before clearing the text,
+        // and consumed once in FocusIn to restore the keyboard layout.
+        // Preserve keyboard language after sending a message.
+        // scrollToBottom() causes multiple async FocusOut/FocusIn cycles that reset the
+        // keyboard layout. We keep restoring on every FocusIn until the user starts typing.
+        if (SWT.getPlatform().equals("win32")) {
+            inputField.addListener(SWT.FocusIn, e -> {
+                if (pendingRestoreHkl != 0) {
+                    try {
+                        org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(pendingRestoreHkl, 0);
+                    } catch (Throwable ignored) {}
+                    // Don't clear — keep restoring on every FocusIn until user types
+                }
+            });
+            // Clear when user starts typing (they're now in their desired language)
+            inputField.addListener(SWT.Modify, e -> {
+                if (!inputField.getText().isEmpty()) {
+                    pendingRestoreHkl = 0;
+                    blockLanguageChange = false;
+                }
+            });
+        }
 
         // Dismiss autocomplete when input loses focus
         inputField.addListener(SWT.FocusOut, e -> {
@@ -619,6 +744,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (text.isEmpty() && !hasAttachments) return;
 
         dismissAutocomplete();
+        // Save keyboard layout and block language changes during send.
+        if (SWT.getPlatform().equals("win32")) {
+            try {
+                pendingRestoreHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0);
+                blockLanguageChange = true;
+            } catch (Throwable ignored) {}
+        }
         inputField.setText("");
 
         // Check for slash commands (only when no attachments)
@@ -2656,6 +2788,25 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             Display.getDefault().asyncExec(() -> {
                 if (!scrolledMessages.isDisposed()) {
                     scrolledMessages.setOrigin(0, messageContainer.getSize().y);
+                }
+                // Restore focus to input field after all layout operations.
+                if (inputField != null && !inputField.isDisposed()) {
+                    inputField.setFocus();
+                    // Restore keyboard layout (Hebrew/Arabic) after setFocus.
+                    // On Windows, layout/focus cycling resets the keyboard to English.
+                    if (pendingRestoreHkl != 0 && SWT.getPlatform().equals("win32")) {
+                        final long hkl = pendingRestoreHkl;
+                        try {
+                            org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(hkl, 0);
+                        } catch (Throwable ignored) {}
+                        // Also schedule another restore in case Windows processes
+                        // further messages that reset it after this point.
+                        Display.getDefault().asyncExec(() -> {
+                            try {
+                                org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(hkl, 0);
+                            } catch (Throwable ignored) {}
+                        });
+                    }
                 }
             });
         });

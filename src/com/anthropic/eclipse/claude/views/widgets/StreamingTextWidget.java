@@ -112,7 +112,14 @@ public class StreamingTextWidget extends Composite {
             MarkdownRenderer.render(styledText, renderText);
             // Reapply orientation and alignment AFTER setText
             styledText.setOrientation(orientation);
-            styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
+            // On Windows, setOrientation(RTL) sets WS_EX_LAYOUTRTL which mirrors the
+            // coordinate system — calling setAlignment(SWT.RIGHT) would double-mirror
+            // and push text to the LEFT. On macOS, setOrientation alone doesn't reflow,
+            // so explicit alignment is needed.
+            boolean isWindows = SWT.getPlatform().equals("win32");
+            if (!isWindows) {
+                styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
+            }
             // Only set RTL on the StyledText itself — do NOT propagate to parent
             // composites, as that flips the entire layout (tool calls, buttons, headers)
             updateHeight();
@@ -127,7 +134,11 @@ public class StreamingTextWidget extends Composite {
         if (styledText == null || styledText.isDisposed()) return;
         int orientation = detectOrientation(text);
         styledText.setOrientation(orientation);
-        styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
+        // On Windows, setOrientation(RTL) mirrors coordinates so setAlignment(RIGHT)
+        // would appear LEFT. Only set explicit alignment on non-Windows platforms.
+        if (!SWT.getPlatform().equals("win32")) {
+            styledText.setAlignment(orientation == SWT.RIGHT_TO_LEFT ? SWT.RIGHT : SWT.LEFT);
+        }
         // Only set RTL on StyledText — don't propagate to parents
         styledText.redraw();
     }
