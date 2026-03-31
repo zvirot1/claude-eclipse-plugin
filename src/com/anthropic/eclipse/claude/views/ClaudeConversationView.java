@@ -1542,6 +1542,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     }
 
     @Override
+    public void onAssistantMessageRemoved(MessageBlock block) {
+        asyncExec(() -> {
+            MessageComposite widget = messageWidgetMap.remove(block);
+            if (widget != null && !widget.isDisposed()) {
+                widget.dispose();
+                scrollToBottom();
+            }
+        });
+    }
+
+    @Override
     public void onAssistantMessageCompleted(MessageBlock block) {
         asyncExec(() -> {
             // Just finalize the widget content (apply markdown etc.).

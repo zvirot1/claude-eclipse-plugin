@@ -312,6 +312,19 @@ public class ConversationModel implements ICliMessageListener {
         // Start a new assistant message — but don't fire onAssistantMessageStarted yet.
         // We defer that until the first content block arrives so we never show an empty bubble.
         usingStreamEvents = true; // stream events are now driving this response
+
+        // Guard: if the CLI already sent a full "assistant" message for this same turn
+        // (before the stream events arrived), remove it to avoid duplicate bubbles.
+        synchronized (messages) {
+            if (!messages.isEmpty()) {
+                MessageBlock lastMsg = messages.get(messages.size() - 1);
+                if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg != currentStreamingBlock) {
+                    messages.remove(messages.size() - 1);
+                    fireAssistantMessageRemoved(lastMsg);
+                }
+            }
+        }
+
         currentStreamingBlock = new MessageBlock(MessageBlock.Role.ASSISTANT);
         synchronized (messages) {
             messages.add(currentStreamingBlock);
@@ -512,6 +525,12 @@ public class ConversationModel implements ICliMessageListener {
     private void fireAssistantMessageStarted(MessageBlock block) {
         for (IConversationListener l : listeners) {
             try { l.onAssistantMessageStarted(block); } catch (Exception e) { logError(e); }
+        }
+    }
+
+    private void fireAssistantMessageRemoved(MessageBlock block) {
+        for (IConversationListener l : listeners) {
+            try { l.onAssistantMessageRemoved(block); } catch (Exception e) { logError(e); }
         }
     }
 
