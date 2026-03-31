@@ -71,10 +71,29 @@ public class NdjsonProtocolHandler {
     }
 
     /**
-     * Stop reading threads.
+     * Stop reading threads and prevent any further message dispatch.
+     * <p>
+     * This method is safe to call from the UI thread.  It does NOT close
+     * the underlying streams (that would deadlock on Windows because the
+     * reader thread holds a lock on the InputStream).  Instead it:
+     * <ol>
+     *   <li>Sets {@code running = false} so the while-condition fails on
+     *       the next iteration of the read loop</li>
+     *   <li>Clears the listener list so even an in-flight dispatch is a
+     *       no-op — no messages can reach the UI</li>
+     *   <li>Interrupts the threads (belt-and-suspenders)</li>
+     * </ol>
+     * The caller is expected to kill the CLI process afterwards
+     * ({@code destroyForcibly()}), which closes the pipes and causes
+     * {@code readLine()} to return null, ending the read loop.
      */
     public void stop() {
         running = false;
+
+        // Remove all listeners so no messages reach the UI even if the
+        // read loop manages one more iteration before seeing running==false.
+        listeners.clear();
+
         if (readerThread != null) {
             readerThread.interrupt();
         }
