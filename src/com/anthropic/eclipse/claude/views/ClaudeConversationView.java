@@ -127,6 +127,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private static final long STREAMING_TIMEOUT_MS = 120_000;
     private volatile long lastStreamActivityTime = 0;
     private volatile boolean streamingActive = false;
+    // Set to true when the user clicks Stop — suppresses ALL message rendering
+    // in asyncExec callbacks so the UI stops updating immediately, even if the
+    // read loop or asyncExec queue still has pending items.
+    private volatile boolean renderingSuppressed = false;
     // Tracks the error MessageBlock created when a timeout fires, so we can
     // dismiss it automatically if the stream recovers.
     private MessageBlock timeoutErrorBlock = null;
@@ -253,6 +257,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         setTooltip(stopButton, "Stop current query");
         stopButton.setEnabled(false);
         stopButton.addListener(SWT.Selection, e -> {
+            renderingSuppressed = true;  // Block ALL further UI updates immediately
             cancelStreamingTimeout();
             cliManager.stop();
             stopButton.setEnabled(false);
@@ -809,6 +814,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             cliManager.sendMessage(finalText);
         }
 
+        renderingSuppressed = false;  // Reset for new query
         stopButton.setEnabled(true);
         costBar.setStatus("Streaming...");
         // Queue AFTER the user message asyncExec so indicator appears below the user message
@@ -833,7 +839,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 showHelp();
                 return true;
             case "/stop":
-                cliManager.stop();
+                renderingSuppressed = true;
+                cancelStreamingTimeout();
+                cliManager.interruptCurrentQuery();
+                stopButton.setEnabled(false);
                 return true;
             case "/resume":
                 showResumeDialog();
@@ -1414,6 +1423,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onStreamingTextAppended(MessageBlock block, String delta) {
+        if (renderingSuppressed) return;  // Stop button was pressed — ignore
         touchStreamActivity(); // each text token proves the stream is alive
         // If streaming display is disabled, skip real-time updates;
         // the full text will be rendered on onAssistantMessageCompleted
@@ -1425,6 +1435,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (!showStreaming) return;
 
         asyncExec(() -> {
+            if (renderingSuppressed) return;  // Double-check inside asyncExec
             MessageComposite widget = messageWidgetMap.get(block);
             if (widget != null && !widget.isDisposed()) {
                 widget.appendStreamingText(delta);
