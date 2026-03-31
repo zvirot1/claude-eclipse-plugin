@@ -255,6 +255,9 @@ public class ClaudeCliManager {
 
     /**
      * Gracefully stop the CLI process.
+     * NOTE: This blocks the calling thread for up to 7 seconds while
+     * waiting for the process to exit.  For a non-blocking abort that
+     * is safe to call from the UI thread, use {@link #interruptCurrentQuery()}.
      */
     public synchronized void stop() {
         if (cliProcess == null || !cliProcess.isAlive()) {
@@ -272,7 +275,7 @@ public class ClaudeCliManager {
             healthChecker = null;
         }
 
-        // Stop protocol handler
+        // Stop protocol handler immediately so no more messages are dispatched
         if (protocolHandler != null) {
             protocolHandler.stop();
         }
@@ -291,6 +294,69 @@ public class ClaudeCliManager {
 
         state = ProcessState.STOPPED;
         fireStateChanged(ProcessState.STOPPING, ProcessState.STOPPED);
+    }
+
+    /**
+     * Non-blocking interrupt of the current query.
+     * <p>
+     * Immediately stops the protocol handler so no further messages reach
+     * the UI, then kills the CLI process on a background thread so the
+     * SWT UI thread is never blocked.  After the process dies the manager
+     * automatically restarts a fresh CLI session.
+     * <p>
+     * This is the preferred method for the Stop button and /stop command.
+     */
+    public void interruptCurrentQuery() {
+        // 1. Stop the protocol handler RIGHT NOW – this prevents any
+        //    buffered stdout data from being dispatched to listeners.
+        if (protocolHandler != null) {
+            protocolHandler.stop();
+        }
+
+        // 2. Kill the process and restart on a background thread so we
+        //    never block the SWT UI thread.
+        Thread killer = new Thread(() -> {
+            try {
+                synchronized (this) {
+                    if (cliProcess == null || !cliProcess.isAlive()) {
+                        state = ProcessState.STOPPED;
+                        fireStateChanged(state, ProcessState.STOPPED);
+                        return;
+                    }
+
+                    ProcessState oldState = state;
+                    state = ProcessState.STOPPING;
+                    fireStateChanged(oldState, ProcessState.STOPPING);
+
+                    // Stop health monitor
+                    if (healthChecker != null) {
+                        healthChecker.shutdown();
+                        healthChecker = null;
+                    }
+
+                    // On Windows, destroyForcibly() (TerminateProcess) is more
+                    // reliable than destroy() which only posts WM_CLOSE.
+                    cliProcess.destroyForcibly();
+                    try {
+                        cliProcess.waitFor(3, TimeUnit.SECONDS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+
+                    state = ProcessState.STOPPED;
+                    fireStateChanged(ProcessState.STOPPING, ProcessState.STOPPED);
+                }
+
+                // 3. Auto-restart so the user doesn't have to reconnect manually.
+                if (config != null) {
+                    start(config);
+                }
+            } catch (Exception e) {
+                Activator.logError("Error during interrupt/restart", e);
+            }
+        }, "Claude-CLI-Interrupt");
+        killer.setDaemon(true);
+        killer.start();
     }
 
     /**
