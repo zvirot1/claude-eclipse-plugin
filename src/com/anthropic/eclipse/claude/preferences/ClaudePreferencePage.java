@@ -33,8 +33,8 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
             "Model:",
             new String[] {
                 "default", "sonnet", "opus", "haiku",
-                "claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5",
-                "claude-sonnet-4-5-20250514", "claude-opus-4-5-20250514",
+                "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5",
+                "claude-sonnet-4-6-20250514", "claude-opus-4-6-20250514",
             },
             getFieldEditorParent()
         ));

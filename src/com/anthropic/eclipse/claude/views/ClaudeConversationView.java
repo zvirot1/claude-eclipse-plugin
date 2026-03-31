@@ -840,7 +840,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 return true;
             case "/model":
                 if (parts.length > 1 && !parts[1].isBlank()) {
-                    // Direct model switch: /model claude-sonnet-4-5
+                    // Direct model switch: /model claude-sonnet-4-6
                     switchToModel(parts[1].trim());
                 } else {
                     showModelInfo();
@@ -2644,9 +2644,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     // Model definitions: { modelId, displayLabel }
     private static final String[][] AVAILABLE_MODELS = {
-        {"claude-sonnet-4-5", "Sonnet 4.5 — Fast, balanced"},
-        {"claude-opus-4", "Opus 4 — Most capable"},
-        {"claude-haiku-3-5", "Haiku 3.5 — Fastest, lightweight"},
+        {"claude-sonnet-4-6", "Sonnet 4.6 — Fast, balanced"},
+        {"claude-opus-4-6", "Opus 4.6 — Most capable"},
+        {"claude-haiku-4-5", "Haiku 4.5 — Fastest, lightweight"},
     };
 
     private void showModelInfo() {
@@ -2733,7 +2733,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         if (!valid) {
             showInfoMessage("Unknown model: " + newModelId
-                + ". Available: claude-sonnet-4-5, claude-opus-4, claude-haiku-3-5");
+                + ". Available: claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5");
             return;
         }
 
