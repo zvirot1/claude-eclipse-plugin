@@ -254,7 +254,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         stopButton.setEnabled(false);
         stopButton.addListener(SWT.Selection, e -> {
             cancelStreamingTimeout();
-            cliManager.stop();
+            cliManager.interruptCurrentQuery();
             stopButton.setEnabled(false);
         });
 
@@ -833,7 +833,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 showHelp();
                 return true;
             case "/stop":
-                cliManager.stop();
+                cancelStreamingTimeout();
+                cliManager.interruptCurrentQuery();
+                stopButton.setEnabled(false);
                 return true;
             case "/resume":
                 showResumeDialog();
