@@ -280,15 +280,11 @@ public class ClaudeCliManager {
             protocolHandler.stop();
         }
 
-        // Try graceful shutdown first
-        cliProcess.destroy();
+        // Kill the entire process tree (npx → cmd → node) then wait
+        destroyProcessTree(cliProcess);
         try {
-            if (!cliProcess.waitFor(5, TimeUnit.SECONDS)) {
-                cliProcess.destroyForcibly();
-                cliProcess.waitFor(2, TimeUnit.SECONDS);
-            }
+            cliProcess.waitFor(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
-            cliProcess.destroyForcibly();
             Thread.currentThread().interrupt();
         }
 
@@ -307,23 +303,31 @@ public class ClaudeCliManager {
      * This is the preferred method for the Stop button and /stop command.
      */
     public void interruptCurrentQuery() {
-        // 1. Stop the protocol handler RIGHT NOW – this prevents any
-        //    buffered stdout data from being dispatched to listeners.
+        Activator.logInfo("[Stop] interruptCurrentQuery() called");
+
+        // 1. Stop the protocol handler RIGHT NOW — clears listeners so
+        //    no messages can reach the UI even if the read loop continues.
         if (protocolHandler != null) {
             protocolHandler.stop();
+            Activator.logInfo("[Stop] protocolHandler.stop() completed — listeners cleared");
         }
 
-        // 2. Kill the process and restart on a background thread so we
-        //    never block the SWT UI thread.
+        // 2. Kill the ENTIRE process tree immediately from the calling thread.
+        //    On Windows, the Claude CLI runs via npx → cmd.exe → node.exe.
+        //    Process.destroyForcibly() only kills the direct child (npx/cmd),
+        //    leaving the node.exe grandchild alive and still writing to stdout.
+        //    We use ProcessHandle.descendants() to kill every process in the tree.
+        Process proc = cliProcess;  // snapshot — avoid races
+        if (proc != null && proc.isAlive()) {
+            destroyProcessTree(proc);
+            Activator.logInfo("[Stop] Process tree killed for PID " + proc.pid());
+        }
+
+        // 3. Wait for process exit and auto-restart on a background thread
+        //    so the UI thread never blocks.
         Thread killer = new Thread(() -> {
             try {
                 synchronized (this) {
-                    if (cliProcess == null || !cliProcess.isAlive()) {
-                        state = ProcessState.STOPPED;
-                        fireStateChanged(state, ProcessState.STOPPED);
-                        return;
-                    }
-
                     ProcessState oldState = state;
                     state = ProcessState.STOPPING;
                     fireStateChanged(oldState, ProcessState.STOPPING);
@@ -334,20 +338,21 @@ public class ClaudeCliManager {
                         healthChecker = null;
                     }
 
-                    // On Windows, destroyForcibly() (TerminateProcess) is more
-                    // reliable than destroy() which only posts WM_CLOSE.
-                    cliProcess.destroyForcibly();
-                    try {
-                        cliProcess.waitFor(3, TimeUnit.SECONDS);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
+                    // Wait for root process to finish dying
+                    if (cliProcess != null && cliProcess.isAlive()) {
+                        try {
+                            cliProcess.waitFor(3, TimeUnit.SECONDS);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
 
                     state = ProcessState.STOPPED;
                     fireStateChanged(ProcessState.STOPPING, ProcessState.STOPPED);
                 }
 
-                // 3. Auto-restart so the user doesn't have to reconnect manually.
+                Activator.logInfo("[Stop] Process terminated, auto-restarting CLI");
+                // 4. Auto-restart so the user doesn't have to reconnect manually.
                 if (config != null) {
                     start(config);
                 }
@@ -394,6 +399,51 @@ public class ClaudeCliManager {
         } catch (IllegalThreadStateException e) {
             return -1; // still running
         }
+    }
+
+    // ==================== Process Tree Management ====================
+
+    /**
+     * Kill an entire process tree (the process and all its descendants).
+     * <p>
+     * On Windows the Claude CLI is typically launched via npx → cmd.exe → node.exe.
+     * {@link Process#destroyForcibly()} only sends TerminateProcess to the direct
+     * child, leaving grandchildren alive.  This method uses the Java 9+
+     * {@link ProcessHandle} API to enumerate and kill every descendant first,
+     * then kills the root process.
+     * <p>
+     * All calls are non-blocking (safe for the UI thread).
+     */
+    private static void destroyProcessTree(Process process) {
+        long pid = process.pid();
+
+        // Strategy 1 (Windows-specific): taskkill /F /T kills the entire
+        // process tree reliably, including grandchildren spawned by npx/cmd.
+        if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
+            try {
+                Process killer = new ProcessBuilder(
+                    "taskkill", "/F", "/T", "/PID", String.valueOf(pid)
+                ).redirectErrorStream(true).start();
+                // Don't wait — taskkill is fast and we don't want to block the UI thread
+                Activator.logInfo("[Stop] taskkill /F /T /PID " + pid + " dispatched");
+            } catch (Exception e) {
+                Activator.logWarning("[Stop] taskkill failed: " + e.getMessage());
+            }
+        }
+
+        // Strategy 2 (cross-platform fallback): ProcessHandle descendants
+        try {
+            ProcessHandle root = process.toHandle();
+            root.descendants().forEach(ph -> {
+                Activator.logInfo("[Stop]   killing descendant PID " + ph.pid());
+                ph.destroyForcibly();
+            });
+        } catch (Exception e) {
+            Activator.logWarning("[Stop] Could not enumerate descendants: " + e.getMessage());
+        }
+
+        // Always kill the root process too
+        process.destroyForcibly();
     }
 
     // ==================== Listener Management ====================
