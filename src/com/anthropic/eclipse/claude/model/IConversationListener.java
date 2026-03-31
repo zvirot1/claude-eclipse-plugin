@@ -87,6 +87,11 @@ public interface IConversationListener {
     default void onExtendedThinkingEnded() {}
 
     /**
+     * Called when an assistant message is removed (e.g. replaced by stream events).
+     */
+    default void onAssistantMessageRemoved(MessageBlock block) {}
+
+    /**
      * Called when an error occurs.
      */
     default void onError(String error) {}
