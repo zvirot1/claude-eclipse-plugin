@@ -145,10 +145,17 @@ public class StreamingTextWidget extends Composite {
 
     public static int detectOrientation(String text) {
         if (text == null) return SWT.LEFT_TO_RIGHT;
-        // Skip leading punctuation/whitespace to find the first real directional character
+        // Skip leading punctuation, whitespace, markdown formatting, and non-letter
+        // symbols to find the first real alphabetic character whose directionality
+        // determines the text orientation.  Previously, markdown chars like '#', '*',
+        // '-', '>' were treated as LTR, causing Hebrew text with headings/lists to
+        // render left-to-right.
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
-            if (Character.isWhitespace(c) || "?!.,;:\"'()[]{}".indexOf(c) >= 0) continue;
+            // Skip whitespace, common punctuation, markdown formatting, and any
+            // character that is not a Unicode letter — we only care about the first
+            // real letter to determine direction.
+            if (!Character.isLetter(c)) continue;
             byte dir = Character.getDirectionality(c);
             if (dir == Character.DIRECTIONALITY_RIGHT_TO_LEFT
                     || dir == Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC

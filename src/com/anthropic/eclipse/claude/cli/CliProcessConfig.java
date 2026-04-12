@@ -45,6 +45,23 @@ public class CliProcessConfig {
     public String[] getAdditionalDirs() { return additionalDirs; }
 
     /**
+     * Create a new config that resumes the given session ID, preserving all
+     * other settings (model, permission mode, max turns, etc.) from this config.
+     * Used when restarting after an interrupt to maintain conversation memory.
+     */
+    public CliProcessConfig withResume(String resumeId) {
+        Builder b = new Builder(cliPath, workingDirectory)
+            .permissionMode(permissionMode)
+            .model(model)
+            .resumeSessionId(resumeId)
+            .maxTurns(maxTurns);
+        if (appendSystemPrompt != null) b.appendSystemPrompt(appendSystemPrompt);
+        if (allowedTools != null) b.allowedTools(allowedTools);
+        if (additionalDirs != null) b.additionalDirs(additionalDirs);
+        return b.build();
+    }
+
+    /**
      * Builder for CliProcessConfig.
      */
     public static class Builder {

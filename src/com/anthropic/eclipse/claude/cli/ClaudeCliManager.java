@@ -293,17 +293,26 @@ public class ClaudeCliManager {
     }
 
     /**
+     * Interrupt with no session resume (backwards compatibility).
+     */
+    public void interruptCurrentQuery() {
+        interruptCurrentQuery(null);
+    }
+
+    /**
      * Non-blocking interrupt of the current query.
      * <p>
      * Immediately stops the protocol handler so no further messages reach
      * the UI, then kills the CLI process on a background thread so the
      * SWT UI thread is never blocked.  After the process dies the manager
-     * automatically restarts a fresh CLI session.
-     * <p>
-     * This is the preferred method for the Stop button and /stop command.
+     * auto-restarts the CLI.
+     *
+     * @param resumeSessionId if non-null, the CLI will restart with --resume
+     *                        to preserve conversation memory
      */
-    public void interruptCurrentQuery() {
-        Activator.logInfo("[Stop] interruptCurrentQuery() called");
+    public void interruptCurrentQuery(String resumeSessionId) {
+        Activator.logInfo("[Stop] interruptCurrentQuery() called"
+            + (resumeSessionId != null ? " (resume " + resumeSessionId + ")" : ""));
 
         // 1. Stop the protocol handler RIGHT NOW — clears listeners so
         //    no messages can reach the UI even if the read loop continues.
@@ -353,8 +362,14 @@ public class ClaudeCliManager {
 
                 Activator.logInfo("[Stop] Process terminated, auto-restarting CLI");
                 // 4. Auto-restart so the user doesn't have to reconnect manually.
+                //    If a session ID was provided, restart with --resume to preserve
+                //    conversation memory (like VS Code does after Escape/Stop).
                 if (config != null) {
-                    start(config);
+                    if (resumeSessionId != null && !resumeSessionId.isEmpty()) {
+                        start(config.withResume(resumeSessionId));
+                    } else {
+                        start(config);
+                    }
                 }
             } catch (Exception e) {
                 Activator.logError("Error during interrupt/restart", e);

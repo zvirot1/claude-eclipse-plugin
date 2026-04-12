@@ -39,8 +39,9 @@ import org.eclipse.swt.dnd.Clipboard;
 import org.eclipse.swt.dnd.ImageTransfer;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.graphics.ImageData;
-import org.eclipse.swt.graphics.ImageLoader;
+import org.eclipse.swt.graphics.PaletteData;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.layout.RowLayout;
@@ -106,6 +107,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private CostStatusBar costBar;
     private Label connectionStatus;
     private Button sendButton;
+    private boolean sendButtonIsStop = false; // true when send button is showing stop icon
+    private Image sendIcon;   // blue circle with ↑ arrow
+    private Image stopIcon;   // red circle with ■ square
     private Button stopButton;
 
     // Thinking indicator (shown while waiting for Claude's first response token)
@@ -208,6 +212,68 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         errorColor = tm.getColor(tm.errorColor);
     }
 
+    /**
+     * Create a 16x16 send icon: white ↑ arrow on a round blue background.
+     */
+    private Image createSendIcon(Display display) {
+        int s = 20;
+        PaletteData pal = new PaletteData(0xFF0000, 0x00FF00, 0x0000FF);
+        ImageData d = new ImageData(s, s, 24, pal);
+        d.alphaData = new byte[s * s];
+        double r = s / 2.0;
+        int blue = (59 << 16) | (130 << 8) | 246;
+        for (int y = 0; y < s; y++) {
+            for (int x = 0; x < s; x++) {
+                double dx = x - r + 0.5, dy = y - r + 0.5;
+                double dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist <= r) {
+                    d.setPixel(x, y, blue);
+                    d.alphaData[y * s + x] = (byte) 255;
+                }
+            }
+        }
+        // White arrow: vertical shaft + chevron head
+        int cx = s / 2;
+        for (int t = -1; t <= 0; t++) { // 2px wide shaft
+            for (int y = 4; y <= 15; y++) setPixelIfInCircle(d, cx + t, y, s, 0xFFFFFF);
+        }
+        for (int i = 1; i <= 5; i++) { // chevron arms
+            setPixelIfInCircle(d, cx - 1 - i, 4 + i, s, 0xFFFFFF);
+            setPixelIfInCircle(d, cx + i, 4 + i, s, 0xFFFFFF);
+            setPixelIfInCircle(d, cx - 2 - i, 4 + i, s, 0xFFFFFF);
+            setPixelIfInCircle(d, cx + 1 + i, 4 + i, s, 0xFFFFFF);
+        }
+        return new Image(display, d);
+    }
+
+    private Image createStopIcon(Display display) {
+        int s = 20;
+        PaletteData pal = new PaletteData(0xFF0000, 0x00FF00, 0x0000FF);
+        ImageData d = new ImageData(s, s, 24, pal);
+        d.alphaData = new byte[s * s];
+        double r = s / 2.0;
+        int red = (239 << 16) | (68 << 8) | 68;
+        for (int y = 0; y < s; y++) {
+            for (int x = 0; x < s; x++) {
+                double dx = x - r + 0.5, dy = y - r + 0.5;
+                double dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist <= r) {
+                    // White square in center (6,6)-(13,13)
+                    d.setPixel(x, y, (x >= 6 && x <= 13 && y >= 6 && y <= 13) ? 0xFFFFFF : red);
+                    d.alphaData[y * s + x] = (byte) 255;
+                }
+            }
+        }
+        return new Image(display, d);
+    }
+
+    private void setPixelIfInCircle(ImageData d, int x, int y, int s, int color) {
+        if (x >= 0 && x < s && y >= 0 && y < s) {
+            double r = s / 2.0, dx = x - r + 0.5, dy = y - r + 0.5;
+            if (Math.sqrt(dx * dx + dy * dy) <= r) d.setPixel(x, y, color);
+        }
+    }
+
     private void createActionBar(Composite parent) {
         Composite toolbar = new Composite(parent, SWT.NONE);
         GridLayout tbLayout = new GridLayout(8, false);
@@ -256,12 +322,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         stopButton.setText("\u25A0");
         setTooltip(stopButton, "Stop current query");
         stopButton.setEnabled(false);
-        stopButton.addListener(SWT.Selection, e -> {
-            renderingSuppressed = true;  // Block ALL further UI updates immediately
-            cancelStreamingTimeout();
-            cliManager.interruptCurrentQuery();
-            stopButton.setEnabled(false);
-        });
+        stopButton.addListener(SWT.Selection, e -> handleStop());
 
         Button clearBtn = new Button(toolbar, SWT.PUSH | SWT.FLAT);
         clearBtn.setText("\u2715");
@@ -486,11 +547,20 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         spacer.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         spacer.setBackground(inputBgColor);
 
-        // Send button (arrow up in colored circle, like VS Code)
+        // Send button — toggles between send (↑) and stop (■) like VS Code
+        Display display = buttonBar.getDisplay();
+        sendIcon = createSendIcon(display);
+        stopIcon = createStopIcon(display);
         sendButton = new Button(buttonBar, SWT.PUSH);
-        sendButton.setText("\u2191");  // ↑ arrow
+        sendButton.setImage(sendIcon);
         sendButton.setToolTipText("Send message (Enter)");
-        sendButton.addListener(SWT.Selection, e -> handleInput());
+        sendButton.addListener(SWT.Selection, e -> {
+            if (sendButtonIsStop) {
+                handleStop();
+            } else {
+                handleInput();
+            }
+        });
 
         // Context info line below input (permission mode + active file)
         Composite contextLine = new Composite(inputContainer, SWT.NONE);
@@ -615,7 +685,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                         e2.doit = false;
                     }
                 } else if (e2.keyCode == SWT.ESC) {
-                    dismissAutocomplete();
+                    if (autocompletePopup != null && !autocompletePopup.isDisposed()
+                            && autocompletePopup.isVisible()) {
+                        dismissAutocomplete();
+                    } else if (sendButtonIsStop) {
+                        // Escape stops the current query (like VS Code)
+                        handleStop();
+                    }
                     e2.doit = false;
                 }
             }
@@ -741,6 +817,52 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         });
     }
 
+    // ==================== Send/Stop Button Toggle ====================
+
+    /**
+     * Switch the send button to "stop" mode (■) — shown while streaming.
+     */
+    private void setSendButtonToStop() {
+        if (sendButton == null || sendButton.isDisposed()) return;
+        sendButtonIsStop = true;
+        sendButton.setImage(stopIcon);
+        sendButton.setToolTipText("Stop current query (Escape)");
+        sendButton.getParent().layout(true, true);
+    }
+
+    /**
+     * Switch the send button back to "send" mode (↑) — shown when idle.
+     */
+    private void setSendButtonToSend() {
+        if (sendButton == null || sendButton.isDisposed()) return;
+        sendButtonIsStop = false;
+        sendButton.setImage(sendIcon);
+        sendButton.setToolTipText("Send message (Enter)");
+        sendButton.getParent().layout(true, true);
+    }
+
+    /**
+     * Handle stop action — triggered by send button in stop mode, toolbar stop button, or /stop command.
+     * Passes the current session ID so the CLI restarts with --resume, preserving conversation memory.
+     */
+    private void handleStop() {
+        renderingSuppressed = true;  // Block ALL further UI updates immediately
+        cancelStreamingTimeout();
+
+        // Get the current session ID so the CLI can resume with conversation memory intact
+        String sessionId = null;
+        SessionInfo info = model.getSessionInfo();
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            sessionId = info.getSessionId();
+        }
+        cliManager.interruptCurrentQuery(sessionId);
+
+        stopButton.setEnabled(false);
+        setSendButtonToSend();
+        hideThinkingIndicator();
+        costBar.setStatus("Interrupted");
+    }
+
     // ==================== Message Handling ====================
 
     private void handleInput() {
@@ -816,6 +938,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         renderingSuppressed = false;  // Reset for new query
         stopButton.setEnabled(true);
+        setSendButtonToStop();
         costBar.setStatus("Streaming...");
         // Queue AFTER the user message asyncExec so indicator appears below the user message
         Display.getDefault().asyncExec(this::showThinkingIndicator);
@@ -839,10 +962,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 showHelp();
                 return true;
             case "/stop":
-                renderingSuppressed = true;
-                cancelStreamingTimeout();
-                cliManager.interruptCurrentQuery();
-                stopButton.setEnabled(false);
+                handleStop();
                 return true;
             case "/resume":
                 showResumeDialog();
@@ -1066,7 +1186,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         if (cliManager.isRunning()) {
             cliManager.sendMessage(fullMessage);
+            renderingSuppressed = false;
             stopButton.setEnabled(true);
+            setSendButtonToStop();
             costBar.setStatus("Streaming...");
         }
     }
@@ -1601,6 +1723,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             hideThinkingIndicator();
             costBar.updateUsage(usage);
             stopButton.setEnabled(false);
+            setSendButtonToSend();
             costBar.setStatus("Ready");
 
             // Save session state
@@ -3080,6 +3203,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Save session before disposing
         saveCurrentSession();
         dismissAutocomplete();
+        if (sendIcon != null) sendIcon.dispose();
+        if (stopIcon != null) stopIcon.dispose();
 
         if (model != null) {
             model.removeListener(this);
