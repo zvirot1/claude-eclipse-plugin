@@ -4,3 +4,7 @@ target/
 .settings/
 .claude/
 *.class
+build/
+sources.txt
+# Stray build artifacts left in the project root (use build/ instead)
+/com.anthropic.eclipse.claude_*.jar
