@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+   <feature id="com.anthropic.eclipse.claude.feature" version="0.0.0">
+      <category name="claude"/>
+   </feature>
+   <category-def name="claude" label="Claude AI">
+      <description>Claude AI plugin for Eclipse</description>
+   </category-def>
+</site>

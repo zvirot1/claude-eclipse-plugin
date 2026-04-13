@@ -84,188 +84,84 @@ rm -f "$FEATURE_JAR"
 (cd "$FEATURE_WORK" && jar cfM "../../$FEATURE_JAR" META-INF/MANIFEST.MF feature.xml)
 echo "  -> $FEATURE_JAR ($(stat -c%s "$FEATURE_JAR") bytes)"
 
-# ==================== Step 5: Build P2 Update Site ====================
-echo "[5/5] Building P2 update site..."
+# ==================== Step 5: Build P2 Update Site (using Eclipse p2 publisher) ====================
+echo "[5/5] Building P2 update site via Eclipse p2 publisher..."
 SITE_DIR="build/update-site"
+SITE_ABS="$(pwd)/$SITE_DIR"
 rm -rf "$SITE_DIR"
 mkdir -p "$SITE_DIR/plugins" "$SITE_DIR/features"
 cp "$PLUGIN_JAR" "$SITE_DIR/plugins/"
 cp "$FEATURE_JAR" "$SITE_DIR/features/"
 
-# Compute checksums and sizes
-PLUGIN_SIZE=$(stat -c%s "$PLUGIN_JAR")
-PLUGIN_SHA256=$(sha256sum "$PLUGIN_JAR" | cut -d' ' -f1)
-PLUGIN_SHA512=$(sha512sum "$PLUGIN_JAR" | cut -d' ' -f1)
-FEATURE_SIZE=$(stat -c%s "$FEATURE_JAR")
-FEATURE_SHA256=$(sha256sum "$FEATURE_JAR" | cut -d' ' -f1)
-FEATURE_SHA512=$(sha512sum "$FEATURE_JAR" | cut -d' ' -f1)
-P2_TIMESTAMP=$(date +%s)000
+# category.xml at site root (referenced by CategoryPublisher below)
+CATEGORY_FILE="$(pwd)/build/category.xml"
+cat > "$CATEGORY_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+   <feature url="features/${FEATURE_ID}_${VERSION}.jar" id="${FEATURE_ID}" version="${VERSION}">
+      <category name="claude"/>
+   </feature>
+   <category-def name="claude" label="Claude AI">
+      <description>Claude AI plugin for Eclipse</description>
+   </category-def>
+</site>
+EOF
 
-# p2.index
+# Locate Eclipse install + launcher (search common paths)
+ECLIPSE_HOME=""
+for candidate in "C:/eclipse2025-12/eclipse" "C:/eclipse" "C:/dev/eclipse25-12/eclipse"; do
+    if [ -d "$candidate/plugins" ]; then
+        ECLIPSE_HOME="$candidate"
+        break
+    fi
+done
+if [ -z "$ECLIPSE_HOME" ]; then
+    echo "ERROR: Could not find Eclipse install (looked in C:/eclipse2025-12, C:/eclipse, C:/dev/eclipse25-12)" >&2
+    exit 1
+fi
+LAUNCHER_JAR=$(ls "$ECLIPSE_HOME"/plugins/org.eclipse.equinox.launcher_*.jar 2>/dev/null | head -1)
+if [ -z "$LAUNCHER_JAR" ]; then
+    echo "ERROR: equinox.launcher jar not found in $ECLIPSE_HOME/plugins" >&2
+    exit 1
+fi
+echo "  Using Eclipse: $ECLIPSE_HOME"
+
+# Convert path to file:/C:/... URL (Windows). pwd in git-bash gives /c/dev/... ; need C:/dev/...
+to_url() {
+    local p="$1"
+    # /c/dev/... -> C:/dev/...
+    p="$(echo "$p" | sed -E 's|^/([a-zA-Z])/|\1:/|; s|\\|/|g')"
+    echo "file:/$p"
+}
+SITE_URL="$(to_url "$SITE_ABS")"
+CATEGORY_URL="$(to_url "$CATEGORY_FILE")"
+echo "  Site URL:     $SITE_URL"
+echo "  Category URL: $CATEGORY_URL"
+
+# Run FeaturesAndBundlesPublisher: generates content.xml + artifacts.xml from the JARs
+java -jar "$LAUNCHER_JAR" \
+    -application org.eclipse.equinox.p2.publisher.FeaturesAndBundlesPublisher \
+    -metadataRepository "$SITE_URL" \
+    -artifactRepository "$SITE_URL" \
+    -metadataRepositoryName "Claude AI Eclipse Plugin Update Site" \
+    -artifactRepositoryName "Claude AI Eclipse Plugin Update Site" \
+    -source "$SITE_ABS" \
+    -compress -publishArtifacts \
+    -nosplash 2>&1 | tail -20
+
+# Run CategoryPublisher: adds the Claude AI category referencing the feature
+java -jar "$LAUNCHER_JAR" \
+    -application org.eclipse.equinox.p2.publisher.CategoryPublisher \
+    -metadataRepository "$SITE_URL" \
+    -categoryDefinition "$CATEGORY_URL" \
+    -compress \
+    -nosplash 2>&1 | tail -10
+
+# p2.index helps p2 discover repo type
 cat > "$SITE_DIR/p2.index" <<EOF
 version = 1
-metadata.repository.factory.order = content.xml,!
-artifact.repository.factory.order = artifacts.xml,!
-EOF
-
-# content.xml (metadata repository)
-cat > "$SITE_DIR/content.xml" <<EOF
-<?xml version='1.0' encoding='UTF-8'?>
-<?metadataRepository version='1.2.0'?>
-<repository name='Claude AI Eclipse Plugin Update Site' type='org.eclipse.equinox.internal.p2.metadata.repository.LocalMetadataRepository' version='1.0.0'>
-  <properties size='2'>
-    <property name='p2.timestamp' value='${P2_TIMESTAMP}'/>
-    <property name='p2.compressed' value='false'/>
-  </properties>
-  <units size='4'>
-    <unit id='${FEATURE_ID}.feature.group' version='${VERSION}' singleton='false'>
-      <update id='${FEATURE_ID}.feature.group' range='[0.0.0,${VERSION})' severity='0'/>
-      <properties size='5'>
-        <property name='org.eclipse.equinox.p2.name' value='Claude AI Eclipse Plugin'/>
-        <property name='org.eclipse.equinox.p2.description' value='Unofficial Claude AI plugin for Eclipse IDE.'/>
-        <property name='org.eclipse.equinox.p2.description.url' value='https://github.com/anthropics/claude-code'/>
-        <property name='org.eclipse.equinox.p2.provider' value='Anthropic (Unofficial)'/>
-        <property name='org.eclipse.equinox.p2.type.group' value='true'/>
-      </properties>
-      <provides size='1'>
-        <provided namespace='org.eclipse.equinox.p2.iu' name='${FEATURE_ID}.feature.group' version='${VERSION}'/>
-      </provides>
-      <requires size='2'>
-        <required namespace='org.eclipse.equinox.p2.iu' name='${PLUGIN_ID}' range='[${VERSION},${VERSION}]'/>
-        <required namespace='org.eclipse.equinox.p2.iu' name='${FEATURE_ID}.feature.jar' range='[${VERSION},${VERSION}]'>
-          <filter>
-            (org.eclipse.update.install.features=true)
-          </filter>
-        </required>
-      </requires>
-      <licenses size='1'>
-        <license>
-          This plugin is provided as-is for personal use.
-        </license>
-      </licenses>
-      <copyright>
-        Copyright (c) 2024 Anthropic (Unofficial). All rights reserved.
-      </copyright>
-    </unit>
-    <unit id='${FEATURE_ID}.feature.jar' version='${VERSION}'>
-      <properties size='4'>
-        <property name='org.eclipse.equinox.p2.name' value='Claude AI Eclipse Plugin'/>
-        <property name='org.eclipse.equinox.p2.description' value='Unofficial Claude AI plugin for Eclipse IDE.'/>
-        <property name='org.eclipse.equinox.p2.description.url' value='https://github.com/anthropics/claude-code'/>
-        <property name='org.eclipse.equinox.p2.provider' value='Anthropic (Unofficial)'/>
-      </properties>
-      <provides size='3'>
-        <provided namespace='org.eclipse.equinox.p2.iu' name='${FEATURE_ID}.feature.jar' version='${VERSION}'/>
-        <provided namespace='org.eclipse.equinox.p2.eclipse.type' name='feature' version='1.0.0'/>
-        <provided namespace='org.eclipse.update.feature' name='${FEATURE_ID}' version='${VERSION}'/>
-      </provides>
-      <filter>
-        (org.eclipse.update.install.features=true)
-      </filter>
-      <artifacts size='1'>
-        <artifact classifier='org.eclipse.update.feature' id='${FEATURE_ID}' version='${VERSION}'/>
-      </artifacts>
-      <touchpoint id='org.eclipse.equinox.p2.osgi' version='1.0.0'/>
-      <touchpointData size='1'>
-        <instructions size='1'>
-          <instruction key='zipped'>
-            true
-          </instruction>
-        </instructions>
-      </touchpointData>
-      <licenses size='1'>
-        <license>
-          This plugin is provided as-is for personal use.
-        </license>
-      </licenses>
-      <copyright>
-        Copyright (c) 2024 Anthropic (Unofficial). All rights reserved.
-      </copyright>
-    </unit>
-    <unit id='${PLUGIN_ID}' version='${VERSION}' generation='2'>
-      <update id='${PLUGIN_ID}' range='[0.0.0,${VERSION})' severity='0'/>
-      <properties size='2'>
-        <property name='org.eclipse.equinox.p2.name' value='Claude AI Plugin'/>
-        <property name='org.eclipse.equinox.p2.provider' value='Anthropic (Unofficial)'/>
-      </properties>
-      <provides size='2'>
-        <provided namespace='org.eclipse.equinox.p2.iu' name='${PLUGIN_ID}' version='${VERSION}'/>
-        <provided namespace='osgi.bundle' name='${PLUGIN_ID}' version='${VERSION}'/>
-      </provides>
-      <requires size='9'>
-        <required namespace='osgi.bundle' name='org.eclipse.ui' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.core.runtime' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.ui.editors' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.ui.workbench.texteditor' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.jface' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.jface.text' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.core.resources' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.ui.ide' range='0.0.0'/>
-        <required namespace='osgi.bundle' name='org.eclipse.equinox.security' range='0.0.0'/>
-      </requires>
-      <artifacts size='1'>
-        <artifact classifier='osgi.bundle' id='${PLUGIN_ID}' version='${VERSION}'/>
-      </artifacts>
-      <touchpoint id='org.eclipse.equinox.p2.osgi' version='1.0.0'/>
-      <touchpointData size='1'>
-        <instructions size='1'>
-          <instruction key='manifest'>
-            Bundle-SymbolicName: ${PLUGIN_ID};singleton:=true&amp;#xA;Bundle-Version: ${VERSION}&amp;#xA;
-          </instruction>
-        </instructions>
-      </touchpointData>
-    </unit>
-    <unit id='Claude_AI_Eclipse_Plugin' version='${VERSION}' singleton='false'>
-      <properties size='2'>
-        <property name='org.eclipse.equinox.p2.name' value='Claude AI Eclipse Plugin'/>
-        <property name='org.eclipse.equinox.p2.type.category' value='true'/>
-      </properties>
-      <provides size='1'>
-        <provided namespace='org.eclipse.equinox.p2.iu' name='Claude_AI_Eclipse_Plugin' version='${VERSION}'/>
-      </provides>
-      <requires size='1'>
-        <required namespace='org.eclipse.equinox.p2.iu' name='${FEATURE_ID}.feature.group' range='[${VERSION},${VERSION}]'/>
-      </requires>
-      <touchpoint id='null' version='0.0.0'/>
-    </unit>
-  </units>
-</repository>
-EOF
-
-# artifacts.xml (artifact repository)
-cat > "$SITE_DIR/artifacts.xml" <<EOF
-<?xml version='1.0' encoding='UTF-8'?>
-<?artifactRepository version='1.1.0'?>
-<repository name='Claude AI Eclipse Plugin Update Site' type='org.eclipse.equinox.p2.artifact.repository.simpleRepository' version='1'>
-  <properties size='2'>
-    <property name='p2.timestamp' value='${P2_TIMESTAMP}'/>
-    <property name='p2.compressed' value='false'/>
-  </properties>
-  <mappings size='3'>
-    <rule filter='(&amp; (classifier=osgi.bundle))' output='\${repoUrl}/plugins/\${id}_\${version}.jar'/>
-    <rule filter='(&amp; (classifier=binary))' output='\${repoUrl}/binary/\${id}_\${version}'/>
-    <rule filter='(&amp; (classifier=org.eclipse.update.feature))' output='\${repoUrl}/features/\${id}_\${version}.jar'/>
-  </mappings>
-  <artifacts size='2'>
-    <artifact classifier='osgi.bundle' id='${PLUGIN_ID}' version='${VERSION}'>
-      <properties size='4'>
-        <property name='artifact.size' value='${PLUGIN_SIZE}'/>
-        <property name='download.size' value='${PLUGIN_SIZE}'/>
-        <property name='download.checksum.sha-512' value='${PLUGIN_SHA512}'/>
-        <property name='download.checksum.sha-256' value='${PLUGIN_SHA256}'/>
-      </properties>
-    </artifact>
-    <artifact classifier='org.eclipse.update.feature' id='${FEATURE_ID}' version='${VERSION}'>
-      <properties size='5'>
-        <property name='artifact.size' value='${FEATURE_SIZE}'/>
-        <property name='download.size' value='${FEATURE_SIZE}'/>
-        <property name='download.checksum.sha-512' value='${FEATURE_SHA512}'/>
-        <property name='download.checksum.sha-256' value='${FEATURE_SHA256}'/>
-        <property name='download.contentType' value='application/zip'/>
-      </properties>
-    </artifact>
-  </artifacts>
-</repository>
+metadata.repository.factory.order = content.xml.xz,content.xml,!
+artifact.repository.factory.order = artifacts.xml.xz,artifacts.xml,!
 EOF
 
 # Package zip
