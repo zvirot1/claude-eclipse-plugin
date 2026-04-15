@@ -88,18 +88,44 @@ public class ClaudeSettingsReader {
 
     // ==================== Internal ====================
 
+    // Retry parameters for the case where another process (typically a running
+    // Claude CLI — each conversation view now owns its own) is mid-write to
+    // the same file and we briefly see truncated / invalid JSON.
+    private static final int    MAX_READ_ATTEMPTS   = 4;
+    private static final long[] BACKOFF_DELAYS_MS   = { 25L, 75L, 200L };
+
     @SuppressWarnings("unchecked")
     private void mergeFile(Path path, Map<String, Object> target) {
         if (!Files.exists(path)) return;
-        try {
-            String content = Files.readString(path, StandardCharsets.UTF_8).trim();
-            if (content.isEmpty()) return;
-            Map<String, Object> parsed = JsonParser.parseObject(content);
-            target.putAll(parsed);
-        } catch (IOException e) {
-            Activator.logWarning("[ClaudeSettingsReader] Could not read " + path + ": " + e.getMessage());
-        } catch (Exception e) {
-            Activator.logWarning("[ClaudeSettingsReader] Could not parse " + path + ": " + e.getMessage());
+
+        Exception lastError = null;
+        for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt++) {
+            try {
+                String content = Files.readString(path, StandardCharsets.UTF_8).trim();
+                if (content.isEmpty()) return;
+                Map<String, Object> parsed = JsonParser.parseObject(content);
+                target.putAll(parsed);
+                return; // success
+            } catch (IOException | RuntimeException e) {
+                // IOException: file locked / disappeared mid-read
+                // RuntimeException (from JsonParser): truncated / invalid JSON
+                lastError = e;
+                if (attempt < BACKOFF_DELAYS_MS.length) {
+                    try {
+                        Thread.sleep(BACKOFF_DELAYS_MS[attempt]);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
         }
+
+        // Exhausted retries — log and move on. A missing read just means the
+        // caller gets defaults from lower-precedence sources.
+        String kind = (lastError instanceof IOException) ? "read" : "parse";
+        Activator.logWarning("[ClaudeSettingsReader] Could not " + kind + " " + path
+                + " after " + MAX_READ_ATTEMPTS + " attempts: "
+                + (lastError != null ? lastError.getMessage() : "unknown"));
     }
 }
