@@ -30,7 +30,9 @@ public class Activator extends AbstractUIPlugin {
     private static Activator plugin;
 
     // Singleton services
-    private ClaudeCliManager cliManager;
+    // NOTE: Each conversation session owns its own ClaudeCliManager — the
+    // plugin no longer maintains a shared CLI process. See the "active CLI
+    // manager" tracking below for status-bar integration.
     private ClaudeSessionManager sessionManager;
     private EditDecisionManager editDecisionManager;
     private CheckpointManager checkpointManager;
@@ -40,6 +42,14 @@ public class Activator extends AbstractUIPlugin {
     private ConversationModel conversationModel;
     private final List<Consumer<ConversationModel>> modelChangeListeners = new CopyOnWriteArrayList<>();
 
+    // Active CLI manager — the CLI of the currently focused conversation view.
+    // The status-bar contribution listens to this so it reflects the active tab.
+    private ClaudeCliManager activeCliManager;
+    private final List<Consumer<ClaudeCliManager>> cliManagerChangeListeners = new CopyOnWriteArrayList<>();
+    // Every CLI manager that has ever been created but not yet disposed — so we
+    // can stop them all on plugin shutdown.
+    private final List<ClaudeCliManager> allCliManagers = new CopyOnWriteArrayList<>();
+
     public Activator() {}
 
     @Override
@@ -47,8 +57,7 @@ public class Activator extends AbstractUIPlugin {
         super.start(context);
         plugin = this;
 
-        // Initialize singleton services
-        cliManager = new ClaudeCliManager();
+        // Initialize singleton services (no CLI manager here — one per session)
         sessionManager = new ClaudeSessionManager();
         editDecisionManager = new EditDecisionManager();
         checkpointManager = new CheckpointManager();
@@ -60,10 +69,11 @@ public class Activator extends AbstractUIPlugin {
 
     @Override
     public void stop(BundleContext context) throws Exception {
-        // Shutdown CLI process
-        if (cliManager != null) {
-            cliManager.stop();
+        // Shutdown every CLI process that was ever created
+        for (ClaudeCliManager mgr : allCliManagers) {
+            try { mgr.stop(); } catch (Exception ignored) {}
         }
+        allCliManagers.clear();
         plugin = null;
         super.stop(context);
     }
@@ -73,10 +83,56 @@ public class Activator extends AbstractUIPlugin {
     }
 
     /**
-     * Get the singleton CLI manager.
+     * Create a brand-new CLI manager dedicated to a single conversation view/session.
+     * The caller is responsible for calling {@link ClaudeCliManager#stop()} on dispose.
+     * The manager is automatically tracked so it can be stopped on plugin shutdown.
      */
-    public ClaudeCliManager getCliManager() {
-        return cliManager;
+    public ClaudeCliManager createCliManager() {
+        ClaudeCliManager mgr = new ClaudeCliManager();
+        allCliManagers.add(mgr);
+        return mgr;
+    }
+
+    /**
+     * Unregister a CLI manager when its owning view is disposed.
+     * Does NOT call stop() — caller is expected to have done that already.
+     */
+    public void releaseCliManager(ClaudeCliManager mgr) {
+        if (mgr != null) {
+            allCliManagers.remove(mgr);
+            if (activeCliManager == mgr) {
+                setActiveCliManager(null);
+            }
+        }
+    }
+
+    /**
+     * Get the CLI manager of the currently active conversation view (may be null).
+     * Used by the workbench status bar to display per-tab state.
+     */
+    public ClaudeCliManager getActiveCliManager() {
+        return activeCliManager;
+    }
+
+    /**
+     * Set the active CLI manager (called by a view when it gains focus or is created).
+     */
+    public void setActiveCliManager(ClaudeCliManager mgr) {
+        this.activeCliManager = mgr;
+        for (Consumer<ClaudeCliManager> listener : cliManagerChangeListeners) {
+            try { listener.accept(mgr); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Register a listener that fires whenever the active CLI manager changes.
+     */
+    public void addActiveCliManagerListener(Consumer<ClaudeCliManager> listener) {
+        cliManagerChangeListeners.add(listener);
+    }
+
+    public void removeActiveCliManagerListener(Consumer<ClaudeCliManager> listener) {
+        cliManagerChangeListeners.remove(listener);
     }
 
     /**

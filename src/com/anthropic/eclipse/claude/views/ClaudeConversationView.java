@@ -162,18 +162,22 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void createPartControl(Composite parent) {
-        // Get services
-        cliManager = Activator.getDefault().getCliManager();
+        // Get shared services
         editDecisionManager = Activator.getDefault().getEditDecisionManager();
         sessionManager = Activator.getDefault().getSessionManager();
+
+        // Each view owns its own dedicated CLI process — no cross-tab sharing.
+        cliManager = Activator.getDefault().createCliManager();
 
         model = new ConversationModel();
         model.addListener(this);
         cliManager.addMessageListener(model);
         cliManager.addStateListener(this);
 
-        // Make the model accessible to other components (e.g. status bar)
+        // Make the model and CLI accessible to other components (e.g. status bar).
+        // Since each tab has its own CLI, the status bar reflects whichever tab is active.
         Activator.getDefault().setConversationModel(model);
+        Activator.getDefault().setActiveCliManager(cliManager);
 
         initColors(parent.getDisplay());
 
@@ -3164,6 +3168,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (inputField != null && !inputField.isDisposed()) {
             inputField.setFocus();
         }
+        // Make this tab's CLI the active one so the status bar reflects it
+        Activator activator = Activator.getDefault();
+        if (activator != null) {
+            activator.setConversationModel(model);
+            activator.setActiveCliManager(cliManager);
+        }
     }
 
     /**
@@ -3212,6 +3222,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (cliManager != null) {
             cliManager.removeMessageListener(model);
             cliManager.removeStateListener(this);
+            // Stop the CLI process that this view owned and release it from the Activator's
+            // tracking so it can't be reused or leak a zombie node.exe process.
+            try { cliManager.stop(); } catch (Exception ignored) {}
+            if (Activator.getDefault() != null) {
+                Activator.getDefault().releaseCliManager(cliManager);
+            }
         }
 
         // Clear the shared model reference so status bar shows "Disconnected"
