@@ -542,8 +542,71 @@ public class ClaudeCliManager {
                 command.add(dir);
             }
         }
+        if (config.getEffortLevel() != null && !config.getEffortLevel().isEmpty()) {
+            command.add("--effort");
+            command.add(config.getEffortLevel());
+        }
 
         return command;
+    }
+
+    /**
+     * Return the last config this manager was started with (may be null if
+     * never started). Used by the view to derive a modified config for
+     * hot-swapping permission mode or effort without losing conversation
+     * context.
+     */
+    public CliProcessConfig getConfig() {
+        return config;
+    }
+
+    /**
+     * Restart the CLI with the given config, preserving conversation memory
+     * via --resume (which the caller is expected to have set on {@code newConfig}
+     * if desired). Safe to call from the UI thread — the kill + restart runs
+     * on a background thread.
+     */
+    public void restartWithConfig(CliProcessConfig newConfig) {
+        if (newConfig == null) return;
+        Activator.logInfo("[HotSwap] restartWithConfig — mode="
+            + newConfig.getPermissionMode() + ", effort=" + newConfig.getEffortLevel()
+            + ", resume=" + newConfig.getResumeSessionId());
+
+        // Stop protocol handler immediately so no messages reach UI during restart
+        if (protocolHandler != null) protocolHandler.stop();
+
+        Process proc = cliProcess;
+        if (proc != null && proc.isAlive()) {
+            destroyProcessTree(proc);
+        }
+
+        Thread killer = new Thread(() -> {
+            try {
+                synchronized (this) {
+                    ProcessState oldState = state;
+                    state = ProcessState.STOPPING;
+                    fireStateChanged(oldState, ProcessState.STOPPING);
+
+                    if (healthChecker != null) {
+                        healthChecker.shutdown();
+                        healthChecker = null;
+                    }
+                    if (cliProcess != null && cliProcess.isAlive()) {
+                        try { cliProcess.waitFor(3, TimeUnit.SECONDS); }
+                        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    }
+
+                    state = ProcessState.STOPPED;
+                    fireStateChanged(ProcessState.STOPPING, ProcessState.STOPPED);
+                }
+                Activator.logInfo("[HotSwap] Process terminated, starting with new config");
+                start(newConfig);
+            } catch (Exception e) {
+                Activator.logError("[HotSwap] Failed to restart CLI", e);
+            }
+        }, "Claude-CLI-HotSwap");
+        killer.setDaemon(true);
+        killer.start();
     }
 
     private void startHealthMonitor() {

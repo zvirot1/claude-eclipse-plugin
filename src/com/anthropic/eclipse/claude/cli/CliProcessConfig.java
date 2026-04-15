@@ -17,6 +17,7 @@ public class CliProcessConfig {
     private final String appendSystemPrompt;  // --append-system-prompt
     private final int maxTurns;               // --max-turns, 0 for unlimited
     private final String[] additionalDirs;    // --add-dir
+    private final String effortLevel;         // --effort: "low", "medium", "high", "max", or null for Auto
 
     private CliProcessConfig(Builder builder) {
         this.cliPath = builder.cliPath;
@@ -30,6 +31,7 @@ public class CliProcessConfig {
         this.appendSystemPrompt = builder.appendSystemPrompt;
         this.maxTurns = builder.maxTurns;
         this.additionalDirs = builder.additionalDirs;
+        this.effortLevel = builder.effortLevel;
     }
 
     public String getCliPath() { return cliPath; }
@@ -43,6 +45,7 @@ public class CliProcessConfig {
     public String getAppendSystemPrompt() { return appendSystemPrompt; }
     public int getMaxTurns() { return maxTurns; }
     public String[] getAdditionalDirs() { return additionalDirs; }
+    public String getEffortLevel() { return effortLevel; }
 
     /**
      * Create a new config that resumes the given session ID, preserving all
@@ -50,15 +53,43 @@ public class CliProcessConfig {
      * Used when restarting after an interrupt to maintain conversation memory.
      */
     public CliProcessConfig withResume(String resumeId) {
+        return toBuilder().resumeSessionId(resumeId).build();
+    }
+
+    /**
+     * Create a new config with a different permission mode (and optionally
+     * effort level), preserving every other setting and adding --resume so
+     * the session memory is carried over. Used for hot-swapping the mode
+     * without losing conversation state.
+     *
+     * @param newMode         new permission mode (CLI value) — null leaves unchanged
+     * @param newEffort       new effort level (low/medium/high/max) — null = Auto (no flag)
+     * @param resumeSessionId session ID to resume — non-null to preserve memory
+     */
+    public CliProcessConfig withModeAndEffort(String newMode, String newEffort,
+                                              String resumeSessionId) {
+        Builder b = toBuilder().effort(newEffort);
+        if (newMode != null) b.permissionMode(newMode);
+        if (resumeSessionId != null && !resumeSessionId.isEmpty()) {
+            b.resumeSessionId(resumeSessionId);
+        }
+        return b.build();
+    }
+
+    /** Copy this config into a fresh Builder. */
+    public Builder toBuilder() {
         Builder b = new Builder(cliPath, workingDirectory)
             .permissionMode(permissionMode)
             .model(model)
-            .resumeSessionId(resumeId)
-            .maxTurns(maxTurns);
+            .maxTurns(maxTurns)
+            .effort(effortLevel);
         if (appendSystemPrompt != null) b.appendSystemPrompt(appendSystemPrompt);
         if (allowedTools != null) b.allowedTools(allowedTools);
         if (additionalDirs != null) b.additionalDirs(additionalDirs);
-        return b.build();
+        if (sessionId != null) b.sessionId(sessionId);
+        if (resumeSessionId != null) b.resumeSessionId(resumeSessionId);
+        if (continueSession) b.continueSession(true);
+        return b;
     }
 
     /**
@@ -76,6 +107,7 @@ public class CliProcessConfig {
         private String appendSystemPrompt;
         private int maxTurns;
         private String[] additionalDirs;
+        private String effortLevel;
 
         public Builder(String cliPath, String workingDirectory) {
             this.cliPath = cliPath;
@@ -124,6 +156,25 @@ public class CliProcessConfig {
 
         public Builder additionalDirs(String... additionalDirs) {
             this.additionalDirs = additionalDirs;
+            return this;
+        }
+
+        /**
+         * Effort level for the session. Accepted values: {@code null} (Auto,
+         * no flag passed), {@code "low"}, {@code "medium"}, {@code "high"},
+         * {@code "max"}. Any other value throws {@link IllegalArgumentException}.
+         */
+        public Builder effort(String effortLevel) {
+            if (effortLevel != null && !effortLevel.isEmpty()) {
+                switch (effortLevel) {
+                    case "low": case "medium": case "high": case "max":
+                        break;
+                    default:
+                        throw new IllegalArgumentException(
+                            "effort must be one of low/medium/high/max, got: " + effortLevel);
+                }
+            }
+            this.effortLevel = (effortLevel == null || effortLevel.isEmpty()) ? null : effortLevel;
             return this;
         }
 

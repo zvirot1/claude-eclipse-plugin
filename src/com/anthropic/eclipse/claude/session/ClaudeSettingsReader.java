@@ -76,6 +76,38 @@ public class ClaudeSettingsReader {
     }
 
     /**
+     * Read the user's default effort level from {@code ~/.claude/settings.json}.
+     * Returns null if unset or the value is invalid (callers should treat null
+     * as "Auto" — no {@code --effort} flag passed).
+     */
+    public String getUserEffortLevel() {
+        String value = getUserSetting("effortLevel", null);
+        if (value == null) return null;
+        switch (value) {
+            case "low": case "medium": case "high": case "max":
+                return value;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Read the user's default permission mode from {@code ~/.claude/settings.json}.
+     * Checks {@code permissions.defaultMode} (new layout) then falls back to
+     * {@code permissionMode} (legacy key).
+     */
+    @SuppressWarnings("unchecked")
+    public String getUserPermissionMode() {
+        Map<String, Object> settings = loadUserSettings();
+        Object perms = settings.get("permissions");
+        if (perms instanceof Map) {
+            Object def = ((Map<String, Object>) perms).get("defaultMode");
+            if (def instanceof String) return (String) def;
+        }
+        return JsonParser.getString(settings, "permissionMode");
+    }
+
+    /**
      * Get a boolean value from the user settings file.
      */
     public boolean getUserSettingBoolean(String key, boolean fallback) {

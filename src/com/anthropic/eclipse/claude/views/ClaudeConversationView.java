@@ -72,6 +72,7 @@ import com.anthropic.eclipse.claude.model.ConversationModel;
 import com.anthropic.eclipse.claude.model.IConversationListener;
 import com.anthropic.eclipse.claude.model.MessageBlock;
 import com.anthropic.eclipse.claude.model.SessionInfo;
+import com.anthropic.eclipse.claude.session.ClaudeSettingsReader;
 import com.anthropic.eclipse.claude.model.UsageInfo;
 import com.anthropic.eclipse.claude.preferences.PreferenceConstants;
 import com.anthropic.eclipse.claude.session.ClaudeSessionManager;
@@ -156,6 +157,16 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     // Selection indicator
     private Label selectionIndicatorLabel;
 
+    // Per-view permission mode & effort — NOT singletons. Each tab owns its own.
+    // Initialized from preferences / settings.json on view creation; changed
+    // via the inline mode popup or Shift+Tab. When changed while the CLI is
+    // running, the view hot-swaps the CLI via --resume so conversation memory
+    // is preserved.
+    private com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode currentMode;
+    private String currentEffort; // null = Auto (no --effort flag)
+    private Button modeButton;
+    private com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup activeModePopup;
+
     // Slash command autocomplete
     private org.eclipse.swt.widgets.Shell autocompletePopup;
     private org.eclipse.swt.widgets.Table autocompleteTable;
@@ -178,6 +189,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Since each tab has its own CLI, the status bar reflects whichever tab is active.
         Activator.getDefault().setConversationModel(model);
         Activator.getDefault().setActiveCliManager(cliManager);
+
+        // Initialize per-view permission mode + effort from preferences, falling back
+        // to ~/.claude/settings.json, then to defaults. These are PER-VIEW state —
+        // changing the mode in one tab does not affect other tabs.
+        initModeAndEffortFromPreferences();
 
         initColors(parent.getDisplay());
 
@@ -519,9 +535,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         attachmentManager = new AttachmentManager(attachmentBar, parent.getShell(),
             inputField, msg -> showError(msg));
 
-        // Row 2: Button bar inside input box [📎 attach] [/ commands] --- spacer --- [↑ send]
+        // Row 2: Button bar inside input box
+        // [📎 attach] [/ commands] --- spacer --- [✋ Ask before edits ▾] [↑ send]
         Composite buttonBar = new Composite(inputBox, SWT.NONE);
-        GridLayout bbLayout = new GridLayout(4, false);
+        GridLayout bbLayout = new GridLayout(5, false);
         bbLayout.marginWidth = 0;
         bbLayout.marginHeight = 0;
         bbLayout.horizontalSpacing = 4;
@@ -551,6 +568,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         spacer.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         spacer.setBackground(inputBgColor);
 
+        // Mode button — shows current permission mode, opens ModeSelectorPopup
+        // (this is the VS Code-style inline selector; it also hosts the Effort slider).
+        modeButton = new Button(buttonBar, SWT.FLAT);
+        modeButton.setToolTipText("Permission mode (Shift+Tab to cycle)");
+        modeButton.addListener(SWT.Selection, e -> openModePopup());
+        refreshModeButton();
+
         // Send button — toggles between send (↑) and stop (■) like VS Code
         Display display = buttonBar.getDisplay();
         sendIcon = createSendIcon(display);
@@ -566,7 +590,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             }
         });
 
-        // Context info line below input (permission mode + active file)
+        // Context info line below input (selection + active file + shortcut hint).
+        // Note: permission mode used to live here as a passive label. It moved to the
+        // interactive mode button in the input button bar (VS Code style), so the
+        // context line no longer displays it.
         Composite contextLine = new Composite(inputContainer, SWT.NONE);
         GridLayout clLayout = new GridLayout(3, false);
         clLayout.marginWidth = 2;
@@ -579,14 +606,6 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ThemeManager tmCtx = ThemeManager.getInstance();
         Color hintColor = tmCtx.getColor(tmCtx.hintText);
         Font hintFont = new Font(parent.getDisplay(), tmCtx.getUIFontName(), 9, SWT.NORMAL);
-
-        Label permLabel = new Label(contextLine, SWT.NONE);
-        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
-        String perm = prefs.getString(PreferenceConstants.PERMISSION_MODE);
-        permLabel.setText("\uD83D\uDD12 " + (perm != null && !perm.isBlank() ? perm : "acceptEdits"));
-        permLabel.setForeground(hintColor);
-        permLabel.setBackground(viewBgColor);
-        permLabel.setFont(hintFont);
 
         // Selection indicator — shows "N lines selected" when editor has a text selection
         selectionIndicatorLabel = new Label(contextLine, SWT.NONE);
@@ -614,6 +633,18 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         shortcutLabel.setFont(hintFont);
 
         contextLine.addDisposeListener(e -> { hintColor.dispose(); hintFont.dispose(); });
+
+        // Shift+Tab cycles through permission modes (Ask → Edit auto → Plan → wrap).
+        // We use a TraverseListener with TAB_PREVIOUS because SWT treats Shift+Tab
+        // as a traversal event on Text widgets — plain KeyDown wouldn't fire.
+        inputField.addListener(SWT.Traverse, e -> {
+            if (e.detail == SWT.TRAVERSE_TAB_PREVIOUS
+                    && (e.stateMask & SWT.SHIFT) != 0) {
+                e.doit = false;
+                cycleMode();
+            }
+        });
+
         inputField.addListener(SWT.KeyDown, e -> {
             if (e.keyCode == SWT.CR || e.keyCode == SWT.LF || e.keyCode == SWT.KEYPAD_CR) {
                 boolean enterToSend = Activator.getDefault().getPreferenceStore()
@@ -865,6 +896,136 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         setSendButtonToSend();
         hideThinkingIndicator();
         costBar.setStatus("Interrupted");
+    }
+
+    // ==================== Permission Mode & Effort (per-view) ====================
+
+    /**
+     * Initialize {@code currentMode} and {@code currentEffort} for this view.
+     * Priority: Eclipse preference > {@code ~/.claude/settings.json} > defaults.
+     * Must run before {@code createInputArea} so the mode button shows the right label.
+     */
+    private void initModeAndEffortFromPreferences() {
+        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+        ClaudeSettingsReader reader = Activator.getDefault().getSettingsReader();
+
+        // --- Permission mode ---
+        String pref = prefs.getString(PreferenceConstants.PERMISSION_MODE);
+        String cli;
+        if (pref == null || pref.isBlank()
+                || pref.equals(prefs.getDefaultString(PreferenceConstants.PERMISSION_MODE))) {
+            String fromSettings = (reader != null) ? reader.getUserPermissionMode() : null;
+            cli = (fromSettings != null && !fromSettings.isBlank()) ? fromSettings : pref;
+        } else {
+            cli = pref;
+        }
+        this.currentMode =
+            com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode.fromCliValue(cli);
+
+        // --- Effort ---
+        this.currentEffort = (reader != null) ? reader.getUserEffortLevel() : null;
+    }
+
+    /**
+     * Translate the user-facing mode into the CLI value we actually pass to
+     * {@code --permission-mode}. Centralizes the stream-json compatibility
+     * fallback: "default" requires interactive prompts which don't work in
+     * stream-json, so we substitute "acceptEdits" (with PermissionBanner
+     * still handling per-tool approval via stdio).
+     */
+    private String cliPermissionModeFor(
+            com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode m) {
+        if (m == null) return "acceptEdits";
+        // Note: we keep the raw "default" value here — the CLI does honor it
+        // in stream-json when --permission-prompt-tool=stdio is set (which is
+        // our case; see ClaudeCliManager.buildCommand).
+        return m.cliValue;
+    }
+
+    /**
+     * Open the mode selector popup anchored to the mode button.
+     */
+    private void openModePopup() {
+        if (modeButton == null || modeButton.isDisposed()) return;
+        if (activeModePopup != null && activeModePopup.isOpen()) {
+            activeModePopup.close();
+            activeModePopup = null;
+            return;
+        }
+        activeModePopup = com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.show(
+            modeButton,
+            currentMode,
+            this::applyModeChange,
+            currentEffort,
+            this::applyEffortChange);
+    }
+
+    /**
+     * Apply a mode change: update per-view state, refresh button label, and
+     * hot-swap the CLI if it's running (preserving session memory via --resume).
+     */
+    private void applyModeChange(
+            com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode newMode) {
+        if (newMode == null || newMode == currentMode) return;
+        currentMode = newMode;
+        refreshModeButton();
+        hotSwapCliForModeOrEffort();
+    }
+
+    /**
+     * Apply an effort change: update per-view state and hot-swap CLI if running.
+     */
+    private void applyEffortChange(String newEffort) {
+        if (java.util.Objects.equals(newEffort, currentEffort)) return;
+        currentEffort = newEffort;
+        hotSwapCliForModeOrEffort();
+    }
+
+    /**
+     * Cycle to the next mode (Shift+Tab handler).
+     */
+    private void cycleMode() {
+        if (currentMode == null) return;
+        applyModeChange(currentMode.next());
+    }
+
+    private void refreshModeButton() {
+        if (modeButton == null || modeButton.isDisposed() || currentMode == null) return;
+        modeButton.setText(currentMode.icon + "  " + currentMode.label);
+        modeButton.setToolTipText(currentMode.description + "\n(Shift+Tab to cycle)");
+        modeButton.getParent().layout(true, true);
+    }
+
+    /**
+     * Hot-swap the CLI with the new mode/effort, preserving session memory.
+     * Only restarts if the CLI is currently running — otherwise the new values
+     * will be picked up on next start.
+     */
+    private void hotSwapCliForModeOrEffort() {
+        if (cliManager == null) return;
+        ClaudeCliManager.ProcessState state = cliManager.getState();
+        if (state != ClaudeCliManager.ProcessState.RUNNING
+                && state != ClaudeCliManager.ProcessState.STARTING) {
+            return; // will be applied on next start
+        }
+        CliProcessConfig oldConfig = cliManager.getConfig();
+        if (oldConfig == null) return;
+
+        String sessionId = null;
+        SessionInfo info = model.getSessionInfo();
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            sessionId = info.getSessionId();
+        }
+
+        CliProcessConfig newConfig;
+        try {
+            newConfig = oldConfig.withModeAndEffort(
+                cliPermissionModeFor(currentMode), currentEffort, sessionId);
+        } catch (IllegalArgumentException e) {
+            showError("Invalid effort value: " + e.getMessage());
+            return;
+        }
+        cliManager.restartWithConfig(newConfig);
     }
 
     // ==================== Message Handling ====================
@@ -2054,13 +2215,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         String cliModel = mapModelName(prefsModel);
 
-        // Get permission mode from preferences.
-        // In stream-json mode, "default" would try interactive terminal prompts which don't
-        // work, so fall back to "acceptEdits" which auto-approves file edits.
-        String permMode = prefs.getString(PreferenceConstants.PERMISSION_MODE);
-        if (permMode == null || permMode.isBlank() || "default".equals(permMode)) {
-            permMode = "acceptEdits";
-        }
+        // Permission mode + effort come from PER-VIEW state (set by the mode button
+        // popup or initialized from preferences in createPartControl). This keeps
+        // each tab independent — flipping the mode in one tab never affects another.
+        String permMode = cliPermissionModeFor(currentMode);
+        String effortLevel = currentEffort;
 
         // Get max turns from preferences
         int maxTurns = prefs.getInt(PreferenceConstants.MAX_TURNS);
@@ -2068,7 +2227,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         try {
             CliProcessConfig.Builder builder = new CliProcessConfig.Builder(cliPath, workDir)
                 .model(cliModel)
-                .permissionMode(permMode);
+                .permissionMode(permMode)
+                .effort(effortLevel);
 
             if (maxTurns > 0) {
                 builder.maxTurns(maxTurns);
@@ -3213,6 +3373,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Save session before disposing
         saveCurrentSession();
         dismissAutocomplete();
+        if (activeModePopup != null) { try { activeModePopup.close(); } catch (Exception ignored) {} }
         if (sendIcon != null) sendIcon.dispose();
         if (stopIcon != null) stopIcon.dispose();
 
