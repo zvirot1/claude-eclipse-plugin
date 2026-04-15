@@ -124,7 +124,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private final Map<MessageBlock, MessageComposite> messageWidgetMap = new LinkedHashMap<>();
     // Direct toolId → ToolCallComposite map for reliable status updates
     private final Map<String, com.anthropic.eclipse.claude.views.widgets.ToolCallComposite> toolCallWidgetById = new java.util.concurrent.ConcurrentHashMap<>();
-    private MessageBlock welcomeBlock; // tracked so we can dismiss it on first real message
+    // Welcome screen shown in an empty conversation. Was a MessageBlock but is now
+    // a standalone Composite (icon + friendly text, VS Code style) — simpler and
+    // avoids rendering it as a message bubble.
+    private Composite welcomeComposite;
 
     // Streaming timeout: if Claude doesn't respond within this many ms, show a warning.
     // 120 seconds — the model often needs >1 min to think between inter-turn tool calls
@@ -1442,7 +1445,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             }
             messageWidgetMap.clear();
             toolCallWidgetById.clear();
-            welcomeBlock = null;
+            if (welcomeComposite != null && !welcomeComposite.isDisposed()) {
+                welcomeComposite.dispose();
+            }
+            welcomeComposite = null;
             if (messageContainer != null && !messageContainer.isDisposed()) {
                 messageContainer.layout(true, true);
             }
@@ -1512,7 +1518,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     }
                     messageWidgetMap.clear();
                     toolCallWidgetById.clear();
-                    welcomeBlock = null; // will be re-shown only if history is empty
+                    if (welcomeComposite != null && !welcomeComposite.isDisposed()) {
+                        welcomeComposite.dispose();
+                    }
+                    welcomeComposite = null; // will be re-shown only if history is empty
                     if (messageContainer != null && !messageContainer.isDisposed()) {
                         messageContainer.layout(true, true);
                     }
@@ -1918,7 +1927,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             }
             messageWidgetMap.clear();
             toolCallWidgetById.clear();
-            welcomeBlock = null; // reset before re-adding
+            if (welcomeComposite != null && !welcomeComposite.isDisposed()) {
+                welcomeComposite.dispose();
+            }
+            welcomeComposite = null; // reset before re-adding
             addWelcomeMessage();
             scrollToBottom();
             costBar.reset();
@@ -2737,40 +2749,127 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     // ==================== UI Helpers ====================
 
+    /**
+     * Render the empty-conversation welcome screen — VS Code style: a small
+     * mascot icon centered above a friendly one-line prompt. Replaces the
+     * old feature-dump message bubble which the user had to scroll past on
+     * every new tab.
+     */
     private void addWelcomeMessage() {
-        welcomeBlock = new MessageBlock(MessageBlock.Role.SYSTEM);
-        MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
-        textSeg.appendText("Welcome to Claude Code for Eclipse!\n\n" +
-            "Features:\n" +
-            "- Real-time streaming responses\n" +
-            "- Agentic tool use (file read/write, search, commands)\n" +
-            "- Code blocks with Copy/Apply/Insert\n" +
-            "- File & image attachments\n" +
-            "- Inline edit accept/reject\n" +
-            "- Session save/resume\n\n" +
-            "Commands: /new, /clear, /cost, /help, /stop, /resume, /model\n" +
-            "CLI Commands: /commit, /review-pr, /explain, /fix, /test, /refactor\n\n" +
-            "Type a message below to get started.");
-        welcomeBlock.addSegment(textSeg);
+        if (messageContainer == null || messageContainer.isDisposed()) return;
+        if (welcomeComposite != null && !welcomeComposite.isDisposed()) return;
 
-        MessageComposite widget = new MessageComposite(messageContainer, welcomeBlock);
-        messageWidgetMap.put(welcomeBlock, widget);
+        welcomeComposite = new Composite(messageContainer, SWT.NONE);
+        GridLayout wLayout = new GridLayout(1, false);
+        wLayout.marginTop = 48;
+        wLayout.marginBottom = 24;
+        wLayout.marginWidth = 24;
+        wLayout.verticalSpacing = 12;
+        welcomeComposite.setLayout(wLayout);
+        welcomeComposite.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+        welcomeComposite.setBackground(viewBgColor);
+
+        // Mascot icon — drawn programmatically so we don't ship another asset.
+        // Orange pixel-art-ish robot face, VS Code welcome vibe.
+        Label iconLabel = new Label(welcomeComposite, SWT.NONE);
+        GridData iconGd = new GridData(SWT.CENTER, SWT.CENTER, true, false);
+        iconLabel.setLayoutData(iconGd);
+        iconLabel.setBackground(viewBgColor);
+        Image mascot = createWelcomeMascot(welcomeComposite.getDisplay());
+        iconLabel.setImage(mascot);
+        // Dispose the generated image when the welcome widget is disposed
+        iconLabel.addDisposeListener(e -> { if (mascot != null) mascot.dispose(); });
+
+        // Friendly prompt
+        Label prompt = new Label(welcomeComposite, SWT.WRAP | SWT.CENTER);
+        prompt.setText("What to do first? Ask about this codebase\nor we can start writing code.");
+        ThemeManager tm = ThemeManager.getInstance();
+        Color promptColor = tm.getColor(tm.titleColor);
+        prompt.setForeground(promptColor);
+        prompt.setBackground(viewBgColor);
+        Font promptFont = new Font(welcomeComposite.getDisplay(), tm.getUIFontName(), 11, SWT.NORMAL);
+        prompt.setFont(promptFont);
+        GridData promptGd = new GridData(SWT.CENTER, SWT.CENTER, true, false);
+        promptGd.widthHint = 420;
+        prompt.setLayoutData(promptGd);
+        prompt.addDisposeListener(e -> promptFont.dispose());
+
         scrollToBottom();
     }
 
     /**
-     * Dismiss the welcome message widget. Called when the first real message is sent
+     * Draw the small robot-face mascot used in the welcome screen. Orange
+     * body, dark eyes, minimal antenna — roughly matches the VS Code feel
+     * without requiring a separate PNG asset.
+     */
+    private Image createWelcomeMascot(Display display) {
+        int size = 48;
+        PaletteData pal = new PaletteData(0xFF0000, 0x00FF00, 0x0000FF);
+        ImageData data = new ImageData(size, size, 24, pal);
+        data.alphaData = new byte[size * size];
+
+        int orange = (204 << 16) | (85 << 8) | 45;    // #CC552D rust
+        int orangeDark = (160 << 16) | (60 << 8) | 30;
+        int dark   = (30 << 16) | (30 << 8) | 30;     // eyes
+
+        // Antenna (2px tall stalk + small dot on top)
+        fillRect(data, size, 23, 6, 2, 3, orangeDark);
+        fillRect(data, size, 22, 4, 4, 3, orangeDark);
+
+        // Body: rounded rectangle roughly 32x28 centered
+        int bx = 8, by = 10, bw = 32, bh = 28, radius = 4;
+        for (int y = by; y < by + bh; y++) {
+            for (int x = bx; x < bx + bw; x++) {
+                // Rounded corners
+                boolean corner = false;
+                int cx = 0, cy = 0;
+                if (x < bx + radius && y < by + radius) { corner = true; cx = bx + radius; cy = by + radius; }
+                else if (x >= bx + bw - radius && y < by + radius) { corner = true; cx = bx + bw - radius - 1; cy = by + radius; }
+                else if (x < bx + radius && y >= by + bh - radius) { corner = true; cx = bx + radius; cy = by + bh - radius - 1; }
+                else if (x >= bx + bw - radius && y >= by + bh - radius) { corner = true; cx = bx + bw - radius - 1; cy = by + bh - radius - 1; }
+                if (corner) {
+                    int dx = x - cx, dy = y - cy;
+                    if (dx * dx + dy * dy > radius * radius) continue;
+                }
+                data.setPixel(x, y, orange);
+                data.alphaData[y * size + x] = (byte) 255;
+            }
+        }
+
+        // Eyes — two dark rectangles
+        fillRect(data, size, 17, 20, 4, 5, dark);
+        fillRect(data, size, 27, 20, 4, 5, dark);
+
+        // Mouth — small horizontal bar
+        fillRect(data, size, 20, 30, 8, 2, dark);
+
+        return new Image(display, data);
+    }
+
+    private void fillRect(ImageData d, int canvasSize, int x, int y, int w, int h, int color) {
+        for (int yy = y; yy < y + h && yy < canvasSize; yy++) {
+            for (int xx = x; xx < x + w && xx < canvasSize; xx++) {
+                if (xx < 0 || yy < 0) continue;
+                d.setPixel(xx, yy, color);
+                d.alphaData[yy * canvasSize + xx] = (byte) 255;
+            }
+        }
+    }
+
+    /**
+     * Dismiss the welcome widget. Called when the first real message is sent
      * or when session history is loaded, so the chat area is uncluttered.
      * Must be called on the UI thread.
      */
     private void dismissWelcomeMessage() {
-        if (welcomeBlock == null) return;
-        MessageComposite w = messageWidgetMap.remove(welcomeBlock);
-        if (w != null && !w.isDisposed()) {
-            w.dispose();
-            messageContainer.layout(true, true);
+        if (welcomeComposite == null) return;
+        if (!welcomeComposite.isDisposed()) {
+            welcomeComposite.dispose();
+            if (messageContainer != null && !messageContainer.isDisposed()) {
+                messageContainer.layout(true, true);
+            }
         }
-        welcomeBlock = null;
+        welcomeComposite = null;
     }
 
     private void showError(String error) {
