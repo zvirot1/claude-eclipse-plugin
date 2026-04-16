@@ -109,6 +109,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private Label connectionStatus;
     private Button sendButton;
     private boolean sendButtonIsStop = false; // true when send button is showing stop icon
+    private long lastSendTimestamp = 0; // debounce: prevent double-send within 300ms
     private Image sendIcon;   // blue circle with ↑ arrow
     private Image stopIcon;   // red circle with ■ square
     private Button stopButton;
@@ -170,9 +171,36 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private Button modeButton;
     private com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup activeModePopup;
 
+    // Eclipse memento — used to persist session ID across Eclipse restarts
+    private org.eclipse.ui.IMemento savedMemento;
+    private static final String MEMENTO_SESSION_ID = "claudeSessionId";
+    private static final String MEMENTO_TAB_TITLE  = "claudeTabTitle";
+
     // Slash command autocomplete
     private org.eclipse.swt.widgets.Shell autocompletePopup;
     private org.eclipse.swt.widgets.Table autocompleteTable;
+
+    @Override
+    public void init(org.eclipse.ui.IViewSite site, org.eclipse.ui.IMemento memento) throws org.eclipse.ui.PartInitException {
+        super.init(site, memento);
+        this.savedMemento = memento; // may be null on first launch
+    }
+
+    @Override
+    public void saveState(org.eclipse.ui.IMemento memento) {
+        super.saveState(memento);
+        if (memento == null) return;
+        // Persist the CLI session ID so we can --resume on next Eclipse launch
+        SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            memento.putString(MEMENTO_SESSION_ID, info.getSessionId());
+        }
+        // Persist the tab title
+        String title = getPartName();
+        if (title != null && !title.equals("Claude Code")) {
+            memento.putString(MEMENTO_TAB_TITLE, title);
+        }
+    }
 
     @Override
     public void createPartControl(Composite parent) {
@@ -216,11 +244,26 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             ((GridData) costBar.getLayoutData()).exclude = true;
         }
 
-        // Auto-start CLI if available
+        // Auto-start CLI if available (may be overridden by auto-resume below)
         autoStartCli();
 
         // Track editor selection to show "N lines selected" indicator
         registerSelectionListener();
+
+        // Auto-resume previous session if Eclipse is restarting and we have a saved session ID
+        if (savedMemento != null) {
+            String resumeId = savedMemento.getString(MEMENTO_SESSION_ID);
+            String savedTitle = savedMemento.getString(MEMENTO_TAB_TITLE);
+            if (savedTitle != null && !savedTitle.isEmpty()) {
+                setPartName(savedTitle);
+                partNameSet = true;
+            }
+            if (resumeId != null && !resumeId.isEmpty()) {
+                // Defer resume so the UI is fully built first
+                Display.getDefault().asyncExec(() -> resumeSession(resumeId));
+            }
+            savedMemento = null; // consumed
+        }
     }
 
     // ==================== UI Creation ====================
@@ -1149,6 +1192,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     // ==================== Message Handling ====================
 
     private void handleInput() {
+        // Debounce: ignore rapid duplicate sends (e.g. Enter + button click in same instant)
+        long now = System.currentTimeMillis();
+        if (now - lastSendTimestamp < 300) return;
+        lastSendTimestamp = now;
+
         String text = inputField.getText().trim();
         boolean hasAttachments = attachmentManager != null && attachmentManager.hasAttachments();
         if (text.isEmpty() && !hasAttachments) return;

@@ -189,12 +189,15 @@ public class NdjsonProtocolHandler {
                 // New CLI format for permission prompts (can_use_tool subtype)
                 return parseControlRequest(json);
             case "rate_limit_event":
-                // Informational event about API rate limits — no action needed by the plugin
-                Activator.logInfo("[NDJSON] rate_limit_event: status="
-                    + JsonParser.getString(JsonParser.getMap(json, "rate_limit_info"), "status")
-                    + " overageStatus="
-                    + JsonParser.getString(JsonParser.getMap(json, "rate_limit_info"), "overageStatus"));
-                return null;
+                Map<String, Object> rlInfo = JsonParser.getMap(json, "rate_limit_info");
+                String rlStatus = JsonParser.getString(rlInfo, "status");
+                String rlOverage = JsonParser.getString(rlInfo, "overageStatus");
+                Activator.logInfo("[NDJSON] rate_limit_event: status=" + rlStatus
+                    + " overageStatus=" + rlOverage);
+                CliMessage.RateLimitEvent rlEvent = new CliMessage.RateLimitEvent();
+                rlEvent.setStatus(rlStatus);
+                rlEvent.setOverageStatus(rlOverage);
+                return rlEvent;
             case "tool_use_summary":
                 // Informational summary of a completed tool use — no action needed
                 return null;

@@ -277,6 +277,29 @@ public abstract class CliMessage {
         public void setRawJson(Map<String, Object> rawJson) { this.rawJson = rawJson; }
     }
 
+    // ==================== Rate Limit Event ====================
+
+    /**
+     * Informational event about API rate limits.
+     * When overageStatus is "rejected", the request was throttled.
+     */
+    public static class RateLimitEvent extends CliMessage {
+        private String status;
+        private String overageStatus;
+
+        public RateLimitEvent() { super("rate_limit_event"); }
+
+        public String getStatus() { return status; }
+        public void setStatus(String status) { this.status = status; }
+        public String getOverageStatus() { return overageStatus; }
+        public void setOverageStatus(String overageStatus) { this.overageStatus = overageStatus; }
+
+        /** True when the API rejected the request due to rate limits. */
+        public boolean isRejected() {
+            return "rejected".equals(overageStatus);
+        }
+    }
+
     // ==================== User Input Message (for stdin) ====================
 
     /**

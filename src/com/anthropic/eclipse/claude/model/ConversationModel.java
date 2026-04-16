@@ -56,6 +56,8 @@ public class ConversationModel implements ICliMessageListener {
             handleResult((CliMessage.ResultMessage) message);
         } else if (message instanceof CliMessage.PermissionRequest) {
             handlePermissionRequest((CliMessage.PermissionRequest) message);
+        } else if (message instanceof CliMessage.RateLimitEvent) {
+            handleRateLimitEvent((CliMessage.RateLimitEvent) message);
         }
     }
 
@@ -268,6 +270,13 @@ public class ConversationModel implements ICliMessageListener {
             }
             fireAssistantMessageStarted(block);
             fireAssistantMessageCompleted(block);
+        }
+    }
+
+    private void handleRateLimitEvent(CliMessage.RateLimitEvent event) {
+        if (event.isRejected()) {
+            fireError("⚠ Rate limit reached — your request may be delayed or rejected. "
+                    + "Please wait a moment before sending another message.");
         }
     }
 
