@@ -233,8 +233,15 @@ public class ConversationModel implements ICliMessageListener {
         if (usingStreamEvents) {
             return;
         }
+        // Also skip if there's an active streaming block
+        if (currentStreamingBlock != null) {
+            return;
+        }
         // Also ignore if the last message is already ASSISTANT (complete or still streaming).
         // The CLI sends redundant assistant snapshots mid-stream and after result.
+        // Additionally, check content-based dedup: on some backends (e.g. Bedrock),
+        // the CLI may send the same content via both 'assistant' and stream events,
+        // or send multiple 'assistant' snapshots with identical text.
         synchronized (messages) {
             if (!messages.isEmpty()) {
                 MessageBlock lastMsg = messages.get(messages.size() - 1);
@@ -242,10 +249,18 @@ public class ConversationModel implements ICliMessageListener {
                     return; // Already have an assistant message — skip duplicate
                 }
             }
-        }
-        // Also skip if there's an active streaming block
-        if (currentStreamingBlock != null) {
-            return;
+            // Content-based dedup: if ANY recent assistant message has identical text,
+            // skip this one. Catches duplicates regardless of message ordering.
+            String incomingText = extractTextFromContent(msg.getContent());
+            if (incomingText != null && !incomingText.isEmpty()) {
+                for (int i = messages.size() - 1; i >= Math.max(0, messages.size() - 5); i--) {
+                    MessageBlock existing = messages.get(i);
+                    if (existing.getRole() == MessageBlock.Role.ASSISTANT
+                            && incomingText.equals(existing.getFullText())) {
+                        return; // Content duplicate — skip
+                    }
+                }
+            }
         }
 
         // If we received a full message directly (non-streaming), create a block for it
@@ -434,6 +449,24 @@ public class ConversationModel implements ICliMessageListener {
     private void handleMessageStop(CliMessage.StreamEvent event) {
         // Message is complete
         if (currentStreamingBlock != null) {
+            // Content-based dedup: if an earlier assistant message has identical text
+            // (e.g. from a non-stream 'assistant' event that arrived first), remove
+            // the OLD one and keep this streaming version.
+            String streamedText = currentStreamingBlock.getFullText();
+            if (streamedText != null && !streamedText.isEmpty()) {
+                synchronized (messages) {
+                    for (int i = messages.size() - 1; i >= 0; i--) {
+                        MessageBlock existing = messages.get(i);
+                        if (existing == currentStreamingBlock) continue;
+                        if (existing.getRole() == MessageBlock.Role.ASSISTANT
+                                && streamedText.equals(existing.getFullText())) {
+                            messages.remove(i);
+                            fireAssistantMessageRemoved(existing);
+                            break;
+                        }
+                    }
+                }
+            }
             fireAssistantMessageCompleted(currentStreamingBlock);
             currentStreamingBlock = null;
         }
@@ -523,6 +556,18 @@ public class ConversationModel implements ICliMessageListener {
         for (IConversationListener l : listeners) {
             try { l.onSessionInitialized(info); } catch (Exception e) { logError(e); }
         }
+    }
+
+    /** Extract plain text from CLI content blocks for dedup comparison. */
+    private String extractTextFromContent(java.util.List<CliMessage.ContentBlock> content) {
+        if (content == null) return null;
+        StringBuilder sb = new StringBuilder();
+        for (CliMessage.ContentBlock block : content) {
+            if ("text".equals(block.getType()) && block.getText() != null) {
+                sb.append(block.getText());
+            }
+        }
+        return sb.length() > 0 ? sb.toString().trim() : null;
     }
 
     private void fireUserMessageAdded(MessageBlock block) {
