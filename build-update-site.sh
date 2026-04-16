@@ -10,10 +10,10 @@ PROJECT_DIR="$(pwd)"
 # ==================== Configuration ====================
 TIMESTAMP="${1:-$(date +%Y%m%d%H%M)}"
 VERSION="1.0.0.${TIMESTAMP}"
-ECLIPSE_TARGET="4.38"
+ECLIPSE_TARGET="4.32"
 PLUGIN_ID="com.anthropic.eclipse.claude"
 FEATURE_ID="${PLUGIN_ID}.feature"
-ECLIPSE_PLUGINS_DIR="C:/eclipse2025-12/eclipse/plugins"
+ECLIPSE_PLUGINS_DIR="C:/eclipse2024-06/eclipse/plugins"
 
 echo "Building version: ${VERSION}"
 
@@ -120,7 +120,7 @@ EOF
 
 # Locate Eclipse install + launcher (search common paths)
 ECLIPSE_HOME=""
-for candidate in "C:/eclipse2025-12/eclipse" "C:/eclipse" "C:/dev/eclipse25-12/eclipse"; do
+for candidate in "C:/eclipse2024-06/eclipse" "C:/eclipse" "C:/dev/eclipse2024-06/eclipse"; do
     if [ -d "$candidate/plugins" ]; then
         ECLIPSE_HOME="$candidate"
         break
