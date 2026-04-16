@@ -1,6 +1,8 @@
 #!/bin/bash
 # Build Eclipse plugin JAR + P2 update site for installation via Help -> Install New Software
-set -e
+# pipefail: otherwise `javac ... | tail -5` masks javac's exit code and the
+# build continues to package a half-compiled JAR (we've been bitten by this).
+set -eo pipefail
 
 cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
@@ -11,7 +13,7 @@ VERSION="1.0.0.${TIMESTAMP}"
 ECLIPSE_TARGET="4.38"
 PLUGIN_ID="com.anthropic.eclipse.claude"
 FEATURE_ID="${PLUGIN_ID}.feature"
-ECLIPSE_PLUGINS_DIR="C:/eclipse/plugins"
+ECLIPSE_PLUGINS_DIR="C:/eclipse2025-12/eclipse/plugins"
 
 echo "Building version: ${VERSION}"
 
@@ -38,12 +40,21 @@ for jar in "$ECLIPSE_PLUGINS_DIR"/org.eclipse.swt_*.jar \
            "$ECLIPSE_PLUGINS_DIR"/org.eclipse.jface.text_*.jar \
            "$ECLIPSE_PLUGINS_DIR"/org.eclipse.text_*.jar \
            "$ECLIPSE_PLUGINS_DIR"/org.eclipse.compare_*.jar \
-           "$ECLIPSE_PLUGINS_DIR"/org.eclipse.jdt.core_*.jar; do
+           "$ECLIPSE_PLUGINS_DIR"/org.eclipse.jdt.core_*.jar \
+           "$ECLIPSE_PLUGINS_DIR"/org.eclipse.e4.ui.model.workbench_*.jar \
+           "$ECLIPSE_PLUGINS_DIR"/org.eclipse.e4.ui.workbench_*.jar; do
     [ -f "$jar" ] && CP="$CP;$jar"
 done
 
 rm -rf bin && mkdir -p bin
-javac -source 11 -target 11 -cp "$CP" -d bin -sourcepath src $(find src -name "*.java") 2>&1 | tail -5
+javac -source 11 -target 11 -cp "$CP" -d bin -sourcepath src $(find src -name "*.java") 2>&1 | grep -E 'error|warning|^[0-9]+ error' || true
+# Ensure javac actually succeeded (exit code propagated via pipefail above).
+# If bin ends up essentially empty, abort — we'd otherwise ship a broken JAR.
+CLASS_COUNT=$(find bin -name '*.class' 2>/dev/null | wc -l)
+if [ "$CLASS_COUNT" -lt 100 ]; then
+    echo "ERROR: javac produced only $CLASS_COUNT class files — compilation failed. Aborting." >&2
+    exit 1
+fi
 
 # ==================== Step 2: Update MANIFEST.MF version ====================
 echo "[2/5] Updating manifest version..."

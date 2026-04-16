@@ -7,6 +7,7 @@ import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.graphics.GC;
 import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
@@ -65,7 +66,13 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
         container.setLayout(layout);
 
         statusLabel = new Label(container, SWT.NONE);
-        statusLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, false, true));
+        // Measure the longest expected string to set a proper minimum width
+        GC gc = new GC(parent);
+        int minWidth = gc.textExtent("Claude: Thinking\u2026 [claude-sonnet-4-6]").x;
+        gc.dispose();
+        GridData gd = new GridData(SWT.FILL, SWT.CENTER, false, true);
+        gd.widthHint = minWidth;
+        statusLabel.setLayoutData(gd);
         statusLabel.setText("Claude");
 
         // Allocate colors

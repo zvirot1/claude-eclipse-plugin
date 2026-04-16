@@ -134,11 +134,18 @@ public class EffortSliderWidget extends Composite {
 
     private void paintDots(GC gc) {
         ThemeManager tm = ThemeManager.getInstance();
+        Color bg     = tm.getColor(tm.popupBg);
         Color accent = tm.getColor(tm.popupAccent);
         Color dim    = tm.getColor(tm.popupAccentDim);
 
-        gc.setAntialias(SWT.ON);
         Rectangle b = dotsCanvas.getClientArea();
+
+        // Canvas was created with SWT.NO_BACKGROUND — we must clear manually,
+        // otherwise old "active" dots remain drawn after the selection moves.
+        gc.setBackground(bg);
+        gc.fillRectangle(b);
+
+        gc.setAntialias(SWT.ON);
         int cy = b.height / 2;
         int startX = DOT_SPACING / 2;
 

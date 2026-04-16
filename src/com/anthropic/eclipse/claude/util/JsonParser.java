@@ -356,6 +356,22 @@ public class JsonParser {
                 default:
                     if (c < 0x20) {
                         sb.append(String.format("\\u%04x", (int) c));
+                    } else if (c > 0x7F) {
+                        // Escape non-ASCII characters (Hebrew, Arabic, CJK, emoji, etc.)
+                        // as JSON unicode escapes for maximum compatibility across
+                        // system encodings and CLI versions. Handles surrogate pairs
+                        // for characters outside the Basic Multilingual Plane.
+                        if (Character.isHighSurrogate(c) && i + 1 < s.length()) {
+                            char low = s.charAt(i + 1);
+                            if (Character.isLowSurrogate(low)) {
+                                sb.append(String.format("\\u%04x\\u%04x", (int) c, (int) low));
+                                i++; // skip the low surrogate
+                            } else {
+                                sb.append(String.format("\\u%04x", (int) c));
+                            }
+                        } else {
+                            sb.append(String.format("\\u%04x", (int) c));
+                        }
                     } else {
                         sb.append(c);
                     }

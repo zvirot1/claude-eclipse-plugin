@@ -363,14 +363,129 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         newWindowBtn.addListener(SWT.Selection, e -> openNewConversationWindow());
     }
 
-    /** Open a new independent Claude Code conversation window (tab). */
+    /**
+     * Open a new independent Claude Code conversation as a sibling tab in the
+     * same part stack as this view. {@code page.showView} alone creates the
+     * view wherever the perspective originally placed Claude Code — if the
+     * user has dragged the current view to a different folder, new instances
+     * land in the default (often bottom) pane instead of next to us. After
+     * showing the view we reach into the E4 model and relocate the new MPart
+     * to sit next to our own MPart.
+     */
     private void openNewConversationWindow() {
         try {
             String secondaryId = String.valueOf(System.currentTimeMillis());
-            getSite().getPage().showView(ClaudeConversationView.ID, secondaryId,
-                    org.eclipse.ui.IWorkbenchPage.VIEW_ACTIVATE);
+            IWorkbenchPage page = getSite().getPage();
+            org.eclipse.ui.IViewPart newView = page.showView(
+                    ClaudeConversationView.ID, secondaryId, IWorkbenchPage.VIEW_ACTIVATE);
+
+            // Move the freshly-opened view into our own stack (best effort —
+            // any error leaves the view where Eclipse placed it). We defer
+            // via asyncExec to give the E4 compat layer a chance to finish
+            // wiring the MPart into the model.
+            Display.getDefault().asyncExec(() -> relocateToOwnStack(newView));
         } catch (Exception ex) {
             Activator.logError("Could not open new conversation window", ex);
+        }
+    }
+
+    /**
+     * Move the given new view so it becomes a sibling tab of this view.
+     *
+     * <p>E4 subtlety: a 3.x {@code IViewPart} shown via {@code page.showView}
+     * is stored as a <em>shared</em> {@code MPart} in the top-level window,
+     * and its visual presence inside a perspective is represented by an
+     * {@code MPlaceholder}. {@code thisPart.getParent()} therefore returns
+     * the shared-elements container, not the {@code MPartStack} that holds
+     * the tab. We have to look up the {@code MPlaceholder} via
+     * {@link EModelService#findPlaceholderFor} and move the <em>placeholder</em>
+     * — not the MPart — into our own stack.</p>
+     */
+    private void relocateToOwnStack(org.eclipse.ui.IViewPart newView) {
+        if (newView == null) return;
+        try {
+            org.eclipse.e4.ui.model.application.ui.basic.MPart thisPart =
+                    getSite().getService(org.eclipse.e4.ui.model.application.ui.basic.MPart.class);
+            org.eclipse.e4.ui.model.application.ui.basic.MPart newPart =
+                    newView.getSite().getService(
+                            org.eclipse.e4.ui.model.application.ui.basic.MPart.class);
+            org.eclipse.e4.ui.workbench.modeling.EModelService modelService =
+                    getSite().getService(org.eclipse.e4.ui.workbench.modeling.EModelService.class);
+            org.eclipse.e4.ui.workbench.modeling.EPartService partService =
+                    getSite().getService(org.eclipse.e4.ui.workbench.modeling.EPartService.class);
+
+            if (thisPart == null || newPart == null
+                    || modelService == null || partService == null) {
+                Activator.logWarning("[relocate] missing service — thisPart="
+                        + thisPart + " newPart=" + newPart
+                        + " modelSvc=" + modelService + " partSvc=" + partService);
+                return;
+            }
+            if (newPart == thisPart) return;
+
+            org.eclipse.e4.ui.model.application.ui.basic.MWindow window =
+                    modelService.getTopLevelWindowFor(thisPart);
+            if (window == null) {
+                Activator.logWarning("[relocate] no top-level window");
+                return;
+            }
+
+            // Find placeholders in the active perspective.
+            org.eclipse.e4.ui.model.application.ui.advanced.MPlaceholder thisPh =
+                    modelService.findPlaceholderFor(window, thisPart);
+            org.eclipse.e4.ui.model.application.ui.advanced.MPlaceholder newPh =
+                    modelService.findPlaceholderFor(window, newPart);
+
+            // The element that actually sits inside an MPartStack is either
+            // the placeholder (for shared parts) or the MPart itself (for
+            // per-perspective parts). Fall back to the MPart if no placeholder.
+            org.eclipse.e4.ui.model.application.ui.MUIElement thisAnchor =
+                    (thisPh != null) ? thisPh : thisPart;
+            org.eclipse.e4.ui.model.application.ui.MUIElement newAnchor =
+                    (newPh != null) ? newPh : newPart;
+
+            // Walk up from thisAnchor to find the enclosing MPartStack.
+            org.eclipse.e4.ui.model.application.ui.MUIElement cursor = thisAnchor.getParent();
+            org.eclipse.e4.ui.model.application.ui.basic.MPartStack targetStack = null;
+            while (cursor != null) {
+                if (cursor instanceof org.eclipse.e4.ui.model.application.ui.basic.MPartStack) {
+                    targetStack = (org.eclipse.e4.ui.model.application.ui.basic.MPartStack) cursor;
+                    break;
+                }
+                cursor = cursor.getParent();
+            }
+
+            Activator.logWarning("[relocate] thisAnchor.parent=" + thisAnchor.getParent()
+                    + " targetStack=" + targetStack
+                    + " newAnchor.parent=" + newAnchor.getParent());
+
+            if (targetStack == null) return;
+            if ((Object) newAnchor.getParent() == (Object) targetStack) {
+                Activator.logWarning("[relocate] already in target stack");
+                return;
+            }
+
+            // Detach from current container, attach to our stack.
+            org.eclipse.e4.ui.model.application.ui.MElementContainer<?> oldParent = newAnchor.getParent();
+            if (oldParent != null) {
+                @SuppressWarnings({ "unchecked", "rawtypes" })
+                java.util.List children = oldParent.getChildren();
+                children.remove(newAnchor);
+            }
+            // Both MPart and MPlaceholder implement MStackElement, which is
+            // what MPartStack.getChildren() / setSelectedElement expects.
+            // Raw-list append avoids the generic-arg check.
+            @SuppressWarnings({ "unchecked", "rawtypes" })
+            java.util.List stackChildren = targetStack.getChildren();
+            stackChildren.add(newAnchor);
+            targetStack.setSelectedElement(
+                    (org.eclipse.e4.ui.model.application.ui.basic.MStackElement) newAnchor);
+            partService.activate(newPart);
+            Activator.logWarning("[relocate] moved newAnchor into target stack (success)");
+        } catch (Throwable t) {
+            // Soft-fail: the view is still usable, just in the wrong folder
+            Activator.logWarning(
+                    "Could not relocate new conversation to same stack: " + t);
         }
     }
 
