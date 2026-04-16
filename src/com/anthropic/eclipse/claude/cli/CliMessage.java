@@ -281,7 +281,9 @@ public abstract class CliMessage {
 
     /**
      * Informational event about API rate limits.
-     * When overageStatus is "rejected", the request was throttled.
+     * {@code status} is "allowed" when the request proceeds normally,
+     * and something else (e.g. "rejected", "throttled") when actually blocked.
+     * {@code overageStatus} describes the POLICY for overage, not the current request.
      */
     public static class RateLimitEvent extends CliMessage {
         private String status;
@@ -294,9 +296,9 @@ public abstract class CliMessage {
         public String getOverageStatus() { return overageStatus; }
         public void setOverageStatus(String overageStatus) { this.overageStatus = overageStatus; }
 
-        /** True when the API rejected the request due to rate limits. */
+        /** True when the API actually rejected/throttled the request. */
         public boolean isRejected() {
-            return "rejected".equals(overageStatus);
+            return status != null && !"allowed".equals(status);
         }
     }
 
