@@ -593,6 +593,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         new MenuItem(menu, SWT.SEPARATOR);
 
+        MenuItem renameItem = new MenuItem(menu, SWT.PUSH);
+        renameItem.setText("Rename Tab...");
+        renameItem.addListener(SWT.Selection, e -> renameTab());
+
         MenuItem historyItem = new MenuItem(menu, SWT.PUSH);
         historyItem.setText("Session History  (/history)");
         historyItem.addListener(SWT.Selection, e -> showHistoryDialog());
@@ -602,6 +606,25 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             anchor.getLocation().y + anchor.getSize().y);
         menu.setLocation(loc);
         menu.setVisible(true);
+    }
+
+    /**
+     * Show an input dialog to rename the current tab.
+     */
+    private void renameTab() {
+        org.eclipse.jface.dialogs.InputDialog dlg = new org.eclipse.jface.dialogs.InputDialog(
+            getViewSite().getShell(),
+            "Rename Tab",
+            "Enter a new name for this conversation tab:",
+            getPartName(),
+            null);
+        if (dlg.open() == org.eclipse.jface.window.Window.OK) {
+            String newName = dlg.getValue().trim();
+            if (!newName.isEmpty()) {
+                setPartName(newName);
+                partNameSet = true;
+            }
+        }
     }
 
     private void createMessageArea(Composite parent) {
