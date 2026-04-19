@@ -1084,7 +1084,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode.fromCliValue(cli);
 
         // --- Effort ---
-        this.currentEffort = (reader != null) ? reader.getUserEffortLevel() : null;
+        // Priority: Eclipse preference (user changed via popup) > settings.json > "medium" (default, same as IntelliJ)
+        String effortPref = prefs.getString(PreferenceConstants.EFFORT_LEVEL);
+        if (effortPref != null && !effortPref.isEmpty()) {
+            this.currentEffort = effortPref;
+        } else {
+            String fromSettings = (reader != null) ? reader.getUserEffortLevel() : null;
+            this.currentEffort = (fromSettings != null && !fromSettings.isEmpty())
+                                 ? fromSettings : "medium";
+        }
     }
 
     /**
@@ -1139,6 +1147,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private void applyEffortChange(String newEffort) {
         if (java.util.Objects.equals(newEffort, currentEffort)) return;
         currentEffort = newEffort;
+
+        // Persist so new conversations start with the same effort level
+        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+        prefs.setValue(PreferenceConstants.EFFORT_LEVEL,
+                       newEffort != null ? newEffort : "");
+
         hotSwapCliForModeOrEffort();
     }
 

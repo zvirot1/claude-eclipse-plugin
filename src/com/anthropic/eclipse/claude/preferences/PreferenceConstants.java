@@ -26,4 +26,7 @@ public class PreferenceConstants {
     // Input behavior
     public static final String ENTER_TO_SEND = "enterToSend";              // true = Enter sends (default)
     public static final String AUTO_SAVE_BEFORE_TOOLS = "autoSaveBeforeTools"; // save dirty editors before CLI file tools
+
+    // Effort level (persisted across sessions)
+    public static final String EFFORT_LEVEL = "effortLevel";              // "low","medium","high","max", or "" for Auto
 }
