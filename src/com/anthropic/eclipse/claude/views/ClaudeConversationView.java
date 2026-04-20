@@ -403,8 +403,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         Button resumeBtn = new Button(toolbar, SWT.PUSH | SWT.FLAT);
         resumeBtn.setText("\u21BA");
-        setTooltip(resumeBtn, "Resume session");
-        resumeBtn.addListener(SWT.Selection, e -> showResumeDialog());
+        setTooltip(resumeBtn, "Resume session (browse history with preview)");
+        // Open the full history dialog (table + preview) instead of the old
+        // plain-list resume dialog — same data source, richer UI.
+        resumeBtn.addListener(SWT.Selection, e -> showHistoryDialog());
 
         stopButton = new Button(toolbar, SWT.PUSH | SWT.FLAT);
         stopButton.setText("\u25A0");

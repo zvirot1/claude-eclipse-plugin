@@ -247,16 +247,34 @@ public class SessionHistoryDialog extends TitleAreaDialog {
             return;
         }
 
-        // Try to read the JSONL file from ~/.claude/projects/{encoded-path}/{sessionId}.jsonl
-        String encodedPath = projectDir.replace("/", "-");
-        Path jsonlPath = Paths.get(
-            System.getProperty("user.home"), ".claude", "projects",
-            encodedPath, sessionId + ".jsonl");
+        // Locate the JSONL file by scanning all project directories — the CLI's
+        // project encoding (drive-letter colon + separators all collapse to '-')
+        // is lossy, so we cannot deterministically reconstruct the directory
+        // from `projectDir`. A scan is cheap (one readdir per project) and
+        // works regardless of how the path was originally normalized.
+        Path jsonlPath = null;
+        try {
+            Path projectsRoot = Paths.get(
+                System.getProperty("user.home"), ".claude", "projects");
+            if (Files.isDirectory(projectsRoot)) {
+                try (java.util.stream.Stream<Path> dirs = Files.list(projectsRoot)) {
+                    java.util.Iterator<Path> it = dirs.iterator();
+                    while (it.hasNext()) {
+                        Path candidate = it.next().resolve(sessionId + ".jsonl");
+                        if (Files.exists(candidate)) {
+                            jsonlPath = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            // fall through — jsonlPath stays null
+        }
 
-        if (!Files.exists(jsonlPath)) {
-            // Try without encoded path - some sessions may be stored differently
+        if (jsonlPath == null) {
             previewText.setText("Session: " + sessionId + "\n\n"
-                + "(Session JSONL file not found at:\n" + jsonlPath + "\n\n"
+                + "(Session JSONL file not found in ~/.claude/projects/.\n\n"
                 + "The session metadata is available but the conversation\n"
                 + "content may have been cleaned up.)");
             return;
