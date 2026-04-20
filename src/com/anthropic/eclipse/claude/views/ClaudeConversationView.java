@@ -171,10 +171,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private Button modeButton;
     private com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup activeModePopup;
 
-    // Eclipse memento — used to persist session ID across Eclipse restarts
+    // Eclipse memento — used to persist session ID across Eclipse restarts.
+    // Matches VS Code behaviour: each view is 1:1 with a session, and state is
+    // per-view (not global). If Eclipse successfully restored a memento for
+    // this view we auto-resume; otherwise we start fresh (exactly like VS Code
+    // which leaves restored panels empty and lets the user pick from the
+    // session list). No global fallback file, no time-based freshness window.
     private org.eclipse.ui.IMemento savedMemento;
-    private static final String MEMENTO_SESSION_ID = "claudeSessionId";
-    private static final String MEMENTO_TAB_TITLE  = "claudeTabTitle";
+    private static final String MEMENTO_SESSION_ID  = "claudeSessionId";
+    private static final String MEMENTO_TAB_TITLE   = "claudeTabTitle";
 
     // Slash command autocomplete
     private org.eclipse.swt.widgets.Shell autocompletePopup;
@@ -189,13 +194,20 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     @Override
     public void saveState(org.eclipse.ui.IMemento memento) {
         super.saveState(memento);
+        writeMementoState(memento);
+    }
+
+    /**
+     * Populate the given memento with this view's session state so Eclipse
+     * can restore it on the next launch. Each view saves its own memento —
+     * there is no global state. This matches VS Code's per-panel state model.
+     */
+    private void writeMementoState(org.eclipse.ui.IMemento memento) {
         if (memento == null) return;
-        // Persist the CLI session ID so we can --resume on next Eclipse launch
         SessionInfo info = (model != null) ? model.getSessionInfo() : null;
         if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
             memento.putString(MEMENTO_SESSION_ID, info.getSessionId());
         }
-        // Persist the tab title
         String title = getPartName();
         if (title != null && !title.equals("Claude Code")) {
             memento.putString(MEMENTO_TAB_TITLE, title);
@@ -250,19 +262,29 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Track editor selection to show "N lines selected" indicator
         registerSelectionListener();
 
-        // Auto-resume previous session if Eclipse is restarting and we have a saved session ID
+        // Auto-resume from memento if Eclipse restored one for this specific view.
+        // This is the same semantics as VS Code's deserializeWebviewPanel: each
+        // view/panel owns its own state, so brand-new views (including "New
+        // Conversation Window" clicks) always start fresh because their memento
+        // is null. No global fallback file, no time-based freshness heuristic.
+        String resumeId = null;
+        String savedTitle = null;
+
         if (savedMemento != null) {
-            String resumeId = savedMemento.getString(MEMENTO_SESSION_ID);
-            String savedTitle = savedMemento.getString(MEMENTO_TAB_TITLE);
-            if (savedTitle != null && !savedTitle.isEmpty()) {
-                setPartName(savedTitle);
-                partNameSet = true;
-            }
-            if (resumeId != null && !resumeId.isEmpty()) {
-                // Defer resume so the UI is fully built first
-                Display.getDefault().asyncExec(() -> resumeSession(resumeId));
-            }
+            resumeId = savedMemento.getString(MEMENTO_SESSION_ID);
+            savedTitle = savedMemento.getString(MEMENTO_TAB_TITLE);
             savedMemento = null; // consumed
+        }
+
+        if (savedTitle != null && !savedTitle.isEmpty()) {
+            setPartName(savedTitle);
+            partNameSet = true;
+        }
+
+        if (resumeId != null && !resumeId.isEmpty()) {
+            // Defer resume so the UI is fully built first
+            final String finalResumeId = resumeId;
+            Display.getDefault().asyncExec(() -> resumeSession(finalResumeId));
         }
     }
 
@@ -1683,6 +1705,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
 
+        // Reset tab title so first user message from loaded history can re-set it
+        partNameSet = false;
+
         // Start with resume flag
         String cliPath = cliManager.getCliPath();
         if (cliPath == null) {
@@ -1724,6 +1749,25 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     welcomeComposite = null; // will be re-shown only if history is empty
                     if (messageContainer != null && !messageContainer.isDisposed()) {
                         messageContainer.layout(true, true);
+                    }
+
+                    // Update the tab title from the first user message in history
+                    // (mirrors VS Code extension behaviour — tab shows the session summary).
+                    if (!partNameSet) {
+                        for (MessageBlock b : history) {
+                            if (b.getRole() == MessageBlock.Role.USER) {
+                                String text = b.getFullText();
+                                if (text != null && !text.trim().isEmpty()) {
+                                    String tabTitle = text.trim();
+                                    if (tabTitle.length() > 30) {
+                                        tabTitle = tabTitle.substring(0, 30) + "\u2026";
+                                    }
+                                    setPartName(tabTitle);
+                                    partNameSet = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 });
                 // loadHistory fires events → listeners do asyncExec → queued after the clear above

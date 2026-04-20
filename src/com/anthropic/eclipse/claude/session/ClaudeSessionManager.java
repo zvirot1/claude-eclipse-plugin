@@ -58,9 +58,51 @@ public class ClaudeSessionManager {
 
     /**
      * List available sessions.
+     * <p>
+     * Now reads directly from Claude CLI's JSONL transcripts in
+     * {@code ~/.claude/projects/} (matching VS Code extension behaviour) and
+     * merges with the plugin's local {@link SessionStore} metadata. The JSONL
+     * scan is the source of truth — the SessionStore is only used for fields
+     * we can't cheaply read from JSONL (e.g. custom titles set via /rename).
      */
     public List<SessionInfo> listSessions() {
-        return store.listAllSessions();
+        return listSessions(null);
+    }
+
+    /**
+     * List sessions, restricted to the given project directory if non-null.
+     * Project matching is done against the encoded directory name used by the CLI.
+     */
+    public List<SessionInfo> listSessions(String projectDir) {
+        // Start from JSONL (source of truth)
+        List<SessionInfo> fromJsonl = JsonlSessionScanner.listSessions(projectDir);
+
+        // Index by sessionId for fast merge
+        java.util.Map<String, SessionInfo> byId = new java.util.LinkedHashMap<>();
+        for (SessionInfo s : fromJsonl) {
+            if (s.getSessionId() != null) byId.put(s.getSessionId(), s);
+        }
+
+        // Merge: overlay local SessionStore metadata only for cached fields
+        try {
+            for (SessionInfo local : store.listAllSessions()) {
+                SessionInfo merged = byId.get(local.getSessionId());
+                if (merged != null) {
+                    // Prefer local summary if it was curated (e.g. /rename)
+                    if (local.getSummary() != null && !local.getSummary().isEmpty()
+                            && merged.getSummary() == null) {
+                        merged.setSummary(local.getSummary());
+                    }
+                    if (local.getPermissionMode() != null && merged.getPermissionMode() == null) {
+                        merged.setPermissionMode(local.getPermissionMode());
+                    }
+                }
+                // Don't add local-only sessions — if there's no JSONL, it's
+                // an empty/orphan session and we don't want to surface it.
+            }
+        } catch (Exception ignored) {}
+
+        return new java.util.ArrayList<>(byId.values());
     }
 
     /**

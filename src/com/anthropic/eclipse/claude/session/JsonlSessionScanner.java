@@ -1,0 +1,216 @@
+package com.anthropic.eclipse.claude.session;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+
+import com.anthropic.eclipse.claude.Activator;
+import com.anthropic.eclipse.claude.model.SessionInfo;
+import com.anthropic.eclipse.claude.util.JsonParser;
+
+/**
+ * Scans Claude CLI's JSONL transcript files in {@code ~/.claude/projects/} to produce
+ * a {@link SessionInfo} list — a direct analogue of VS Code extension's
+ * {@code listSessions()} (which calls {@code @anthropic-ai/claude-agent-sdk}'s
+ * {@code listSessions()}).
+ *
+ * <p>This is the single source of truth for conversation history — the plugin's
+ * {@link SessionStore} is only a secondary cache of display summaries.
+ *
+ * <p>Project directory name convention mirrors the CLI:
+ * {@code C:\dev\foo} → {@code C--dev-foo}.
+ */
+public class JsonlSessionScanner {
+
+    /**
+     * Returns all sessions across all projects, newest-first by file mtime.
+     * If {@code projectDir} is non-null, restricts to sessions whose project
+     * directory matches that path.
+     */
+    public static List<SessionInfo> listSessions(String projectDir) {
+        List<SessionInfo> result = new ArrayList<>();
+        File projectsRoot = new File(System.getProperty("user.home") + "/.claude/projects");
+        if (!projectsRoot.isDirectory()) return result;
+
+        File[] projectDirs = projectsRoot.listFiles(File::isDirectory);
+        if (projectDirs == null) return result;
+
+        String matchPrefix = null;
+        if (projectDir != null && !projectDir.isEmpty()) {
+            matchPrefix = encodeProjectKey(projectDir);
+        }
+
+        for (File dir : projectDirs) {
+            if (matchPrefix != null) {
+                String name = dir.getName();
+                String lower = name.toLowerCase();
+                String lowerPrefix = matchPrefix.toLowerCase();
+                // Match either exact or with worktree suffix ("foo-bar")
+                if (!lower.equals(lowerPrefix)
+                        && !lower.startsWith(lowerPrefix + "-")) {
+                    continue;
+                }
+            }
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (!f.isFile()) continue;
+                String n = f.getName();
+                if (!n.endsWith(".jsonl")) continue;
+                String sessionId = n.substring(0, n.length() - 6);
+                if (!isUuid(sessionId)) continue; // skip subagent-*.jsonl etc.
+                try {
+                    SessionInfo info = buildSessionInfo(f, sessionId, dir.getName());
+                    if (info != null) result.add(info);
+                } catch (Exception e) {
+                    // Skip unreadable / malformed JSONL
+                }
+            }
+        }
+
+        // Newest first
+        result.sort(Comparator.comparingLong(SessionInfo::getLastActiveTime).reversed());
+        return result;
+    }
+
+    /**
+     * Build a SessionInfo from a .jsonl file: read up to the first user message
+     * to extract a summary, then use file mtime as lastActiveTime and file size
+     * as proxy for messageCount (not perfect but cheap).
+     */
+    @SuppressWarnings("unchecked")
+    private static SessionInfo buildSessionInfo(File jsonl, String sessionId, String projectKey) {
+        SessionInfo info = new SessionInfo(sessionId);
+        info.setLastActiveTime(jsonl.lastModified());
+        info.setWorkingDirectory(decodeProjectKey(projectKey));
+
+        String summary = null;
+        int messageCount = 0;
+        long createdAt = 0L;
+        String model = null;
+
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(new FileInputStream(jsonl), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty()) continue;
+                try {
+                    Map<String, Object> obj = JsonParser.parseObject(line);
+                    String type = JsonParser.getString(obj, "type");
+                    if (type == null) continue;
+                    // CLI writes timestamp per entry as ISO-8601 string — use first one as createdAt
+                    if (createdAt == 0L) {
+                        String ts = JsonParser.getString(obj, "timestamp");
+                        if (ts != null) {
+                            try {
+                                createdAt = java.time.Instant.parse(ts).toEpochMilli();
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                    // First user message → summary
+                    if (summary == null && "user".equals(type)) {
+                        Map<String, Object> msg = JsonParser.getMap(obj, "message");
+                        if (msg != null) {
+                            Object content = msg.get("content");
+                            String text = extractUserText(content);
+                            if (text != null && !text.isEmpty()) {
+                                summary = text.length() > 60 ? text.substring(0, 57) + "..." : text;
+                            }
+                        }
+                    }
+                    if ("user".equals(type) || "assistant".equals(type)) {
+                        messageCount++;
+                    }
+                    if (model == null) {
+                        Map<String, Object> msg = JsonParser.getMap(obj, "message");
+                        if (msg != null) {
+                            String m = JsonParser.getString(msg, "model");
+                            if (m != null) model = m;
+                        }
+                    }
+                } catch (Exception lineEx) {
+                    // Skip malformed line
+                }
+            }
+        } catch (Exception e) {
+            return null;
+        }
+
+        if (messageCount == 0) return null; // not really a conversation
+
+        info.setSummary(summary);
+        info.setMessageCount(messageCount);
+        info.setModel(model);
+        if (createdAt > 0) info.setStartTime(createdAt);
+        return info;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String extractUserText(Object content) {
+        if (content instanceof String) return (String) content;
+        if (content instanceof List) {
+            StringBuilder sb = new StringBuilder();
+            for (Object part : (List<Object>) content) {
+                if (part instanceof Map) {
+                    Map<String, Object> p = (Map<String, Object>) part;
+                    Object t = p.get("type");
+                    if ("text".equals(t)) {
+                        Object txt = p.get("text");
+                        if (txt != null) sb.append(txt.toString());
+                    }
+                }
+            }
+            return sb.toString();
+        }
+        return null;
+    }
+
+    /**
+     * Convert project path like {@code C:\dev\foo} to {@code C--dev-foo}
+     * (matches Claude CLI's encoding).
+     */
+    private static String encodeProjectKey(String path) {
+        return path.replace(':', '-').replace('\\', '-').replace('/', '-');
+    }
+
+    /**
+     * Reverse of encodeProjectKey: {@code C--dev-foo} → {@code C:\dev\foo}.
+     * Used for display/debugging only; best-effort — we can't fully recover
+     * the original separators.
+     */
+    private static String decodeProjectKey(String key) {
+        // CLI encoding is lossy (drive letter colon + separators collapse),
+        // so we can only take a guess. Leave as-is for display.
+        return key;
+    }
+
+    private static boolean isUuid(String s) {
+        if (s == null || s.length() != 36) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (c != '-') return false;
+            } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** For diagnostics: log one-liner summary of scan results. */
+    public static void logScanSummary(String projectDir) {
+        try {
+            List<SessionInfo> s = listSessions(projectDir);
+            Activator.logInfo("[JsonlSessionScanner] Found " + s.size()
+                + " sessions" + (projectDir != null ? " for " + projectDir : ""));
+        } catch (Exception e) {
+            Activator.logError("[JsonlSessionScanner] scan failed", e);
+        }
+    }
+}
