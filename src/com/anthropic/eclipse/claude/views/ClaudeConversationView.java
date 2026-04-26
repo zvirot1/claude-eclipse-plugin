@@ -109,6 +109,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private Label connectionStatus;
     private Button sendButton;
     private boolean sendButtonIsStop = false; // true when send button is showing stop icon
+    private volatile long diagSendTime = 0; // diagnostic: when last user message was sent
     private long lastSendTimestamp = 0; // debounce: prevent double-send within 300ms
     private Image sendIcon;   // blue circle with ↑ arrow
     private Image stopIcon;   // red circle with ■ square
@@ -1329,6 +1330,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
 
         renderingSuppressed = false;  // Reset for new query
+        diagSendTime = System.currentTimeMillis();
+        Activator.logInfo("[DIAG-TIMING] T0 send at " + diagSendTime);
         stopButton.setEnabled(true);
         setSendButtonToStop();
         costBar.setStatus("Streaming...");
@@ -1953,6 +1956,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onAssistantMessageStarted(MessageBlock block) {
+        if (diagSendTime > 0) {
+            Activator.logInfo("[DIAG-TIMING] T1 onAssistantMessageStarted +"
+                    + (System.currentTimeMillis() - diagSendTime) + "ms");
+        }
         touchStreamActivity(); // streaming started — reset timeout clock
         asyncExec(() -> {
             hideThinkingIndicator();
@@ -2107,6 +2114,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onAssistantMessageCompleted(MessageBlock block) {
+        if (diagSendTime > 0) {
+            Activator.logInfo("[DIAG-TIMING] T2 onAssistantMessageCompleted +"
+                    + (System.currentTimeMillis() - diagSendTime) + "ms"
+                    + " hasRunningTools=" + model.hasRunningToolCalls());
+        }
         asyncExec(() -> {
             // Just finalize the widget content (apply markdown etc.).
             // Do NOT set "Ready" or disable stop here — this event fires after every
@@ -2138,6 +2150,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onResultReceived(UsageInfo usage) {
+        if (diagSendTime > 0) {
+            Activator.logInfo("[DIAG-TIMING] T3 onResultReceived +"
+                    + (System.currentTimeMillis() - diagSendTime) + "ms");
+            diagSendTime = 0; // reset
+        }
         cancelStreamingTimeout(); // full result arrived — no timeout needed
         asyncExec(() -> {
             hideThinkingIndicator();

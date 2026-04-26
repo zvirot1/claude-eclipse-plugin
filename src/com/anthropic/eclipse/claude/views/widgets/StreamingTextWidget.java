@@ -75,6 +75,9 @@ public class StreamingTextWidget extends Composite {
             boolean wasEmpty = rawMarkdown.length() == 0;
             pendingText.append(delta);
             rawMarkdown.append(delta);
+            com.anthropic.eclipse.claude.Activator.logInfo(
+                "[DIAG] StreamingTextWidget.appendText deltaLen=" + delta.length()
+                + " rawTotalLen=" + rawMarkdown.length());
             if (wasEmpty) {
                 Display.getDefault().asyncExec(() -> applyRtlIfNeeded(rawMarkdown.toString()));
             }
@@ -99,6 +102,22 @@ public class StreamingTextWidget extends Composite {
         // Apply markdown rendering and RTL
         if (!styledText.isDisposed()) {
             String text = rawMarkdown.toString();
+            // === DIAGNOSTIC LOGGING ===
+            int len = text.length();
+            String head = text.substring(0, Math.min(120, len)).replace("\n", "\\n");
+            String tail = len > 120 ? text.substring(Math.max(0, len - 120)).replace("\n", "\\n") : "";
+            boolean exactHalfDup = false;
+            if (len >= 20 && len % 2 == 0) {
+                String firstHalf = text.substring(0, len / 2);
+                String secondHalf = text.substring(len / 2);
+                exactHalfDup = firstHalf.equals(secondHalf);
+            }
+            com.anthropic.eclipse.claude.Activator.logInfo(
+                "[DIAG] StreamingTextWidget.finalizeContent rawLen=" + len
+                + " exactHalfDup=" + exactHalfDup
+                + " head='" + head + "'"
+                + " tail='" + tail + "'");
+            // === END DIAGNOSTIC ===
             // Duplication guard: if rawMarkdown somehow has doubled content, take only first half
             // This can happen on Windows due to CLI sending redundant assistant snapshots
             int orientation = detectOrientation(text);
