@@ -2212,6 +2212,31 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     }
 
     @Override
+    public void onSilentEmptyShouldRetry(String lastUserPrompt) {
+        // The CLI returned an empty result on the first attempt — likely the
+        // non-deterministic AIM/UserPromptSubmit hook rejecting the prompt.
+        // Re-send the same content. The model has already set its retry flag,
+        // so a second silent-empty will fall through to onError instead of
+        // looping back here.
+        Activator.logDiag("[DIAG] auto-retry: re-sending last prompt after silent-empty");
+        asyncExec(() -> {
+            try {
+                if (cliManager != null && cliManager.isRunning()) {
+                    cliManager.sendMessage(lastUserPrompt);
+                    // Restart streaming UI state — keep stop button as "stop" since
+                    // we're effectively in another assistant turn now.
+                    stopButton.setEnabled(true);
+                    setSendButtonToStop();
+                    costBar.setStatus("Streaming…");
+                    diagSendTime = System.currentTimeMillis(); // restart timing for the retry
+                }
+            } catch (Exception ex) {
+                Activator.logError("[Retry] failed to re-send: " + ex.getMessage(), ex);
+            }
+        });
+    }
+
+    @Override
     public void onConversationCleared() {
         asyncExec(() -> {
             for (MessageComposite widget : messageWidgetMap.values()) {
