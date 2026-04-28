@@ -253,19 +253,39 @@ public class McpServersDialog extends TitleAreaDialog {
         try {
             String json = new String(Files.readAllBytes(globalClaudePath), StandardCharsets.UTF_8);
             Map<String, Object> root = JsonParser.parseObject(json);
+
+            // User-scope servers (added via `claude mcp add --scope user`) live at
+            // the ROOT level of ~/.claude.json under "mcpServers". The CLI also
+            // mirrors them per-project under projects[dir].mcpServers but the
+            // root level is the authoritative location for global/user-scope.
+            Map<String, Object> rootServers = JsonParser.getMap(root, "mcpServers");
+            if (rootServers != null) {
+                for (Map.Entry<String, Object> entry : rootServers.entrySet()) {
+                    if (entry.getValue() instanceof Map) {
+                        addServerToTable(globalServersTable, entry.getKey(),
+                            (Map<String, Object>) entry.getValue());
+                    }
+                }
+            }
+
+            // Also include any per-project mcpServers stored in the same file
+            // (legacy / project-local additions) — these are still global in the
+            // sense that they live in the user's home file.
             Map<String, Object> projects = JsonParser.getMap(root, "projects");
-            if (projects == null) return;
-
-            Map<String, Object> project = JsonParser.getMap(projects, projectDir);
-            if (project == null) return;
-
-            Map<String, Object> servers = JsonParser.getMap(project, "mcpServers");
-            if (servers == null) return;
-
-            for (Map.Entry<String, Object> entry : servers.entrySet()) {
-                if (entry.getValue() instanceof Map) {
-                    addServerToTable(globalServersTable, entry.getKey(),
-                        (Map<String, Object>) entry.getValue());
+            if (projects != null) {
+                Map<String, Object> project = JsonParser.getMap(projects, projectDir);
+                if (project != null) {
+                    Map<String, Object> projServers = JsonParser.getMap(project, "mcpServers");
+                    if (projServers != null) {
+                        for (Map.Entry<String, Object> entry : projServers.entrySet()) {
+                            // Avoid duplicating root-level entries with the same name
+                            if (rootServers != null && rootServers.containsKey(entry.getKey())) continue;
+                            if (entry.getValue() instanceof Map) {
+                                addServerToTable(globalServersTable, entry.getKey(),
+                                    (Map<String, Object>) entry.getValue());
+                            }
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
@@ -359,31 +379,36 @@ public class McpServersDialog extends TitleAreaDialog {
 
             Map<String, Object> servers = buildServersMap(globalServersTable);
 
-            // Navigate to projects[projectDir]
-            Map<String, Object> projects = JsonParser.getMap(root, "projects");
-            if (projects == null) {
-                projects = new LinkedHashMap<>();
-                root.put("projects", projects);
-            }
-
-            Map<String, Object> project = JsonParser.getMap(projects, projectDir);
-            if (project == null) {
-                project = new LinkedHashMap<>();
-                projects.put(projectDir, project);
-            }
-
+            // Save to ROOT-level mcpServers (matches `claude mcp add --scope user`).
+            // The CLI also reads this location for global/user-scope servers.
             if (servers.isEmpty()) {
-                project.remove("mcpServers");
+                root.remove("mcpServers");
             } else {
-                project.put("mcpServers", servers);
+                root.put("mcpServers", servers);
             }
 
-            // Clean up empty project entry
-            if (project.isEmpty()) {
-                projects.remove(projectDir);
-            }
-            if (projects.isEmpty()) {
-                root.remove("projects");
+            // Also clean up any legacy project-scoped duplicates of these names
+            // so the same server isn't listed twice in different scopes.
+            Map<String, Object> projects = JsonParser.getMap(root, "projects");
+            if (projects != null) {
+                Map<String, Object> project = JsonParser.getMap(projects, projectDir);
+                if (project != null) {
+                    Map<String, Object> projServers = JsonParser.getMap(project, "mcpServers");
+                    if (projServers != null) {
+                        for (String name : servers.keySet()) {
+                            projServers.remove(name);
+                        }
+                        if (projServers.isEmpty()) {
+                            project.remove("mcpServers");
+                        }
+                    }
+                    if (project.isEmpty()) {
+                        projects.remove(projectDir);
+                    }
+                }
+                if (projects.isEmpty()) {
+                    root.remove("projects");
+                }
             }
 
             if (root.isEmpty() && !Files.exists(globalClaudePath)) {
