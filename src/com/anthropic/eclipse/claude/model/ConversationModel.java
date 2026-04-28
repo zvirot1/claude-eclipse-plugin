@@ -605,9 +605,23 @@ public class ConversationModel implements ICliMessageListener {
                     + (resultText != null && !resultText.isEmpty() ? "\n" + resultText : "");
                 fireError(msg);
             } else {
-                msg = "⚠ Empty response from Claude (no text, no tokens used).\n"
-                    + "Possible causes: authentication issue (SSO/API key), a hook blocked the prompt, "
-                    + "or the CLI failed to reach the API. Check the Error Log for [Claude CLI stderr] entries.";
+                // Signature of a UserPromptSubmit hook block: empty result, success
+                // subtype, no error flag, but num_turns>=1 and zero tokens used.
+                // The CLI does NOT surface the hook's block message to stream-json
+                // (it only prints to its own stdout in interactive mode), so we
+                // can only diagnose this by symptom.
+                msg = "⚠ Your prompt was blocked.\n\n"
+                    + "The CLI returned an empty response with 0 tokens used "
+                    + "(duration=" + result.getDurationMs() + "ms, turns=" + result.getNumTurns() + "). "
+                    + "This is the typical signature of a UserPromptSubmit hook "
+                    + "rejecting the prompt — for example, a corporate security "
+                    + "policy flagging Hebrew/RTL text as \"obfuscation attack\".\n\n"
+                    + "To see the exact reason, run in cmd:\n"
+                    + "   claude --debug\n"
+                    + "   <your prompt>\n\n"
+                    + "Workarounds: rephrase in English, or ask your IT/AWS admin "
+                    + "to relax the hook rule. Other possible causes: SSO token expired, "
+                    + "or the CLI failed to reach the API (check Error Log for [Claude CLI stderr]).";
                 fireError(msg);
             }
         }
