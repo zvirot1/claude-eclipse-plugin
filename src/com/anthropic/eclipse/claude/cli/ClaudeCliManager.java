@@ -507,6 +507,11 @@ public class ClaudeCliManager {
         command.add("stream-json");
         command.add("--verbose");
         command.add("--include-partial-messages");
+        // Always enable --debug. The CLI writes a per-session log file at
+        // ~/.claude/debug/<session-id>.txt that we mine for hook block
+        // messages (e.g. "obfuscation attack detected") which are NOT
+        // emitted via stream-json. Cost is just an extra file on disk.
+        command.add("--debug");
 
         // Critical: Tell CLI to send permission prompts via stdin/stdout JSON
         // (not via terminal UI). This is how VS Code extension handles permissions.
