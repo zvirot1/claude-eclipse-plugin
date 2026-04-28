@@ -44,6 +44,17 @@ public class ConversationModel implements ICliMessageListener {
 
     @Override
     public void onMessage(CliMessage message) {
+        String type = message != null ? message.getClass().getSimpleName() : "null";
+        String extra = "";
+        if (message instanceof CliMessage.StreamEvent) {
+            extra = " eventType=" + ((CliMessage.StreamEvent) message).getEventType()
+                  + " idx=" + ((CliMessage.StreamEvent) message).getIndex();
+        } else if (message instanceof CliMessage.ResultMessage) {
+            CliMessage.ResultMessage r = (CliMessage.ResultMessage) message;
+            extra = " subtype=" + r.getSubtype() + " isError=" + r.isError();
+        }
+        Activator.logInfo("[DIAG-MSG] model=" + System.identityHashCode(this)
+                + " recv=" + type + extra);
         if (message instanceof CliMessage.SystemInit) {
             handleSystemInit((CliMessage.SystemInit) message);
         } else if (message instanceof CliMessage.AssistantMessage) {
@@ -499,8 +510,18 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void handleResult(CliMessage.ResultMessage result) {
-        Activator.logInfo("[DIAG] handleResult: cost=" + result.getCostUsd()
-                + " duration=" + result.getDurationMs() + "ms turns=" + result.getNumTurns());
+        String resultText = result.getResult();
+        String resultPreview = resultText != null
+                ? resultText.substring(0, Math.min(120, resultText.length())).replace("\n", "\\n")
+                : "null";
+        Activator.logInfo("[DIAG] handleResult: subtype=" + result.getSubtype()
+                + " isError=" + result.isError()
+                + " cost=" + result.getCostUsd()
+                + " duration=" + result.getDurationMs() + "ms"
+                + " turns=" + result.getNumTurns()
+                + " resultLen=" + (resultText != null ? resultText.length() : 0)
+                + " resultPreview='" + resultPreview + "'"
+                + " sessionId=" + result.getSessionId());
         // NOTE: Do NOT reset usingStreamEvents here. The CLI sends a redundant
         // assistant snapshot AFTER the result message. If we reset the flag,
         // handleAssistantMessage would process that snapshot and duplicate the text.

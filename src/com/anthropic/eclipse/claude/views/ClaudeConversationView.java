@@ -228,6 +228,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         model.addListener(this);
         cliManager.addMessageListener(model);
         cliManager.addStateListener(this);
+        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " INITIAL model=" + System.identityHashCode(model)
+                + " cli=" + System.identityHashCode(cliManager));
 
         // Make the model and CLI accessible to other components (e.g. status bar).
         // Since each tab has its own CLI, the status bar reflects whichever tab is active.
@@ -1090,6 +1093,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Passes the current session ID so the CLI restarts with --resume, preserving conversation memory.
      */
     private void handleStop() {
+        Activator.logInfo("[DIAG-FLAG] renderingSuppressed: false -> TRUE (handleStop)");
         renderingSuppressed = true;  // Block ALL further UI updates immediately
         cancelStreamingTimeout();
 
@@ -1329,9 +1333,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             cliManager.sendMessage(finalText);
         }
 
+        Activator.logInfo("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (handleInput)");
         renderingSuppressed = false;  // Reset for new query
         diagSendTime = System.currentTimeMillis();
-        Activator.logInfo("[DIAG-TIMING] T0 send at " + diagSendTime);
+        Activator.logInfo("[DIAG-TIMING] T0 send at " + diagSendTime
+                + " viewModel=" + System.identityHashCode(model)
+                + " viewHash=" + System.identityHashCode(this));
         stopButton.setEnabled(true);
         setSendButtonToStop();
         costBar.setStatus("Streaming...");
@@ -1581,6 +1588,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         if (cliManager.isRunning()) {
             cliManager.sendMessage(fullMessage);
+            Activator.logInfo("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (slash cmd)");
             renderingSuppressed = false;
             stopButton.setEnabled(true);
             setSendButtonToStop();
@@ -1610,6 +1618,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
         Activator.getDefault().setConversationModel(model);
@@ -1654,6 +1665,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
         Activator.getDefault().setConversationModel(model);
@@ -1707,6 +1721,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
 
@@ -3424,6 +3441,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
 
