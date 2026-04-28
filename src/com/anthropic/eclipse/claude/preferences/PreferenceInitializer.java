@@ -37,5 +37,8 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
         // Input behavior
         store.setDefault(PreferenceConstants.ENTER_TO_SEND, true);
         store.setDefault(PreferenceConstants.AUTO_SAVE_BEFORE_TOOLS, true);
+
+        // Diagnostic logging — off by default. Enable via preferences or -Dclaude.diag=true.
+        store.setDefault(PreferenceConstants.DIAGNOSTIC_LOGGING, false);
     }
 }

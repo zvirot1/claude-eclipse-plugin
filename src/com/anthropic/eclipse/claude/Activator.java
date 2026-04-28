@@ -27,6 +27,15 @@ public class Activator extends AbstractUIPlugin {
 
     public static final String PLUGIN_ID = "com.anthropic.eclipse.claude";
 
+    /**
+     * Diagnostic logging toggle. When true, calls to {@link #logDiag(String)}
+     * emit messages to the Error Log. When false, they're no-ops.
+     *
+     * Initial value comes from -Dclaude.diag=true (JVM system property).
+     * Updated at runtime by the preference page (DIAGNOSTIC_LOGGING).
+     */
+    public static volatile boolean DIAG_ENABLED = Boolean.getBoolean("claude.diag");
+
     private static Activator plugin;
 
     // Singleton services
@@ -65,6 +74,30 @@ public class Activator extends AbstractUIPlugin {
 
         // Migrate API key from plain preference store to encrypted secure storage (one-time)
         SecureApiKeyStore.migrateIfNeeded();
+
+        // Initialize DIAG_ENABLED from preference (OR'd with the system-property default)
+        try {
+            boolean prefEnabled = getPreferenceStore().getBoolean(
+                com.anthropic.eclipse.claude.preferences.PreferenceConstants.DIAGNOSTIC_LOGGING);
+            DIAG_ENABLED = DIAG_ENABLED || prefEnabled;
+            // React to preference changes at runtime
+            getPreferenceStore().addPropertyChangeListener(evt -> {
+                if (com.anthropic.eclipse.claude.preferences.PreferenceConstants.DIAGNOSTIC_LOGGING
+                        .equals(evt.getProperty())) {
+                    boolean now = Boolean.parseBoolean(String.valueOf(evt.getNewValue()))
+                            || Boolean.getBoolean("claude.diag");
+                    DIAG_ENABLED = now;
+                    logInfo("[DIAG-START] Diagnostic logging " + (now ? "ENABLED" : "DISABLED")
+                            + " via preference at " + System.currentTimeMillis());
+                }
+            });
+            if (DIAG_ENABLED) {
+                logInfo("[DIAG-START] Diagnostic logging ENABLED at startup (sysProp="
+                        + Boolean.getBoolean("claude.diag") + ", pref=" + prefEnabled + ")");
+            }
+        } catch (Throwable t) {
+            // Best-effort; never block startup over diagnostic plumbing
+        }
     }
 
     @Override
@@ -202,6 +235,17 @@ public class Activator extends AbstractUIPlugin {
      */
     public static void logInfo(String message) {
         log(IStatus.INFO, message, null);
+    }
+
+    /**
+     * Diagnostic log — only emitted when DIAG_ENABLED is true.
+     * Cheap when disabled (single volatile read).
+     * Use this for verbose tracing that should NOT appear in normal usage.
+     */
+    public static void logDiag(String message) {
+        if (DIAG_ENABLED) {
+            log(IStatus.INFO, message, null);
+        }
     }
 
     /**

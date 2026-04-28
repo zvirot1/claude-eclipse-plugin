@@ -120,6 +120,14 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
             "Max Stored Sessions:",
             getFieldEditorParent()
         ));
+
+        // Diagnostic logging — only enable when investigating bugs.
+        // Emits verbose [DIAG] entries to the Error Log.
+        addField(new BooleanFieldEditor(
+            PreferenceConstants.DIAGNOSTIC_LOGGING,
+            "Enable diagnostic logging (verbose [DIAG] entries in Error Log)",
+            getFieldEditorParent()
+        ));
     }
 
     @Override

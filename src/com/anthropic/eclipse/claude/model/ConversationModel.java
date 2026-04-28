@@ -53,7 +53,7 @@ public class ConversationModel implements ICliMessageListener {
             CliMessage.ResultMessage r = (CliMessage.ResultMessage) message;
             extra = " subtype=" + r.getSubtype() + " isError=" + r.isError();
         }
-        Activator.logInfo("[DIAG-MSG] model=" + System.identityHashCode(this)
+        Activator.logDiag("[DIAG-MSG] model=" + System.identityHashCode(this)
                 + " recv=" + type + extra);
         if (message instanceof CliMessage.SystemInit) {
             handleSystemInit((CliMessage.SystemInit) message);
@@ -244,18 +244,18 @@ public class ConversationModel implements ICliMessageListener {
             String t = extractTextFromContent(msg.getContent());
             if (t != null) preview = t.substring(0, Math.min(40, t.length())).replace("\n", "\\n");
         } catch (Throwable ignored) {}
-        Activator.logInfo("[DIAG] handleAssistantMessage: usingStreamEvents=" + usingStreamEvents
+        Activator.logDiag("[DIAG] handleAssistantMessage: usingStreamEvents=" + usingStreamEvents
                 + " currentStreamingBlock=" + (currentStreamingBlock != null)
                 + " preview='" + preview + "'");
         // When stream events are active, ignore ALL assistant messages. The stream events
         // (message_start/content_block_*/message_stop) are authoritative and already drive the UI.
         if (usingStreamEvents) {
-            Activator.logInfo("[DIAG] handleAssistantMessage SKIPPED: usingStreamEvents=true");
+            Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: usingStreamEvents=true");
             return;
         }
         // Also skip if there's an active streaming block
         if (currentStreamingBlock != null) {
-            Activator.logInfo("[DIAG] handleAssistantMessage SKIPPED: currentStreamingBlock != null");
+            Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: currentStreamingBlock != null");
             return;
         }
         // Also ignore if the last message is already ASSISTANT (complete or still streaming).
@@ -267,7 +267,7 @@ public class ConversationModel implements ICliMessageListener {
             if (!messages.isEmpty()) {
                 MessageBlock lastMsg = messages.get(messages.size() - 1);
                 if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT) {
-                    Activator.logInfo("[DIAG] handleAssistantMessage SKIPPED: last msg is ASSISTANT");
+                    Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: last msg is ASSISTANT");
                     return; // Already have an assistant message — skip duplicate
                 }
             }
@@ -279,13 +279,13 @@ public class ConversationModel implements ICliMessageListener {
                     MessageBlock existing = messages.get(i);
                     if (existing.getRole() == MessageBlock.Role.ASSISTANT
                             && incomingText.equals(existing.getFullText())) {
-                        Activator.logInfo("[DIAG] handleAssistantMessage SKIPPED: content duplicate");
+                        Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: content duplicate");
                         return; // Content duplicate — skip
                     }
                 }
             }
         }
-        Activator.logInfo("[DIAG] handleAssistantMessage PROCESSING (snapshot mode): creating new block");
+        Activator.logDiag("[DIAG] handleAssistantMessage PROCESSING (snapshot mode): creating new block");
 
         // If we received a full message directly (non-streaming), create a block for it
         if (msg.getContent() != null && !msg.getContent().isEmpty()) {
@@ -357,7 +357,7 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void handleMessageStart(CliMessage.StreamEvent event) {
-        Activator.logInfo("[DIAG] handleMessageStart: prev usingStreamEvents=" + usingStreamEvents
+        Activator.logDiag("[DIAG] handleMessageStart: prev usingStreamEvents=" + usingStreamEvents
                 + " currentStreamingBlock=" + (currentStreamingBlock != null));
         // Start a new assistant message — but don't fire onAssistantMessageStarted yet.
         // We defer that until the first content block arrives so we never show an empty bubble.
@@ -370,7 +370,7 @@ public class ConversationModel implements ICliMessageListener {
                 MessageBlock lastMsg = messages.get(messages.size() - 1);
                 if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg != currentStreamingBlock) {
                     String prev = lastMsg.getFullText();
-                    Activator.logInfo("[DIAG] handleMessageStart REMOVED prev assistant block, len="
+                    Activator.logDiag("[DIAG] handleMessageStart REMOVED prev assistant block, len="
                             + (prev != null ? prev.length() : 0));
                     messages.remove(messages.size() - 1);
                     fireAssistantMessageRemoved(lastMsg);
@@ -387,7 +387,7 @@ public class ConversationModel implements ICliMessageListener {
 
     private void handleContentBlockStart(CliMessage.StreamEvent event) {
         CliMessage.ContentBlock cb0 = event.getContentBlock();
-        Activator.logInfo("[DIAG] handleContentBlockStart: index=" + event.getIndex()
+        Activator.logDiag("[DIAG] handleContentBlockStart: index=" + event.getIndex()
                 + " type=" + (cb0 != null ? cb0.getType() : "null")
                 + " currentStreamingBlock=" + (currentStreamingBlock != null));
         boolean fireStarted = false;
@@ -443,7 +443,7 @@ public class ConversationModel implements ICliMessageListener {
         if ("text_delta".equals(delta.getType()) && delta.getText() != null) {
             String dt = delta.getText();
             String snip = dt.substring(0, Math.min(30, dt.length())).replace("\n", "\\n");
-            Activator.logInfo("[DIAG] text_delta idx=" + event.getIndex()
+            Activator.logDiag("[DIAG] text_delta idx=" + event.getIndex()
                     + " len=" + dt.length() + " snip='" + snip + "'");
             // Append text to the current text segment
             MessageBlock.TextSegment textSeg = currentStreamingBlock.getOrCreateLastTextSegment();
@@ -514,7 +514,7 @@ public class ConversationModel implements ICliMessageListener {
         String resultPreview = resultText != null
                 ? resultText.substring(0, Math.min(120, resultText.length())).replace("\n", "\\n")
                 : "null";
-        Activator.logInfo("[DIAG] handleResult: subtype=" + result.getSubtype()
+        Activator.logDiag("[DIAG] handleResult: subtype=" + result.getSubtype()
                 + " isError=" + result.isError()
                 + " cost=" + result.getCostUsd()
                 + " duration=" + result.getDurationMs() + "ms"

@@ -228,7 +228,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         model.addListener(this);
         cliManager.addMessageListener(model);
         cliManager.addStateListener(this);
-        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
                 + " INITIAL model=" + System.identityHashCode(model)
                 + " cli=" + System.identityHashCode(cliManager));
 
@@ -1093,7 +1093,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Passes the current session ID so the CLI restarts with --resume, preserving conversation memory.
      */
     private void handleStop() {
-        Activator.logInfo("[DIAG-FLAG] renderingSuppressed: false -> TRUE (handleStop)");
+        Activator.logDiag("[DIAG-FLAG] renderingSuppressed: false -> TRUE (handleStop)");
         renderingSuppressed = true;  // Block ALL further UI updates immediately
         cancelStreamingTimeout();
 
@@ -1333,10 +1333,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             cliManager.sendMessage(finalText);
         }
 
-        Activator.logInfo("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (handleInput)");
+        Activator.logDiag("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (handleInput)");
         renderingSuppressed = false;  // Reset for new query
         diagSendTime = System.currentTimeMillis();
-        Activator.logInfo("[DIAG-TIMING] T0 send at " + diagSendTime
+        Activator.logDiag("[DIAG-TIMING] T0 send at " + diagSendTime
                 + " viewModel=" + System.identityHashCode(model)
                 + " viewHash=" + System.identityHashCode(this));
         stopButton.setEnabled(true);
@@ -1588,7 +1588,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         if (cliManager.isRunning()) {
             cliManager.sendMessage(fullMessage);
-            Activator.logInfo("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (slash cmd)");
+            Activator.logDiag("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (slash cmd)");
             renderingSuppressed = false;
             stopButton.setEnabled(true);
             setSendButtonToStop();
@@ -1618,7 +1618,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
-        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
                 + " replaced oldModel=" + System.identityHashCode(oldModel)
                 + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
@@ -1665,7 +1665,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
-        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
                 + " replaced oldModel=" + System.identityHashCode(oldModel)
                 + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
@@ -1721,7 +1721,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
-        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
                 + " replaced oldModel=" + System.identityHashCode(oldModel)
                 + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
@@ -1974,7 +1974,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     @Override
     public void onAssistantMessageStarted(MessageBlock block) {
         if (diagSendTime > 0) {
-            Activator.logInfo("[DIAG-TIMING] T1 onAssistantMessageStarted +"
+            Activator.logDiag("[DIAG-TIMING] T1 onAssistantMessageStarted +"
                     + (System.currentTimeMillis() - diagSendTime) + "ms");
         }
         touchStreamActivity(); // streaming started — reset timeout clock
@@ -2132,7 +2132,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     @Override
     public void onAssistantMessageCompleted(MessageBlock block) {
         if (diagSendTime > 0) {
-            Activator.logInfo("[DIAG-TIMING] T2 onAssistantMessageCompleted +"
+            Activator.logDiag("[DIAG-TIMING] T2 onAssistantMessageCompleted +"
                     + (System.currentTimeMillis() - diagSendTime) + "ms"
                     + " hasRunningTools=" + model.hasRunningToolCalls());
         }
@@ -2168,7 +2168,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     @Override
     public void onResultReceived(UsageInfo usage) {
         if (diagSendTime > 0) {
-            Activator.logInfo("[DIAG-TIMING] T3 onResultReceived +"
+            Activator.logDiag("[DIAG-TIMING] T3 onResultReceived +"
                     + (System.currentTimeMillis() - diagSendTime) + "ms");
             diagSendTime = 0; // reset
         }
@@ -3441,7 +3441,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
-        Activator.logInfo("[DIAG-MODEL] view=" + System.identityHashCode(this)
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
                 + " replaced oldModel=" + System.identityHashCode(oldModel)
                 + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
