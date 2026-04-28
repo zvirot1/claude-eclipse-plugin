@@ -55,6 +55,19 @@ public class ConversationModel implements ICliMessageListener {
      */
     private volatile CliMessage.SystemNotification lastErrorNotification;
 
+    /**
+     * The exact text of the last user prompt sent to the CLI for the current
+     * turn. Used to drive a one-shot auto-retry on silent-empty results
+     * (the AIM hook is non-deterministic and a second attempt often passes).
+     */
+    private volatile String lastUserPrompt;
+
+    /**
+     * True once we've already auto-retried this turn. Prevents an infinite
+     * retry loop if the prompt is genuinely blocked.
+     */
+    private volatile boolean retriedSilentEmpty;
+
     // ==================== ICliMessageListener Implementation ====================
 
     @Override
@@ -146,6 +159,8 @@ public class ConversationModel implements ICliMessageListener {
         // Reset per-turn diagnostic state so handleResult can detect empty turns.
         hadTextInCurrentTurn = false;
         lastErrorNotification = null;
+        lastUserPrompt = content;
+        retriedSilentEmpty = false;
 
         MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
         MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
@@ -596,6 +611,19 @@ public class ConversationModel implements ICliMessageListener {
                 && (resultText == null || resultText.isEmpty())
                 && result.getOutputTokens() == 0;
         if (silentEmpty) {
+            // First-attempt auto-retry: the AIM/UserPromptSubmit hook is
+            // non-deterministic — same prompt sometimes blocks, sometimes
+            // passes. A single retry is cheap and frequently succeeds.
+            if (!retriedSilentEmpty && lastUserPrompt != null && !lastUserPrompt.isEmpty()
+                    && lastErrorNotification == null) {
+                retriedSilentEmpty = true;          // keep TRUE — prevents infinite loop
+                hadTextInCurrentTurn = false;       // reset for the retry attempt
+                lastErrorNotification = null;       // reset for the retry attempt
+                Activator.logDiag("[DIAG] silentEmpty result — auto-retrying once");
+                fireSilentEmptyShouldRetry(lastUserPrompt);
+                return;
+            }
+
             String msg;
             if (lastErrorNotification != null) {
                 // We already surfaced a richer error from the hook — don't double-report.
@@ -618,18 +646,23 @@ public class ConversationModel implements ICliMessageListener {
                         + "Workarounds: rephrase the prompt, or contact your IT/AWS "
                         + "admin to relax the hook rule.";
                 } else {
-                    msg = "⚠ Your prompt was blocked.\n\n"
+                    String retried = retriedSilentEmpty ? "after one auto-retry " : "";
+                    msg = "⚠ Your prompt was blocked " + retried + "by a hook.\n\n"
                         + "The CLI returned an empty response with 0 tokens used "
                         + "(duration=" + result.getDurationMs() + "ms, turns=" + result.getNumTurns() + "). "
                         + "This is the typical signature of a UserPromptSubmit hook "
-                        + "rejecting the prompt — for example, a corporate security "
-                        + "policy flagging Hebrew/RTL text as \"obfuscation attack\".\n\n"
+                        + "(e.g. corporate \"obfuscation attack\" detector flagging "
+                        + "Hebrew/RTL text). The hook can be non-deterministic — "
+                        + (retriedSilentEmpty
+                            ? "we already retried automatically and it was blocked again, "
+                              + "so this prompt is consistently rejected."
+                            : "this attempt was rejected.")
+                        + "\n\n"
                         + "To see the exact reason, run in cmd:\n"
                         + "   claude --debug\n"
                         + "   <your prompt>\n\n"
-                        + "Workarounds: rephrase in English, or ask your IT/AWS admin "
-                        + "to relax the hook rule. Other possible causes: SSO token expired, "
-                        + "or the CLI failed to reach the API (check Error Log for [Claude CLI stderr]).";
+                        + "Workarounds: rephrase in English, try again later, or ask your "
+                        + "IT/AWS admin to relax the hook rule.";
                 }
                 fireError(msg);
             }
@@ -879,6 +912,12 @@ public class ConversationModel implements ICliMessageListener {
         } catch (Exception e) {
             Activator.logDiag("[DIAG] readHookBlockFromDebugLog failed: " + e.getMessage());
             return null;
+        }
+    }
+
+    private void fireSilentEmptyShouldRetry(String prompt) {
+        for (IConversationListener l : listeners) {
+            try { l.onSilentEmptyShouldRetry(prompt); } catch (Exception e) { logError(e); }
         }
     }
 

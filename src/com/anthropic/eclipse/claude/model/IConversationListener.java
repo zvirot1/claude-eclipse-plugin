@@ -97,6 +97,16 @@ public interface IConversationListener {
     default void onError(String error) {}
 
     /**
+     * Called when the model detects a silent-empty result (CLI returned with
+     * 0 tokens and no streaming events) on the FIRST attempt of a turn. The
+     * UI should re-send {@code lastUserPrompt} once — corporate hooks like
+     * AIM are non-deterministic and a retry frequently succeeds. If the retry
+     * also yields a silent-empty result, the model will fire {@link #onError}
+     * with a block-explanation message instead.
+     */
+    default void onSilentEmptyShouldRetry(String lastUserPrompt) {}
+
+    /**
      * Called when the conversation is cleared.
      */
     default void onConversationCleared() {}
