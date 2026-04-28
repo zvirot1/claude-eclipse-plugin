@@ -29,4 +29,9 @@ public class PreferenceConstants {
 
     // Effort level (persisted across sessions)
     public static final String EFFORT_LEVEL = "effortLevel";              // "low","medium","high","max", or "" for Auto
+
+    // Diagnostic logging — when true, the plugin emits verbose [DIAG] logs
+    // to the Eclipse Error Log. Useful for investigating bugs without rebuilding.
+    // Can also be enabled at startup via -Dclaude.diag=true on the JVM.
+    public static final String DIAGNOSTIC_LOGGING = "diagnosticLogging";
 }

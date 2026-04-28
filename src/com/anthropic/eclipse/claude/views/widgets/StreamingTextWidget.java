@@ -75,7 +75,7 @@ public class StreamingTextWidget extends Composite {
             boolean wasEmpty = rawMarkdown.length() == 0;
             pendingText.append(delta);
             rawMarkdown.append(delta);
-            com.anthropic.eclipse.claude.Activator.logInfo(
+            com.anthropic.eclipse.claude.Activator.logDiag(
                 "[DIAG] StreamingTextWidget.appendText deltaLen=" + delta.length()
                 + " rawTotalLen=" + rawMarkdown.length());
             if (wasEmpty) {
@@ -112,7 +112,7 @@ public class StreamingTextWidget extends Composite {
                 String secondHalf = text.substring(len / 2);
                 exactHalfDup = firstHalf.equals(secondHalf);
             }
-            com.anthropic.eclipse.claude.Activator.logInfo(
+            com.anthropic.eclipse.claude.Activator.logDiag(
                 "[DIAG] StreamingTextWidget.finalizeContent rawLen=" + len
                 + " exactHalfDup=" + exactHalfDup
                 + " head='" + head + "'"

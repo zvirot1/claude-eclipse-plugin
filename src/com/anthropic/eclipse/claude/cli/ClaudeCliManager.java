@@ -469,7 +469,7 @@ public class ClaudeCliManager {
         if (protocolHandler != null) {
             protocolHandler.addListener(listener);
         }
-        com.anthropic.eclipse.claude.Activator.logInfo(
+        com.anthropic.eclipse.claude.Activator.logDiag(
             "[DIAG-LISTENER] ADD listener=" + System.identityHashCode(listener)
             + " totalListeners=" + messageListeners.size()
             + " protocolHandlerActive=" + (protocolHandler != null));
@@ -480,7 +480,7 @@ public class ClaudeCliManager {
         if (protocolHandler != null) {
             protocolHandler.removeListener(listener);
         }
-        com.anthropic.eclipse.claude.Activator.logInfo(
+        com.anthropic.eclipse.claude.Activator.logDiag(
             "[DIAG-LISTENER] REMOVE listener=" + System.identityHashCode(listener)
             + " totalListeners=" + messageListeners.size()
             + " protocolHandlerActive=" + (protocolHandler != null));
