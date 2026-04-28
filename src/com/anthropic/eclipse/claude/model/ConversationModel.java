@@ -40,6 +40,21 @@ public class ConversationModel implements ICliMessageListener {
      */
     private volatile boolean usingStreamEvents = false;
 
+    /**
+     * True if the current turn produced any visible text (assistant text segments
+     * via stream events). Reset on each new user input. Used by handleResult to
+     * detect "empty result" cases (CLI returned without producing any output —
+     * e.g. AWS SSO token expired in a SessionStart hook).
+     */
+    private volatile boolean hadTextInCurrentTurn = false;
+
+    /**
+     * Last hook-related notification with an error indicator (e.g. "Token has
+     * expired"). Cleared on each new user input. Surfaced via onError() if the
+     * subsequent result is empty.
+     */
+    private volatile CliMessage.SystemNotification lastErrorNotification;
+
     // ==================== ICliMessageListener Implementation ====================
 
     @Override
@@ -57,6 +72,8 @@ public class ConversationModel implements ICliMessageListener {
                 + " recv=" + type + extra);
         if (message instanceof CliMessage.SystemInit) {
             handleSystemInit((CliMessage.SystemInit) message);
+        } else if (message instanceof CliMessage.SystemNotification) {
+            handleSystemNotification((CliMessage.SystemNotification) message);
         } else if (message instanceof CliMessage.AssistantMessage) {
             handleAssistantMessage((CliMessage.AssistantMessage) message);
         } else if (message instanceof CliMessage.UserMessage) {
@@ -126,6 +143,10 @@ public class ConversationModel implements ICliMessageListener {
      * Add a user message to the conversation (before sending to CLI).
      */
     public void addUserMessage(String content) {
+        // Reset per-turn diagnostic state so handleResult can detect empty turns.
+        hadTextInCurrentTurn = false;
+        lastErrorNotification = null;
+
         MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
         MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
         textSeg.appendText(content);
@@ -312,6 +333,47 @@ public class ConversationModel implements ICliMessageListener {
         }
     }
 
+    /**
+     * Surface hook-related system notifications to the user when they carry an
+     * error indicator. Common case: enterprise SessionStart hooks that talk to
+     * AWS SSO and emit "Token has expired" on stderr while still reporting
+     * outcome:"success" — without this handler the failure is invisible.
+     */
+    private void handleSystemNotification(CliMessage.SystemNotification n) {
+        Activator.logDiag("[DIAG] SystemNotification subtype=" + n.getSubtype()
+                + " hook=" + n.getHookName()
+                + " hasError=" + n.hasErrorIndicator());
+
+        // Only act on hook_response (the final outcome of a hook) to avoid spamming.
+        if (!"hook_response".equals(n.getSubtype())) {
+            return;
+        }
+
+        if (n.hasErrorIndicator()) {
+            // Cache so handleResult can correlate an empty result with this error.
+            lastErrorNotification = n;
+
+            // Build a friendly message
+            String hook = n.getHookName() != null ? n.getHookName() : "hook";
+            String detail = n.getStderr();
+            if (detail == null || detail.isBlank()) detail = n.getStdout();
+            if (detail == null) detail = "";
+            detail = detail.trim();
+            // Trim CR/LF noise but keep readable
+            if (detail.length() > 400) detail = detail.substring(0, 400) + " …";
+
+            String hint = "";
+            String low = detail.toLowerCase();
+            if (low.contains("token has expired") || low.contains("sso")) {
+                hint = "\nFix: refresh your AWS SSO token (run `aws sso login`) and reopen this Claude tab.";
+            } else if (low.contains("unauthorized") || low.contains("authentication failed")) {
+                hint = "\nFix: re-authenticate (check your API key / SSO session) and reopen this Claude tab.";
+            }
+
+            fireError("⚠ Hook '" + hook + "' reported an error:\n" + detail + hint);
+        }
+    }
+
     private void handleRateLimitEvent(CliMessage.RateLimitEvent event) {
         if (event.isRejected()) {
             fireError("⚠ Rate limit reached — your request may be delayed or rejected. "
@@ -445,6 +507,7 @@ public class ConversationModel implements ICliMessageListener {
             String snip = dt.substring(0, Math.min(30, dt.length())).replace("\n", "\\n");
             Activator.logDiag("[DIAG] text_delta idx=" + event.getIndex()
                     + " len=" + dt.length() + " snip='" + snip + "'");
+            hadTextInCurrentTurn = true; // any text delta proves the model produced output
             // Append text to the current text segment
             MessageBlock.TextSegment textSeg = currentStreamingBlock.getOrCreateLastTextSegment();
             textSeg.appendText(dt);
@@ -526,6 +589,28 @@ public class ConversationModel implements ICliMessageListener {
         // assistant snapshot AFTER the result message. If we reset the flag,
         // handleAssistantMessage would process that snapshot and duplicate the text.
         // The flag is reset in handleMessageStart when a new streaming turn begins.
+
+        // Detect "silent failure": result arrived but no text was streamed in this
+        // turn. Common cause: SessionStart hook (AWS SSO) blocked or auth failed.
+        boolean silentEmpty = !hadTextInCurrentTurn
+                && (resultText == null || resultText.isEmpty())
+                && result.getOutputTokens() == 0;
+        if (silentEmpty) {
+            String msg;
+            if (lastErrorNotification != null) {
+                // We already surfaced a richer error from the hook — don't double-report.
+                Activator.logDiag("[DIAG] silentEmpty result, but lastErrorNotification already fired");
+            } else if (result.isError() || (result.getSubtype() != null && !"success".equals(result.getSubtype()))) {
+                msg = "⚠ CLI returned an error: subtype=" + result.getSubtype()
+                    + (resultText != null && !resultText.isEmpty() ? "\n" + resultText : "");
+                fireError(msg);
+            } else {
+                msg = "⚠ Empty response from Claude (no text, no tokens used).\n"
+                    + "Possible causes: authentication issue (SSO/API key), a hook blocked the prompt, "
+                    + "or the CLI failed to reach the API. Check the Error Log for [Claude CLI stderr] entries.";
+                fireError(msg);
+            }
+        }
 
         // Update usage
         cumulativeUsage.addUsage(

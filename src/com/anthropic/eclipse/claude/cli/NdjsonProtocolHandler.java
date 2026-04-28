@@ -172,7 +172,13 @@ public class NdjsonProtocolHandler {
 
         switch (type) {
             case "system":
-                return parseSystemInit(json);
+                {
+                    String subtype = JsonParser.getString(json, "subtype");
+                    if (subtype == null || "init".equals(subtype)) {
+                        return parseSystemInit(json);
+                    }
+                    return parseSystemNotification(json, jsonLine);
+                }
             case "assistant":
                 return parseAssistantMessage(json);
             case "user":
@@ -211,6 +217,22 @@ public class NdjsonProtocolHandler {
                 }
                 return null;
         }
+    }
+
+    private CliMessage.SystemNotification parseSystemNotification(Map<String, Object> json, String rawLine) {
+        CliMessage.SystemNotification n = new CliMessage.SystemNotification();
+        n.setSubtype(JsonParser.getString(json, "subtype"));
+        n.setHookName(JsonParser.getString(json, "hook_name"));
+        n.setHookEvent(JsonParser.getString(json, "hook_event"));
+        n.setHookId(JsonParser.getString(json, "hook_id"));
+        n.setStdout(JsonParser.getString(json, "stdout"));
+        n.setStderr(JsonParser.getString(json, "stderr"));
+        Object ec = json.get("exit_code");
+        if (ec instanceof Number) n.setExitCode(((Number) ec).intValue());
+        n.setOutcome(JsonParser.getString(json, "outcome"));
+        n.setSessionId(JsonParser.getString(json, "session_id"));
+        n.setRawJson(rawLine.length() > 1000 ? rawLine.substring(0, 1000) : rawLine);
+        return n;
     }
 
     private CliMessage.SystemInit parseSystemInit(Map<String, Object> json) {

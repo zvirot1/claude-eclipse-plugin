@@ -2136,6 +2136,18 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     + (System.currentTimeMillis() - diagSendTime) + "ms"
                     + " hasRunningTools=" + model.hasRunningToolCalls());
         }
+        // Bug-1 fix: when no tools are running, the visible turn is effectively
+        // done — flip the send button back to "Send" immediately rather than
+        // waiting up to 15s for the result message (very visible lag on slow
+        // corporate networks where the result trails far behind the last token).
+        if (!model.hasRunningToolCalls()) {
+            asyncExec(() -> {
+                hideThinkingIndicator();
+                if (!stopButton.isDisposed()) stopButton.setEnabled(false);
+                setSendButtonToSend();
+                // Leave costBar status to handleResult so we don't flicker.
+            });
+        }
         asyncExec(() -> {
             // Just finalize the widget content (apply markdown etc.).
             // Do NOT set "Ready" or disable stop here — this event fires after every
