@@ -202,6 +202,11 @@ public class MessageComposite extends Composite {
      */
     public void appendStreamingText(String delta) {
         if (isDisposed() || finalized) return;
+        // Race fix: if the MessageComposite was created AFTER the underlying
+        // MessageBlock was already complete, renderExistingContent() in the
+        // constructor already wrote the full text. Late-arriving streaming
+        // deltas (from buffered asyncExecs) would duplicate it. Skip them.
+        if (hasStreamedText && messageBlock.isComplete()) return;
         ensureTextWidget();
         currentTextWidget.appendText(delta);
         hasStreamedText = true;
