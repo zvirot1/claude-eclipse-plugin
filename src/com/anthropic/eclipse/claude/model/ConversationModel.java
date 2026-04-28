@@ -607,21 +607,30 @@ public class ConversationModel implements ICliMessageListener {
             } else {
                 // Signature of a UserPromptSubmit hook block: empty result, success
                 // subtype, no error flag, but num_turns>=1 and zero tokens used.
-                // The CLI does NOT surface the hook's block message to stream-json
-                // (it only prints to its own stdout in interactive mode), so we
-                // can only diagnose this by symptom.
-                msg = "⚠ Your prompt was blocked.\n\n"
-                    + "The CLI returned an empty response with 0 tokens used "
-                    + "(duration=" + result.getDurationMs() + "ms, turns=" + result.getNumTurns() + "). "
-                    + "This is the typical signature of a UserPromptSubmit hook "
-                    + "rejecting the prompt — for example, a corporate security "
-                    + "policy flagging Hebrew/RTL text as \"obfuscation attack\".\n\n"
-                    + "To see the exact reason, run in cmd:\n"
-                    + "   claude --debug\n"
-                    + "   <your prompt>\n\n"
-                    + "Workarounds: rephrase in English, or ask your IT/AWS admin "
-                    + "to relax the hook rule. Other possible causes: SSO token expired, "
-                    + "or the CLI failed to reach the API (check Error Log for [Claude CLI stderr]).";
+                // The CLI does NOT surface the hook's block message to stream-json,
+                // BUT with --debug enabled it writes the full block reason (including
+                // "obfuscation attack detected", "Original prompt: ..." etc.) to
+                // ~/.claude/debug/<session-id>.txt — we mine that file here.
+                String hookBlock = readHookBlockFromDebugLog(result.getSessionId());
+                if (hookBlock != null && !hookBlock.isBlank()) {
+                    msg = "⚠ Your prompt was blocked by a hook:\n\n"
+                        + hookBlock + "\n\n"
+                        + "Workarounds: rephrase the prompt, or contact your IT/AWS "
+                        + "admin to relax the hook rule.";
+                } else {
+                    msg = "⚠ Your prompt was blocked.\n\n"
+                        + "The CLI returned an empty response with 0 tokens used "
+                        + "(duration=" + result.getDurationMs() + "ms, turns=" + result.getNumTurns() + "). "
+                        + "This is the typical signature of a UserPromptSubmit hook "
+                        + "rejecting the prompt — for example, a corporate security "
+                        + "policy flagging Hebrew/RTL text as \"obfuscation attack\".\n\n"
+                        + "To see the exact reason, run in cmd:\n"
+                        + "   claude --debug\n"
+                        + "   <your prompt>\n\n"
+                        + "Workarounds: rephrase in English, or ask your IT/AWS admin "
+                        + "to relax the hook rule. Other possible causes: SSO token expired, "
+                        + "or the CLI failed to reach the API (check Error Log for [Claude CLI stderr]).";
+                }
                 fireError(msg);
             }
         }
@@ -795,6 +804,81 @@ public class ConversationModel implements ICliMessageListener {
     private void fireExtendedThinkingEnded() {
         for (IConversationListener l : listeners) {
             try { l.onExtendedThinkingEnded(); } catch (Exception e) { logError(e); }
+        }
+    }
+
+    /**
+     * Read the per-session debug log file written by `claude --debug` and
+     * extract the hook-block reason if present.
+     *
+     * The file lives at {@code ~/.claude/debug/<session-id>.txt}. When a
+     * UserPromptSubmit hook blocks a prompt, the CLI writes lines like:
+     * <pre>
+     *   ● UserPromptSubmit operation blocked by hook:   obfuscation attack detected
+     *     Original prompt: יה
+     * </pre>
+     * The block reason is NOT emitted via stream-json — this is the only way
+     * to obtain it programmatically.
+     *
+     * Returns null if the file is missing, unreadable, or contains no block.
+     */
+    private String readHookBlockFromDebugLog(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return null;
+        try {
+            String home = System.getProperty("user.home");
+            java.nio.file.Path file = java.nio.file.Paths.get(home, ".claude", "debug", sessionId + ".txt");
+            if (!java.nio.file.Files.exists(file)) {
+                Activator.logDiag("[DIAG] debug log not found: " + file);
+                return null;
+            }
+            // Read the whole file (typically small — a few KB per session).
+            String content = new String(java.nio.file.Files.readAllBytes(file),
+                    java.nio.charset.StandardCharsets.UTF_8);
+
+            // Look for the canonical block marker. Capture the line(s) that
+            // describe the block AND the "Original prompt" line if present.
+            //
+            // We do a simple scan rather than a regex — the output is
+            // human-formatted and the patterns are stable.
+            String[] lines = content.split("\\r?\\n");
+            StringBuilder out = new StringBuilder();
+            boolean inBlock = false;
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i];
+                String low = line.toLowerCase();
+                if (low.contains("operation blocked by hook")
+                        || low.contains("blocked by hook:")) {
+                    out.append(line.trim()).append("\n");
+                    inBlock = true;
+                    // Capture the next 1-3 indented lines (e.g. "Original prompt: ..."
+                    // or extra reason text the hook emitted).
+                    for (int j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+                        String next = lines[j];
+                        if (next.isBlank()) break;
+                        // Hook continuation lines are typically indented
+                        if (next.startsWith(" ") || next.startsWith("\t")
+                                || next.toLowerCase().contains("original prompt")) {
+                            out.append(next.trim()).append("\n");
+                        } else {
+                            break;
+                        }
+                    }
+                    break; // first match is enough
+                }
+            }
+            String result = out.toString().trim();
+            if (result.isEmpty()) {
+                Activator.logDiag("[DIAG] debug log present but no hook-block marker found");
+                return null;
+            }
+            // Trim a leading bullet character if present (e.g. "● ")
+            if (result.startsWith("●") || result.startsWith("•")) {
+                result = result.substring(1).trim();
+            }
+            return result;
+        } catch (Exception e) {
+            Activator.logDiag("[DIAG] readHookBlockFromDebugLog failed: " + e.getMessage());
+            return null;
         }
     }
 
