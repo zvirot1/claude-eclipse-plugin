@@ -29,6 +29,9 @@ public class MessageComposite extends Composite {
     private final List<ToolCallComposite> toolCallWidgets = new ArrayList<>();
     private final List<CodeBlockComposite> codeBlockWidgets = new ArrayList<>();
     private boolean hasStreamedText = false; // true if any text was rendered during streaming
+    private boolean fullTextRendered = false; // true ONLY if renderExistingContent wrote the full segment text
+                                              // (used to skip late-arriving deltas in the race-condition case
+                                              // where the widget was created after the block was already complete)
     private boolean finalized = false; // prevent double finalization
 
     /** Callback for fork action from context menu. */
@@ -190,6 +193,7 @@ public class MessageComposite extends Composite {
                     ensureTextWidget();
                     currentTextWidget.appendText(textSeg.getText());
                     hasStreamedText = true; // Prevent finalizeContent() from re-adding this text
+                    fullTextRendered = true; // Block late streaming deltas from duplicating this content
                 }
             } else if (seg instanceof MessageBlock.ToolCallSegment) {
                 addToolCallWidget((MessageBlock.ToolCallSegment) seg);
@@ -206,7 +210,12 @@ public class MessageComposite extends Composite {
         // MessageBlock was already complete, renderExistingContent() in the
         // constructor already wrote the full text. Late-arriving streaming
         // deltas (from buffered asyncExecs) would duplicate it. Skip them.
-        if (hasStreamedText && messageBlock.isComplete()) return;
+        //
+        // IMPORTANT: only check the dedicated fullTextRendered flag — checking
+        // messageBlock.isComplete() would over-trigger and drop legitimate
+        // late deltas in the normal streaming case (content_block_stop fires
+        // before all queued asyncExecs are processed on a busy UI thread).
+        if (fullTextRendered) return;
         ensureTextWidget();
         currentTextWidget.appendText(delta);
         hasStreamedText = true;
