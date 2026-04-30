@@ -279,18 +279,57 @@ public class MessageComposite extends Composite {
     }
 
     private void openImageInExternalViewer(MessageBlock.ImageSegment imageSeg) {
+        java.nio.file.Path tmp = null;
         try {
             String safeName = imageSeg.getName().replaceAll("[^A-Za-z0-9._-]", "_");
             if (!safeName.toLowerCase().endsWith(".png") && !safeName.toLowerCase().endsWith(".jpg")
                     && !safeName.toLowerCase().endsWith(".jpeg") && !safeName.toLowerCase().endsWith(".gif")) {
                 safeName += ".png";
             }
-            java.nio.file.Path tmp = java.nio.file.Files.createTempFile("claude-img-", "-" + safeName);
+            tmp = java.nio.file.Files.createTempFile("claude-img-", "-" + safeName);
             java.nio.file.Files.write(tmp, imageSeg.getBytes());
-            java.awt.Desktop.getDesktop().open(tmp.toFile());
-        } catch (Exception ex) {
+            String absPath = tmp.toAbsolutePath().toString();
+
+            // 1. Try SWT's Program.launch (preferred — uses OS file association)
+            boolean launched = org.eclipse.swt.program.Program.launch(absPath);
+            if (launched) {
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via Program.launch: " + absPath);
+                return;
+            }
+
+            // 2. Fallback: rundll32 url.dll on Windows (always works on Windows
+            //    even if no file association is registered for SWT)
+            String os = System.getProperty("os.name", "").toLowerCase();
+            if (os.contains("win")) {
+                new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", absPath)
+                        .inheritIO().start();
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via rundll32: " + absPath);
+                return;
+            }
+
+            // 3. Fallback: AWT Desktop (last resort, may fail in headless / SWT)
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(tmp.toFile());
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via Desktop: " + absPath);
+                return;
+            }
+
             com.anthropic.eclipse.claude.Activator.logWarning(
-                    "[MessageComposite] Failed to open image: " + ex.getMessage());
+                    "[MessageComposite] No way to open image. Saved at: " + absPath);
+            // Show user where the file was saved so they can open manually
+            org.eclipse.jface.dialogs.MessageDialog.openInformation(getShell(),
+                    "Image saved",
+                    "Could not open the image automatically.\n\nThe image was saved at:\n" + absPath);
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logError(
+                    "[MessageComposite] Failed to open image: " + ex.getMessage(), ex);
+            String pathInfo = tmp != null ? "\n\nThe image was saved at:\n" + tmp.toAbsolutePath() : "";
+            org.eclipse.jface.dialogs.MessageDialog.openError(getShell(),
+                    "Could not open image",
+                    "Failed to open the image: " + ex.getMessage() + pathInfo);
         }
     }
 
