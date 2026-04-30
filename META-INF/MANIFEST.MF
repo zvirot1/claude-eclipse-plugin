@@ -2,7 +2,7 @@ Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
 Bundle-Name: Claude AI Plugin
 Bundle-SymbolicName: com.anthropic.eclipse.claude;singleton:=true
-Bundle-Version: 1.0.0.202604291030
+Bundle-Version: 1.0.0.202604291130
 Bundle-Activator: com.anthropic.eclipse.claude.Activator
 Bundle-Vendor: Anthropic (Unofficial)
 Require-Bundle: org.eclipse.ui,

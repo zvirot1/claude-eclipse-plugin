@@ -617,6 +617,39 @@ public class McpServersDialog extends TitleAreaDialog {
                 item.setText(1, e.getValue());
             }
 
+            // Inline editing: double-click any cell to edit it in place.
+            // ENTER commits the value; ESC cancels. Empty key after edit removes
+            // the row to avoid orphan blank entries.
+            final org.eclipse.swt.custom.TableEditor cellEditor = new org.eclipse.swt.custom.TableEditor(envTable);
+            cellEditor.horizontalAlignment = SWT.LEFT;
+            cellEditor.grabHorizontal = true;
+            envTable.addListener(SWT.MouseDoubleClick, evt -> {
+                org.eclipse.swt.graphics.Point pt = new org.eclipse.swt.graphics.Point(evt.x, evt.y);
+                TableItem item = envTable.getItem(pt);
+                if (item == null) return;
+                int colIdx = -1;
+                for (int i = 0; i < envTable.getColumnCount(); i++) {
+                    if (item.getBounds(i).contains(pt)) { colIdx = i; break; }
+                }
+                if (colIdx < 0) return;
+                final int col = colIdx;
+                final TableItem ti = item;
+                final Text editor = new Text(envTable, SWT.NONE);
+                editor.setText(ti.getText(col));
+                editor.selectAll();
+                editor.setFocus();
+                editor.addListener(SWT.FocusOut, e -> commitInlineEdit(envTable, cellEditor, ti, col, editor));
+                editor.addListener(SWT.Traverse, e -> {
+                    if (e.detail == SWT.TRAVERSE_RETURN) {
+                        commitInlineEdit(envTable, cellEditor, ti, col, editor);
+                    } else if (e.detail == SWT.TRAVERSE_ESCAPE) {
+                        editor.dispose();
+                        e.doit = false;
+                    }
+                });
+                cellEditor.setEditor(editor, ti, col);
+            });
+
             // Env add/remove buttons
             Composite envBtns = new Composite(envPanel, SWT.NONE);
             envBtns.setLayout(new GridLayout(4, false));
@@ -654,7 +687,27 @@ public class McpServersDialog extends TitleAreaDialog {
                 if (indices.length > 0) envTable.remove(indices);
             });
 
+            // Subtle hint so users discover inline editing
+            Label envHint = new Label(envPanel, SWT.NONE);
+            envHint.setText("Tip: double-click a cell to edit. Press Enter to save, Esc to cancel.");
+            envHint.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+
             return area;
+        }
+
+        private void commitInlineEdit(Table table, org.eclipse.swt.custom.TableEditor cellEditor,
+                                       TableItem item, int col, Text editor) {
+            if (editor.isDisposed()) return;
+            String newText = editor.getText();
+            if (!item.isDisposed()) {
+                item.setText(col, newText);
+                // If KEY column is now empty, drop the row to avoid orphan entries
+                if (col == 0 && newText.trim().isEmpty()) {
+                    int idx = table.indexOf(item);
+                    if (idx >= 0) table.remove(idx);
+                }
+            }
+            editor.dispose();
         }
 
         @Override
