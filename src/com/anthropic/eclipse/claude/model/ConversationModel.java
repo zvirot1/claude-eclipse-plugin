@@ -156,6 +156,19 @@ public class ConversationModel implements ICliMessageListener {
      * Add a user message to the conversation (before sending to CLI).
      */
     public void addUserMessage(String content) {
+        addUserMessage(content, null, null);
+    }
+
+    /**
+     * Add a user message including attached images. Images are stored as
+     * ImageSegments after the text so the UI can render thumbnails inline.
+     *
+     * @param content   the visible text the user typed
+     * @param images    raw image bytes per attachment (may be null/empty)
+     * @param imageNames matching display names for each image (may be null/empty)
+     */
+    public void addUserMessage(String content, java.util.List<byte[]> images,
+                               java.util.List<String> imageNames) {
         // Reset per-turn diagnostic state so handleResult can detect empty turns.
         hadTextInCurrentTurn = false;
         lastErrorNotification = null;
@@ -166,6 +179,17 @@ public class ConversationModel implements ICliMessageListener {
         MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
         textSeg.appendText(content);
         block.addSegment(textSeg);
+
+        if (images != null && !images.isEmpty()) {
+            for (int i = 0; i < images.size(); i++) {
+                byte[] bytes = images.get(i);
+                if (bytes == null || bytes.length == 0) continue;
+                String name = (imageNames != null && i < imageNames.size())
+                        ? imageNames.get(i) : ("Image " + (i + 1));
+                block.addSegment(new MessageBlock.ImageSegment(bytes, name, "image/png"));
+            }
+        }
+
         synchronized (messages) {
             messages.add(block);
         }

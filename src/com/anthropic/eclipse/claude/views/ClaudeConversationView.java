@@ -1310,13 +1310,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         // Collect images and build display text BEFORE clearing
         List<byte[]> images = attachmentManager != null ? new ArrayList<>(attachmentManager.getImages()) : new ArrayList<>();
+        List<String> imageNames = attachmentManager != null ? new ArrayList<>(attachmentManager.getImageNames()) : new ArrayList<>();
         String displayText = buildDisplayText(text);
 
         // Clear attachment state
         if (attachmentManager != null) attachmentManager.clearAll();
 
-        // Show in UI what was sent
-        model.addUserMessage(displayText.isEmpty() ? finalText : displayText);
+        // Show in UI what was sent (include images so the bubble renders thumbnails)
+        model.addUserMessage(displayText.isEmpty() ? finalText : displayText, images, imageNames);
 
         // Update tab title with first user message (only once per conversation)
         if (!partNameSet && !text.trim().isEmpty()) {
