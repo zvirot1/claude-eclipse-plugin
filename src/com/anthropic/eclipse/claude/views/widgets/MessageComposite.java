@@ -195,6 +195,8 @@ public class MessageComposite extends Composite {
                     hasStreamedText = true; // Prevent finalizeContent() from re-adding this text
                     fullTextRendered = true; // Block late streaming deltas from duplicating this content
                 }
+            } else if (seg instanceof MessageBlock.ImageSegment) {
+                addImageWidget((MessageBlock.ImageSegment) seg);
             } else if (seg instanceof MessageBlock.ToolCallSegment) {
                 addToolCallWidget((MessageBlock.ToolCallSegment) seg);
             }
@@ -219,6 +221,77 @@ public class MessageComposite extends Composite {
         ensureTextWidget();
         currentTextWidget.appendText(delta);
         hasStreamedText = true;
+    }
+
+    /**
+     * Render an attached image inline as a thumbnail (max ~200px) under the
+     * current text. Click opens the full-size image in Eclipse's default
+     * image viewer (via a temp file).
+     */
+    public void addImageWidget(MessageBlock.ImageSegment imageSeg) {
+        if (isDisposed() || imageSeg.getBytes() == null) return;
+        // Close current text widget so the image renders below
+        if (currentTextWidget != null && !currentTextWidget.isFinalized()) {
+            finalizeAndExtractCodeBlocks(currentTextWidget);
+            currentTextWidget = null;
+        }
+        try {
+            org.eclipse.swt.graphics.ImageData full = new org.eclipse.swt.graphics.ImageData(
+                    new java.io.ByteArrayInputStream(imageSeg.getBytes()));
+            // Scale to max 200x200 keeping aspect ratio
+            int maxDim = 200;
+            int w = full.width, h = full.height;
+            if (w > maxDim || h > maxDim) {
+                if (w >= h) { h = (int) ((double) h * maxDim / w); w = maxDim; }
+                else        { w = (int) ((double) w * maxDim / h); h = maxDim; }
+            }
+            final org.eclipse.swt.graphics.Image thumb =
+                    new org.eclipse.swt.graphics.Image(getDisplay(), full.scaledTo(w, h));
+
+            org.eclipse.swt.widgets.Composite wrap = new org.eclipse.swt.widgets.Composite(contentArea, SWT.NONE);
+            GridLayout wl = new GridLayout(1, false);
+            wl.marginWidth = 0; wl.marginHeight = 4; wl.verticalSpacing = 2;
+            wrap.setLayout(wl);
+            wrap.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            wrap.setBackground(getBackground());
+
+            Label imgLabel = new Label(wrap, SWT.NONE);
+            imgLabel.setImage(thumb);
+            imgLabel.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            imgLabel.setToolTipText("Click to open " + imageSeg.getName() + " (" + full.width + "×" + full.height + ")");
+            imgLabel.setBackground(getBackground());
+            imgLabel.setCursor(getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+            imgLabel.addDisposeListener(e -> { if (!thumb.isDisposed()) thumb.dispose(); });
+            imgLabel.addListener(SWT.MouseDown, e -> openImageInExternalViewer(imageSeg));
+
+            Label nameLabel = new Label(wrap, SWT.NONE);
+            nameLabel.setText(imageSeg.getName() + "  (" + full.width + "×" + full.height + ")");
+            nameLabel.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            nameLabel.setBackground(getBackground());
+            org.eclipse.swt.graphics.Color fg = getForeground();
+            if (fg != null) nameLabel.setForeground(fg);
+
+            relayoutParent();
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logWarning(
+                    "[MessageComposite] Failed to render image '" + imageSeg.getName() + "': " + ex.getMessage());
+        }
+    }
+
+    private void openImageInExternalViewer(MessageBlock.ImageSegment imageSeg) {
+        try {
+            String safeName = imageSeg.getName().replaceAll("[^A-Za-z0-9._-]", "_");
+            if (!safeName.toLowerCase().endsWith(".png") && !safeName.toLowerCase().endsWith(".jpg")
+                    && !safeName.toLowerCase().endsWith(".jpeg") && !safeName.toLowerCase().endsWith(".gif")) {
+                safeName += ".png";
+            }
+            java.nio.file.Path tmp = java.nio.file.Files.createTempFile("claude-img-", "-" + safeName);
+            java.nio.file.Files.write(tmp, imageSeg.getBytes());
+            java.awt.Desktop.getDesktop().open(tmp.toFile());
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logWarning(
+                    "[MessageComposite] Failed to open image: " + ex.getMessage());
+        }
     }
 
     /**
