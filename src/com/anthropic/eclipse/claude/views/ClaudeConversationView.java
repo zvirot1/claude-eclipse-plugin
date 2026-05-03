@@ -150,6 +150,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     // Attachment state — managed by AttachmentManager (initialized after attachmentBar is created)
     private Composite attachmentBar;
+    // Active-file chip: shows the currently focused editor's file name; clicking toggles auto-attach
+    private Composite contextBar;
+    private Button activeFileChip;
+    private org.eclipse.ui.IPartListener2 activeFilePartListener;
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -705,6 +709,39 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         inputContainer.setLayout(icLayout);
         inputContainer.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
         inputContainer.setBackground(viewBgColor);
+
+        // Context bar: shows a clickable "Active file" chip (pin/unpin behavior)
+        // Always visible (provides discoverability); chip label updates as the
+        // user switches editors. Clicking toggles the ATTACH_ACTIVE_FILE pref.
+        contextBar = new Composite(inputContainer, SWT.NONE);
+        RowLayout cbLayout = new RowLayout(SWT.HORIZONTAL);
+        cbLayout.wrap = true;
+        cbLayout.spacing = 4;
+        cbLayout.marginWidth = 0;
+        cbLayout.marginHeight = 2;
+        contextBar.setLayout(cbLayout);
+        GridData cbGd = new GridData(SWT.FILL, SWT.CENTER, true, false);
+        contextBar.setLayoutData(cbGd);
+        contextBar.setBackground(viewBgColor);
+
+        activeFileChip = new Button(contextBar, SWT.TOGGLE);
+        activeFileChip.setToolTipText("Auto-attach the active editor file to each message you send.\n"
+                + "Click to toggle. Updates when you switch editors.");
+        activeFileChip.addListener(SWT.Selection, e -> {
+            try {
+                Activator.getDefault().getPreferenceStore().setValue(
+                        PreferenceConstants.ATTACH_ACTIVE_FILE, activeFileChip.getSelection());
+            } catch (Exception ignored) {}
+            updateActiveFileChipLabel();
+        });
+        // Initial state from preference + listen to active editor changes
+        try {
+            boolean enabled = Activator.getDefault().getPreferenceStore()
+                    .getBoolean(PreferenceConstants.ATTACH_ACTIVE_FILE);
+            activeFileChip.setSelection(enabled);
+        } catch (Exception ignored) {}
+        installActiveEditorListener();
+        updateActiveFileChipLabel();
 
         // Attachment chips bar - shown only when files/images are attached
         attachmentBar = new Composite(inputContainer, SWT.NONE);
@@ -1298,6 +1335,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         String editorContext = getActiveEditorContext();
         if (editorContext != null && !editorContext.isEmpty()) {
             fullMessage.append(editorContext).append("\n\n");
+        }
+
+        // If "Active file" chip is pinned, include the file's full content as context
+        String activeFileCtx = buildActiveFilePinContext();
+        if (activeFileCtx != null) {
+            fullMessage.append(activeFileCtx);
         }
 
         if (attachmentManager != null) {
@@ -2936,6 +2979,102 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Get context about the file currently open in the active editor.
      * This helps Claude know which file the user is referring to.
      */
+    /**
+     * Update the "Active file" chip label to reflect the currently focused editor.
+     * - When a file editor is open: "📄 active-file: Foo.java" (and "(pinned)" if toggle on)
+     * - When no editor / non-file editor: "📄 active-file (none)"
+     */
+    private void updateActiveFileChipLabel() {
+        if (activeFileChip == null || activeFileChip.isDisposed()) return;
+        IFile file = getActiveFileFromEditor();
+        boolean enabled = activeFileChip.getSelection();
+        String label;
+        if (file != null) {
+            label = (enabled ? "📌 " : "📄 ") + "active-file: " + file.getName();
+            activeFileChip.setEnabled(true);
+        } else {
+            label = "📄 active-file (none)";
+            activeFileChip.setEnabled(false);
+        }
+        activeFileChip.setText(label);
+        if (contextBar != null && !contextBar.isDisposed()) {
+            contextBar.requestLayout();
+        }
+    }
+
+    private IFile getActiveFileFromEditor() {
+        try {
+            org.eclipse.ui.IWorkbenchPage page = getSite().getPage();
+            if (page == null) return null;
+            org.eclipse.ui.IEditorPart ed = page.getActiveEditor();
+            if (ed == null) return null;
+            return ed.getEditorInput().getAdapter(IFile.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void installActiveEditorListener() {
+        if (activeFilePartListener != null) return; // installed once
+        activeFilePartListener = new org.eclipse.ui.IPartListener2() {
+            @Override public void partActivated(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partBroughtToTop(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partClosed(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partOpened(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partVisible(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partHidden(org.eclipse.ui.IWorkbenchPartReference ref) {}
+            @Override public void partDeactivated(org.eclipse.ui.IWorkbenchPartReference ref) {}
+            @Override public void partInputChanged(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+        };
+        try {
+            getSite().getPage().addPartListener(activeFilePartListener);
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * If the "Active file" chip is enabled and an editor is open, return a
+     * &lt;file&gt; context block with the full content; otherwise null.
+     */
+    private String buildActiveFilePinContext() {
+        if (activeFileChip == null || !activeFileChip.getSelection()) return null;
+        IFile file = getActiveFileFromEditor();
+        if (file == null) return null;
+        try {
+            String path = file.getLocation().toOSString();
+            String content = new String(java.nio.file.Files.readAllBytes(
+                    java.nio.file.Paths.get(path)), java.nio.charset.StandardCharsets.UTF_8);
+            // Cap very large files to avoid blowing up the prompt
+            int MAX = 64 * 1024;
+            String truncatedNote = "";
+            if (content.length() > MAX) {
+                content = content.substring(0, MAX);
+                truncatedNote = "\n... (truncated to 64KB)";
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("<file path=\"").append(path).append("\" pinned=\"active-editor\">\n");
+            sb.append(content);
+            sb.append(truncatedNote);
+            if (!content.endsWith("\n")) sb.append("\n");
+            sb.append("</file>\n\n");
+            return sb.toString();
+        } catch (Exception e) {
+            Activator.logWarning("[ActiveFile] failed to read pinned file: " + e.getMessage());
+            return null;
+        }
+    }
+
     private String getActiveEditorContext() {
         try {
             org.eclipse.ui.IWorkbenchPage page = getSite().getPage();
@@ -3796,6 +3935,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (activeModePopup != null) { try { activeModePopup.close(); } catch (Exception ignored) {} }
         if (sendIcon != null) sendIcon.dispose();
         if (stopIcon != null) stopIcon.dispose();
+
+        // Detach the active-editor listener
+        if (activeFilePartListener != null) {
+            try { getSite().getPage().removePartListener(activeFilePartListener); } catch (Exception ignored) {}
+            activeFilePartListener = null;
+        }
 
         if (model != null) {
             model.removeListener(this);

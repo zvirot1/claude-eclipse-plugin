@@ -40,5 +40,10 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
 
         // Diagnostic logging — off by default. Enable via preferences or -Dclaude.diag=true.
         store.setDefault(PreferenceConstants.DIAGNOSTIC_LOGGING, false);
+
+        // Auto-attach active editor file (Amazon-Q-style "active file" pinning).
+        // Defaults to OFF so existing users see no behavior change until they
+        // explicitly opt in by clicking the chip.
+        store.setDefault(PreferenceConstants.ATTACH_ACTIVE_FILE, false);
     }
 }

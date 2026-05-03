@@ -34,4 +34,9 @@ public class PreferenceConstants {
     // to the Eclipse Error Log. Useful for investigating bugs without rebuilding.
     // Can also be enabled at startup via -Dclaude.diag=true on the JVM.
     public static final String DIAGNOSTIC_LOGGING = "diagnosticLogging";
+
+    // Active-file pinning — when true, the currently focused editor's file is
+    // automatically attached to every outgoing message. UI shows a chip with
+    // the file name; clicking the chip toggles this preference.
+    public static final String ATTACH_ACTIVE_FILE = "attachActiveFile";
 }
