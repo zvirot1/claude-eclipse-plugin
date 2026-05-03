@@ -710,38 +710,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         inputContainer.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
         inputContainer.setBackground(viewBgColor);
 
-        // Context bar: shows a clickable "Active file" chip (pin/unpin behavior)
-        // Always visible (provides discoverability); chip label updates as the
-        // user switches editors. Clicking toggles the ATTACH_ACTIVE_FILE pref.
-        contextBar = new Composite(inputContainer, SWT.NONE);
-        RowLayout cbLayout = new RowLayout(SWT.HORIZONTAL);
-        cbLayout.wrap = true;
-        cbLayout.spacing = 4;
-        cbLayout.marginWidth = 0;
-        cbLayout.marginHeight = 2;
-        contextBar.setLayout(cbLayout);
-        GridData cbGd = new GridData(SWT.FILL, SWT.CENTER, true, false);
-        contextBar.setLayoutData(cbGd);
-        contextBar.setBackground(viewBgColor);
-
-        activeFileChip = new Button(contextBar, SWT.TOGGLE);
-        activeFileChip.setToolTipText("Auto-attach the active editor file to each message you send.\n"
-                + "Click to toggle. Updates when you switch editors.");
-        activeFileChip.addListener(SWT.Selection, e -> {
-            try {
-                Activator.getDefault().getPreferenceStore().setValue(
-                        PreferenceConstants.ATTACH_ACTIVE_FILE, activeFileChip.getSelection());
-            } catch (Exception ignored) {}
-            updateActiveFileChipLabel();
-        });
-        // Initial state from preference + listen to active editor changes
-        try {
-            boolean enabled = Activator.getDefault().getPreferenceStore()
-                    .getBoolean(PreferenceConstants.ATTACH_ACTIVE_FILE);
-            activeFileChip.setSelection(enabled);
-        } catch (Exception ignored) {}
-        installActiveEditorListener();
-        updateActiveFileChipLabel();
+        // (Active-file chip moved below — it now lives INSIDE the input frame
+        // for Amazon-Q-style parity. See contextBar creation after inputBox.)
 
         // Attachment chips bar - shown only when files/images are attached
         attachmentBar = new Composite(inputContainer, SWT.NONE);
@@ -767,6 +737,41 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         inputBox.setLayout(boxLayout);
         inputBox.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
         inputBox.setBackground(inputBgColor);
+
+        // Row 0: Active-file chip — Q-style, INSIDE the input frame.
+        // Filename-only when an editor is open; blue accent when pinned.
+        // The chip is always created (the listener will hide it when no
+        // file editor is active so it doesn't take vertical space).
+        contextBar = new Composite(inputBox, SWT.NONE);
+        RowLayout cbLayout = new RowLayout(SWT.HORIZONTAL);
+        cbLayout.wrap = true;
+        cbLayout.spacing = 4;
+        cbLayout.marginWidth = 0;
+        cbLayout.marginHeight = 0;
+        contextBar.setLayout(cbLayout);
+        GridData cbGd = new GridData(SWT.FILL, SWT.CENTER, true, false);
+        contextBar.setLayoutData(cbGd);
+        contextBar.setBackground(inputBgColor);
+
+        activeFileChip = new Button(contextBar, SWT.TOGGLE | SWT.FLAT);
+        activeFileChip.setBackground(inputBgColor);
+        activeFileChip.setToolTipText("Auto-attach the currently focused file to each message.\n"
+                + "Click to toggle. Updates when you switch editors.");
+        activeFileChip.addListener(SWT.Selection, e -> {
+            try {
+                Activator.getDefault().getPreferenceStore().setValue(
+                        PreferenceConstants.ATTACH_ACTIVE_FILE, activeFileChip.getSelection());
+            } catch (Exception ignored) {}
+            updateActiveFileChipLabel();
+        });
+        // Initial state from preference + listen to active editor changes
+        try {
+            boolean enabled = Activator.getDefault().getPreferenceStore()
+                    .getBoolean(PreferenceConstants.ATTACH_ACTIVE_FILE);
+            activeFileChip.setSelection(enabled);
+        } catch (Exception ignored) {}
+        installActiveEditorListener();
+        updateActiveFileChipLabel();
 
         // Row 1: Text input area (full width)
         inputField = new Text(inputBox, SWT.MULTI | SWT.WRAP | SWT.V_SCROLL);
@@ -1359,8 +1364,22 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Clear attachment state
         if (attachmentManager != null) attachmentManager.clearAll();
 
-        // Show in UI what was sent (include images so the bubble renders thumbnails)
-        model.addUserMessage(displayText.isEmpty() ? finalText : displayText, images, imageNames);
+        // Show in UI what was sent (include images so the bubble renders thumbnails).
+        //
+        // IMPORTANT: NEVER fall back to finalText here — finalText contains the
+        // raw <file path=...>...</file> XML for both attachment context and the
+        // active-file pin. If we displayed it in the user's bubble the user
+        // would see a wall of file content from their own message. Mirrors the
+        // IntelliJ fix in commit 0d151b8 (split displayText vs cliText).
+        // If the user typed nothing and only attached files/active-file, we
+        // still want a non-empty bubble — fall back to chip-label list (text=""
+        // makes buildDisplayText return just "[name1] [name2] " from the
+        // attached files), or to a small marker when there's nothing.
+        String userBubbleText = displayText;
+        if (userBubbleText == null || userBubbleText.isEmpty()) {
+            userBubbleText = !text.isEmpty() ? text : "(attached files)";
+        }
+        model.addUserMessage(userBubbleText, images, imageNames);
 
         // Update tab title with first user message (only once per conversation)
         if (!partNameSet && !text.trim().isEmpty()) {
@@ -2980,25 +2999,44 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * This helps Claude know which file the user is referring to.
      */
     /**
-     * Update the "Active file" chip label to reflect the currently focused editor.
-     * - When a file editor is open: "📄 active-file: Foo.java" (and "(pinned)" if toggle on)
-     * - When no editor / non-file editor: "📄 active-file (none)"
+     * Update the "Active file" chip label, Q-style:
+     *   - File open + pinned   → "📌 Foo.java" with blue accent foreground
+     *   - File open + not pin  → "📄 Foo.java" with default foreground
+     *   - No file open         → hide the entire context bar (no row taken up)
+     *
+     * (Mirrors IntelliJ commits 09be592 + d0a5b6a — filename-only, blue accent.)
      */
     private void updateActiveFileChipLabel() {
         if (activeFileChip == null || activeFileChip.isDisposed()) return;
         IFile file = getActiveFileFromEditor();
-        boolean enabled = activeFileChip.getSelection();
-        String label;
-        if (file != null) {
-            label = (enabled ? "📌 " : "📄 ") + "active-file: " + file.getName();
-            activeFileChip.setEnabled(true);
-        } else {
-            label = "📄 active-file (none)";
-            activeFileChip.setEnabled(false);
-        }
-        activeFileChip.setText(label);
+        boolean show = (file != null);
+
+        // Hide / show the entire chip row depending on whether a file editor is active.
         if (contextBar != null && !contextBar.isDisposed()) {
-            contextBar.requestLayout();
+            GridData gd = (GridData) contextBar.getLayoutData();
+            if (gd != null) gd.exclude = !show;
+            contextBar.setVisible(show);
+        }
+        if (!show) {
+            activeFileChip.setText("");
+            if (contextBar != null && contextBar.getParent() != null) {
+                contextBar.getParent().layout(true, true);
+            }
+            return;
+        }
+
+        boolean enabled = activeFileChip.getSelection();
+        activeFileChip.setText((enabled ? "📌 " : "📄 ") + file.getName());
+
+        // Blue accent when pinned (matches Q's pinned-state visual).
+        try {
+            org.eclipse.swt.graphics.Color blue = activeFileChip.getDisplay()
+                    .getSystemColor(SWT.COLOR_LINK_FOREGROUND);
+            activeFileChip.setForeground(enabled ? blue : null);
+        } catch (Throwable ignored) {}
+
+        if (contextBar != null && contextBar.getParent() != null) {
+            contextBar.getParent().layout(true, true);
         }
     }
 
