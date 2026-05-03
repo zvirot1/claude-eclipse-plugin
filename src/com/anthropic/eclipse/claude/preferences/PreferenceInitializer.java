@@ -41,9 +41,11 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
         // Diagnostic logging — off by default. Enable via preferences or -Dclaude.diag=true.
         store.setDefault(PreferenceConstants.DIAGNOSTIC_LOGGING, false);
 
-        // Auto-attach active editor file (Amazon-Q-style "active file" pinning).
-        // Defaults to OFF so existing users see no behavior change until they
-        // explicitly opt in by clicking the chip.
-        store.setDefault(PreferenceConstants.ATTACH_ACTIVE_FILE, false);
+        // Auto-attach active editor file (Amazon-Q / IntelliJ style "active file" pinning).
+        // ON by default — every newly focused editor file is auto-pinned. The user
+        // can click the × on a chip to dismiss it for that specific file path
+        // (per-path memory in the view), but the global preference stays on so a
+        // new file is again auto-pinned when the user switches to it.
+        store.setDefault(PreferenceConstants.ATTACH_ACTIVE_FILE, true);
     }
 }

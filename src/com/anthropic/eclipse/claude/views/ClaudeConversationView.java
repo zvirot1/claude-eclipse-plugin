@@ -157,6 +157,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private Label    chipNameLabel;      // file name text
     private Button   chipDismissButton;  // × button to unpin
     private boolean  activeFilePinned = false;
+    /** File paths the user has explicitly dismissed via the chip's × button. */
+    private final java.util.Set<String> dismissedActiveFilePaths = new java.util.HashSet<>();
     private org.eclipse.ui.IPartListener2 activeFilePartListener;
     private AttachmentManager attachmentManager;
 
@@ -781,24 +783,24 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         chipDismissButton.setBackground(inputBgColor);
         chipDismissButton.setToolTipText("Unpin this file");
 
-        // Click on icon or name → toggle pin
+        // Click on icon or name → re-pin (clear dismissal for this path)
         org.eclipse.swt.widgets.Listener togglePin = e -> {
-            activeFilePinned = !activeFilePinned;
-            try {
-                Activator.getDefault().getPreferenceStore().setValue(
-                        PreferenceConstants.ATTACH_ACTIVE_FILE, activeFilePinned);
-            } catch (Exception ignored) {}
+            String currentPath = getActiveFilePathOrNull();
+            if (currentPath != null && dismissedActiveFilePaths.contains(currentPath)) {
+                dismissedActiveFilePaths.remove(currentPath); // re-pin
+            } else if (currentPath != null) {
+                dismissedActiveFilePaths.add(currentPath); // toggle off
+            }
             updateActiveFileChipLabel();
         };
         chipIconLabel.addListener(SWT.MouseDown, togglePin);
         chipNameLabel.addListener(SWT.MouseDown, togglePin);
-        // × always unpins
+        // × dismisses for current path (per-file memory)
         chipDismissButton.addListener(SWT.Selection, e -> {
-            activeFilePinned = false;
-            try {
-                Activator.getDefault().getPreferenceStore().setValue(
-                        PreferenceConstants.ATTACH_ACTIVE_FILE, false);
-            } catch (Exception ignored) {}
+            String currentPath = getActiveFilePathOrNull();
+            if (currentPath != null) {
+                dismissedActiveFilePaths.add(currentPath);
+            }
             updateActiveFileChipLabel();
         });
 
@@ -837,9 +839,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         buttonBar.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         buttonBar.setBackground(inputBgColor);
 
-        // Attach button
+        // Attach button \u2014 IntelliJ-style paperclip image (icons/paperclip.png)
         Button attachBtn = new Button(buttonBar, SWT.FLAT);
-        attachBtn.setText("\uD83D\uDCCE");
+        try {
+            org.osgi.framework.Bundle bundle = org.eclipse.core.runtime.FileLocator.class
+                    .cast(null) != null ? null : null; // dummy ref to satisfy compiler
+            java.net.URL url = Activator.getDefault().getBundle().getResource("icons/paperclip.png");
+            if (url != null) {
+                org.eclipse.swt.graphics.Image clip = org.eclipse.jface.resource.ImageDescriptor
+                        .createFromURL(url).createImage();
+                attachBtn.setImage(clip);
+                attachBtn.addDisposeListener(e -> { if (!clip.isDisposed()) clip.dispose(); });
+            } else {
+                attachBtn.setText("\uD83D\uDCCE");
+            }
+        } catch (Throwable t) {
+            attachBtn.setText("\uD83D\uDCCE");
+        }
         attachBtn.setToolTipText("Add file or image to context (Ctrl+@)");
         attachBtn.addListener(SWT.Selection, e -> showAttachMenu(attachBtn));
 
@@ -3062,28 +3078,39 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             return;
         }
 
+        // Resolve effective pinned state: global pref ON AND not dismissed-for-path
+        String path = file.getLocation() != null ? file.getLocation().toOSString() : null;
+        boolean dismissedForPath = path != null && dismissedActiveFilePaths.contains(path);
+        boolean pinnedNow = activeFilePinned && !dismissedForPath;
+
         // Update icon, name, and dismiss visibility based on pinned state
-        chipIconLabel.setText(activeFilePinned ? "📌" : "📎");
+        chipIconLabel.setText(pinnedNow ? "📌" : "📎");
         chipNameLabel.setText(file.getName());
-        chipDismissButton.setVisible(activeFilePinned);
+        chipDismissButton.setVisible(pinnedNow);
         // Reserve no space when hidden
         if (chipDismissButton.getLayoutData() == null) {
             chipDismissButton.setLayoutData(new GridData());
         }
-        ((GridData) chipDismissButton.getLayoutData()).exclude = !activeFilePinned;
+        ((GridData) chipDismissButton.getLayoutData()).exclude = !pinnedNow;
 
         // Blue accent when pinned (matches Q's pinned-state visual).
         try {
             org.eclipse.swt.graphics.Color blue = chipPill.getDisplay()
                     .getSystemColor(SWT.COLOR_LINK_FOREGROUND);
-            chipNameLabel.setForeground(activeFilePinned ? blue : null);
-            chipIconLabel.setForeground(activeFilePinned ? blue : null);
+            chipNameLabel.setForeground(pinnedNow ? blue : null);
+            chipIconLabel.setForeground(pinnedNow ? blue : null);
         } catch (Throwable ignored) {}
 
         chipPill.layout(true, true);
         if (contextBar != null && contextBar.getParent() != null) {
             contextBar.getParent().layout(true, true);
         }
+    }
+
+    private String getActiveFilePathOrNull() {
+        IFile f = getActiveFileFromEditor();
+        if (f == null || f.getLocation() == null) return null;
+        return f.getLocation().toOSString();
     }
 
     private IFile getActiveFileFromEditor() {
@@ -3135,6 +3162,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (!activeFilePinned) return null;
         IFile file = getActiveFileFromEditor();
         if (file == null) return null;
+        // Respect per-path dismissals
+        String path0 = file.getLocation() != null ? file.getLocation().toOSString() : null;
+        if (path0 != null && dismissedActiveFilePaths.contains(path0)) return null;
         try {
             String path = file.getLocation().toOSString();
             String content = new String(java.nio.file.Files.readAllBytes(
