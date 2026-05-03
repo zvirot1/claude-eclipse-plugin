@@ -152,7 +152,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private Composite attachmentBar;
     // Active-file chip: shows the currently focused editor's file name; clicking toggles auto-attach
     private Composite contextBar;
-    private Button activeFileChip;
+    private Composite chipPill;          // the rounded pill that wraps the chip widgets
+    private Label    chipIconLabel;      // 📎 / 📌 icon
+    private Label    chipNameLabel;      // file name text
+    private Button   chipDismissButton;  // × button to unpin
+    private boolean  activeFilePinned = false;
     private org.eclipse.ui.IPartListener2 activeFilePartListener;
     private AttachmentManager attachmentManager;
 
@@ -738,10 +742,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         inputBox.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
         inputBox.setBackground(inputBgColor);
 
-        // Row 0: Active-file chip — Q-style, INSIDE the input frame.
-        // Filename-only when an editor is open; blue accent when pinned.
-        // The chip is always created (the listener will hide it when no
-        // file editor is active so it doesn't take vertical space).
+        // Row 0: Active-file chip — IntelliJ/Q-style pill INSIDE the input frame.
+        // Container "contextBar" hosts the rounded "chipPill" composite.
         contextBar = new Composite(inputBox, SWT.NONE);
         RowLayout cbLayout = new RowLayout(SWT.HORIZONTAL);
         cbLayout.wrap = true;
@@ -753,22 +755,57 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         contextBar.setLayoutData(cbGd);
         contextBar.setBackground(inputBgColor);
 
-        activeFileChip = new Button(contextBar, SWT.TOGGLE | SWT.FLAT);
-        activeFileChip.setBackground(inputBgColor);
-        activeFileChip.setToolTipText("Auto-attach the currently focused file to each message.\n"
-                + "Click to toggle. Updates when you switch editors.");
-        activeFileChip.addListener(SWT.Selection, e -> {
+        // The chip pill: bordered Composite with [📎 / 📌] [name] [×]
+        chipPill = new Composite(contextBar, SWT.BORDER);
+        GridLayout pillLayout = new GridLayout(3, false);
+        pillLayout.marginWidth = 4;
+        pillLayout.marginHeight = 1;
+        pillLayout.horizontalSpacing = 4;
+        chipPill.setLayout(pillLayout);
+        chipPill.setBackground(inputBgColor);
+        chipPill.setToolTipText("Active editor file. Click the icon or name to pin/unpin.\n"
+                + "× removes the pin. Updates when you switch editors.");
+
+        chipIconLabel = new Label(chipPill, SWT.NONE);
+        chipIconLabel.setText("📎"); // 📎 paperclip
+        chipIconLabel.setBackground(inputBgColor);
+        chipIconLabel.setCursor(parent.getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+
+        chipNameLabel = new Label(chipPill, SWT.NONE);
+        chipNameLabel.setText("");
+        chipNameLabel.setBackground(inputBgColor);
+        chipNameLabel.setCursor(parent.getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+
+        chipDismissButton = new Button(chipPill, SWT.PUSH | SWT.FLAT);
+        chipDismissButton.setText("×"); // ×
+        chipDismissButton.setBackground(inputBgColor);
+        chipDismissButton.setToolTipText("Unpin this file");
+
+        // Click on icon or name → toggle pin
+        org.eclipse.swt.widgets.Listener togglePin = e -> {
+            activeFilePinned = !activeFilePinned;
             try {
                 Activator.getDefault().getPreferenceStore().setValue(
-                        PreferenceConstants.ATTACH_ACTIVE_FILE, activeFileChip.getSelection());
+                        PreferenceConstants.ATTACH_ACTIVE_FILE, activeFilePinned);
+            } catch (Exception ignored) {}
+            updateActiveFileChipLabel();
+        };
+        chipIconLabel.addListener(SWT.MouseDown, togglePin);
+        chipNameLabel.addListener(SWT.MouseDown, togglePin);
+        // × always unpins
+        chipDismissButton.addListener(SWT.Selection, e -> {
+            activeFilePinned = false;
+            try {
+                Activator.getDefault().getPreferenceStore().setValue(
+                        PreferenceConstants.ATTACH_ACTIVE_FILE, false);
             } catch (Exception ignored) {}
             updateActiveFileChipLabel();
         });
+
         // Initial state from preference + listen to active editor changes
         try {
-            boolean enabled = Activator.getDefault().getPreferenceStore()
+            activeFilePinned = Activator.getDefault().getPreferenceStore()
                     .getBoolean(PreferenceConstants.ATTACH_ACTIVE_FILE);
-            activeFileChip.setSelection(enabled);
         } catch (Exception ignored) {}
         installActiveEditorListener();
         updateActiveFileChipLabel();
@@ -2999,15 +3036,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * This helps Claude know which file the user is referring to.
      */
     /**
-     * Update the "Active file" chip label, Q-style:
-     *   - File open + pinned   → "📌 Foo.java" with blue accent foreground
-     *   - File open + not pin  → "📄 Foo.java" with default foreground
+     * Update the chip pill widgets to reflect the currently focused editor.
+     *   - File open + pinned   → 📌 + blue filename + × visible
+     *   - File open + not pin  → 📎 + default filename + × hidden
      *   - No file open         → hide the entire context bar (no row taken up)
      *
-     * (Mirrors IntelliJ commits 09be592 + d0a5b6a — filename-only, blue accent.)
+     * Visual mirrors IntelliJ commits 09be592 + d0a5b6a + b5558d7.
      */
     private void updateActiveFileChipLabel() {
-        if (activeFileChip == null || activeFileChip.isDisposed()) return;
+        if (chipPill == null || chipPill.isDisposed()) return;
         IFile file = getActiveFileFromEditor();
         boolean show = (file != null);
 
@@ -3018,23 +3055,32 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             contextBar.setVisible(show);
         }
         if (!show) {
-            activeFileChip.setText("");
+            chipNameLabel.setText("");
             if (contextBar != null && contextBar.getParent() != null) {
                 contextBar.getParent().layout(true, true);
             }
             return;
         }
 
-        boolean enabled = activeFileChip.getSelection();
-        activeFileChip.setText((enabled ? "📌 " : "📄 ") + file.getName());
+        // Update icon, name, and dismiss visibility based on pinned state
+        chipIconLabel.setText(activeFilePinned ? "📌" : "📎");
+        chipNameLabel.setText(file.getName());
+        chipDismissButton.setVisible(activeFilePinned);
+        // Reserve no space when hidden
+        if (chipDismissButton.getLayoutData() == null) {
+            chipDismissButton.setLayoutData(new GridData());
+        }
+        ((GridData) chipDismissButton.getLayoutData()).exclude = !activeFilePinned;
 
         // Blue accent when pinned (matches Q's pinned-state visual).
         try {
-            org.eclipse.swt.graphics.Color blue = activeFileChip.getDisplay()
+            org.eclipse.swt.graphics.Color blue = chipPill.getDisplay()
                     .getSystemColor(SWT.COLOR_LINK_FOREGROUND);
-            activeFileChip.setForeground(enabled ? blue : null);
+            chipNameLabel.setForeground(activeFilePinned ? blue : null);
+            chipIconLabel.setForeground(activeFilePinned ? blue : null);
         } catch (Throwable ignored) {}
 
+        chipPill.layout(true, true);
         if (contextBar != null && contextBar.getParent() != null) {
             contextBar.getParent().layout(true, true);
         }
@@ -3086,7 +3132,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * &lt;file&gt; context block with the full content; otherwise null.
      */
     private String buildActiveFilePinContext() {
-        if (activeFileChip == null || !activeFileChip.getSelection()) return null;
+        if (!activeFilePinned) return null;
         IFile file = getActiveFileFromEditor();
         if (file == null) return null;
         try {
