@@ -102,7 +102,9 @@ public class SkillsDialog extends TitleAreaDialog {
     private final Path settingsPath;
     private final Path marketplacesDir;
     private final Path installedPluginsPath;
-    private final Path localSkillsDir;          // custom user skills
+    private Path localSkillsDir;                // custom user skills (mutable: can be changed via Browse / Preferences)
+    private Label localSkillsHeaderLabel;       // header above the skills list — text reflects localSkillsDir
+    private org.eclipse.jface.util.IPropertyChangeListener skillsFolderPrefListener;
 
     // ==================== Widgets ====================
 
@@ -141,7 +143,20 @@ public class SkillsDialog extends TitleAreaDialog {
         this.settingsPath = Paths.get(home, ".claude", "settings.json");
         this.marketplacesDir = Paths.get(home, ".claude", "plugins", "marketplaces");
         this.installedPluginsPath = Paths.get(home, ".claude", "plugins", "installed_plugins.json");
-        this.localSkillsDir = Paths.get(home, "skills", "skills");
+        // Resolve the local-skills folder from the preference store, falling back
+        // to the new sensible default (~/.claude/skills/) if the preference is empty.
+        // The preference is also exposed in Window > Preferences > Claude AI so a
+        // user can change it without opening this dialog.
+        String configured = null;
+        try {
+            configured = com.anthropic.eclipse.claude.Activator.getDefault()
+                    .getPreferenceStore()
+                    .getString(com.anthropic.eclipse.claude.preferences.PreferenceConstants.SKILLS_FOLDER);
+        } catch (Exception ignored) {}
+        if (configured == null || configured.isBlank()) {
+            configured = Paths.get(home, ".claude", "skills").toString();
+        }
+        this.localSkillsDir = Paths.get(configured);
         setShellStyle(SWT.DIALOG_TRIM | SWT.RESIZE | SWT.MAX | SWT.APPLICATION_MODAL);
     }
 
@@ -197,9 +212,36 @@ public class SkillsDialog extends TitleAreaDialog {
         Composite leftPanel = new Composite(sash, SWT.NONE);
         leftPanel.setLayout(new GridLayout(1, false));
 
-        Label listLabel = new Label(leftPanel, SWT.NONE);
-        listLabel.setText("Custom skills from ~/skills/skills/");
-        listLabel.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+        localSkillsHeaderLabel = new Label(leftPanel, SWT.NONE);
+        localSkillsHeaderLabel.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+        updateLocalSkillsHeaderLabel();
+
+        // Listen for preference changes so the header + table refresh live when
+        // the user edits the path in Window > Preferences > Claude AI.
+        try {
+            org.eclipse.jface.preference.IPreferenceStore prefs =
+                    com.anthropic.eclipse.claude.Activator.getDefault().getPreferenceStore();
+            skillsFolderPrefListener = evt -> {
+                if (com.anthropic.eclipse.claude.preferences.PreferenceConstants.SKILLS_FOLDER
+                        .equals(evt.getProperty())) {
+                    String newPath = String.valueOf(evt.getNewValue());
+                    if (newPath != null && !newPath.isBlank()) {
+                        org.eclipse.swt.widgets.Display.getDefault().asyncExec(() -> {
+                            if (localSkillsHeaderLabel == null || localSkillsHeaderLabel.isDisposed()) return;
+                            this.localSkillsDir = Paths.get(newPath);
+                            updateLocalSkillsHeaderLabel();
+                            scanLocalSkills();
+                            refreshLocalSkillsTable();
+                        });
+                    }
+                }
+            };
+            prefs.addPropertyChangeListener(skillsFolderPrefListener);
+            // Detach when the dialog closes
+            leftPanel.addDisposeListener(e -> {
+                try { prefs.removePropertyChangeListener(skillsFolderPrefListener); } catch (Exception ignored) {}
+            });
+        } catch (Exception ignored) {}
 
         localSkillsTable = new Table(leftPanel,
             SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.SINGLE);
@@ -217,17 +259,35 @@ public class SkillsDialog extends TitleAreaDialog {
 
         localSkillsTable.addListener(SWT.Selection, e -> showLocalSkillDetail());
 
-        // Buttons
+        // Buttons row \u2014 3 columns now: [Open Folder] [Browse...] [Refresh]
         Composite btnRow = new Composite(leftPanel, SWT.NONE);
-        btnRow.setLayout(new GridLayout(2, false));
+        btnRow.setLayout(new GridLayout(3, false));
         btnRow.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
 
         Button openFolderBtn = new Button(btnRow, SWT.PUSH);
         openFolderBtn.setText("\uD83D\uDCC2 Open Folder");
-        openFolderBtn.addListener(SWT.Selection, e -> {
-            try {
-                Runtime.getRuntime().exec(new String[]{"open", localSkillsDir.toString()});
-            } catch (Exception ignored) {}
+        openFolderBtn.addListener(SWT.Selection, e -> openLocalSkillsFolder());
+
+        Button browseBtn = new Button(btnRow, SWT.PUSH);
+        browseBtn.setText("Browse\u2026");
+        browseBtn.setToolTipText("Pick a different folder to scan for local skills");
+        browseBtn.addListener(SWT.Selection, e -> {
+            org.eclipse.swt.widgets.DirectoryDialog dd =
+                    new org.eclipse.swt.widgets.DirectoryDialog(getShell());
+            dd.setText("Select Local Skills folder");
+            dd.setFilterPath(localSkillsDir.toString());
+            String chosen = dd.open();
+            if (chosen != null && !chosen.isBlank()) {
+                try {
+                    com.anthropic.eclipse.claude.Activator.getDefault().getPreferenceStore()
+                            .setValue(com.anthropic.eclipse.claude.preferences.PreferenceConstants.SKILLS_FOLDER,
+                                      chosen);
+                } catch (Exception ignored) {}
+                this.localSkillsDir = Paths.get(chosen);
+                updateLocalSkillsHeaderLabel();
+                scanLocalSkills();
+                refreshLocalSkillsTable();
+            }
         });
 
         Button refreshBtn = new Button(btnRow, SWT.PUSH);
@@ -648,6 +708,49 @@ public class SkillsDialog extends TitleAreaDialog {
     }
 
     // ==================== Local Skills ====================
+
+    /** Refresh the "Custom skills from …" header label to reflect localSkillsDir. */
+    private void updateLocalSkillsHeaderLabel() {
+        if (localSkillsHeaderLabel == null || localSkillsHeaderLabel.isDisposed()) return;
+        localSkillsHeaderLabel.setText("Custom skills from " + localSkillsDir.toString());
+        if (localSkillsHeaderLabel.getParent() != null) {
+            localSkillsHeaderLabel.getParent().layout(true, true);
+        }
+    }
+
+    /**
+     * Open the local-skills folder in the OS file explorer.
+     * Mirrors the 3-tier fallback used in MessageComposite.openImageInExternalViewer:
+     *   1) SWT Program.launch (preferred — uses OS file association)
+     *   2) Windows rundll32 (always works, even when no SWT-known association)
+     *   3) AWT Desktop (last resort, mainly for non-Windows)
+     * Auto-creates the folder if it doesn't exist so the launch always has something to open.
+     */
+    private void openLocalSkillsFolder() {
+        try {
+            java.nio.file.Files.createDirectories(localSkillsDir);
+            String absPath = localSkillsDir.toAbsolutePath().toString();
+            if (org.eclipse.swt.program.Program.launch(absPath)) return;
+            String os = System.getProperty("os.name", "").toLowerCase();
+            if (os.contains("win")) {
+                new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", absPath).start();
+                return;
+            }
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(localSkillsDir.toFile());
+                return;
+            }
+            org.eclipse.jface.dialogs.MessageDialog.openInformation(getShell(),
+                    "Folder",
+                    "Could not open the folder. Path:\n" + absPath);
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logError(
+                    "[SkillsDialog] open folder failed: " + ex.getMessage(), ex);
+            org.eclipse.jface.dialogs.MessageDialog.openError(getShell(),
+                    "Open folder",
+                    "Failed to open folder: " + ex.getMessage());
+        }
+    }
 
     private void scanLocalSkills() {
         localSkills.clear();
