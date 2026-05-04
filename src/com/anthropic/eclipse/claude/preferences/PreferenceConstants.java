@@ -39,4 +39,10 @@ public class PreferenceConstants {
     // automatically attached to every outgoing message. UI shows a chip with
     // the file name; clicking the chip toggles this preference.
     public static final String ATTACH_ACTIVE_FILE = "attachActiveFile";
+
+    // Local skills folder — directory the Skills dialog scans for custom skills.
+    // Default matches the Claude CLI: ~/.claude/skills/. The user can override
+    // either via the Browse button in the Skills dialog or via this preference
+    // in Window > Preferences > Claude AI. Both paths write to the same key.
+    public static final String SKILLS_FOLDER = "skillsFolder";
 }

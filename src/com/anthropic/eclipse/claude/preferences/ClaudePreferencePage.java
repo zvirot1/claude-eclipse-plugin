@@ -121,6 +121,14 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
             getFieldEditorParent()
         ));
 
+        // Local skills folder — used by the Skills & Plugins dialog.
+        // Default is ~/.claude/skills/ (matches Claude CLI).
+        addField(new DirectoryFieldEditor(
+            PreferenceConstants.SKILLS_FOLDER,
+            "Local skills folder:",
+            getFieldEditorParent()
+        ));
+
         // Diagnostic logging — only enable when investigating bugs.
         // Emits verbose [DIAG] entries to the Error Log.
         addField(new BooleanFieldEditor(

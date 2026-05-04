@@ -47,5 +47,10 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
         // (per-path memory in the view), but the global preference stays on so a
         // new file is again auto-pinned when the user switches to it.
         store.setDefault(PreferenceConstants.ATTACH_ACTIVE_FILE, true);
+
+        // Default skills folder — matches the Claude CLI convention of ~/.claude/skills/.
+        // (Replaces the older hard-coded ~/skills/skills/ that was a doubled-prefix bug.)
+        store.setDefault(PreferenceConstants.SKILLS_FOLDER,
+                java.nio.file.Paths.get(System.getProperty("user.home"), ".claude", "skills").toString());
     }
 }
