@@ -8,3 +8,14 @@ build/
 sources.txt
 # Stray build artifacts left in the project root (use build/ instead)
 /com.anthropic.eclipse.claude_*.jar
+
+# Old update-site ZIPs (pre-2026-04-29) are kept only as GitHub Releases.
+# Don't track them in working tree to keep git status clean.
+/claude-eclipse-plugin-update-site-4.38-202604[0-2]*.zip
+/claude-eclipse-plugin-update-site-4.38-2026041*.zip
+/claude-eclipse-plugin-update-site-4.32-2026041*.zip
+/claude-eclipse-plugin-update-site-4.32-2026042*.zip
+# Local server logs / scratch files
+/jdbc-server.log
+/update-site-extracted/
+/jdbc-server.log.*
