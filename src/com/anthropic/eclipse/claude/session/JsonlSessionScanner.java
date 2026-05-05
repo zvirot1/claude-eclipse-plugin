@@ -90,7 +90,8 @@ public class JsonlSessionScanner {
         info.setLastActiveTime(jsonl.lastModified());
         info.setWorkingDirectory(decodeProjectKey(projectKey));
 
-        String summary = null;
+        String firstUserSummary = null;
+        String cliSummary = null; // last {"type":"summary",...} wins
         int messageCount = 0;
         long createdAt = 0L;
         String model = null;
@@ -113,14 +114,34 @@ public class JsonlSessionScanner {
                             } catch (Exception ignored) {}
                         }
                     }
-                    // First user message → summary
-                    if (summary == null && "user".equals(type)) {
+                    // Backport from IntelliJ commit 3233fd4: prefer the CLI's
+                    // auto-generated {"type":"summary","summary":"…"} entries as
+                    // the session title. These are tight LLM-written summaries
+                    // the CLI itself produces — much better than the raw first
+                    // user message. Last summary wins (CLI may emit several).
+                    if ("summary".equals(type)) {
+                        String s = JsonParser.getString(obj, "summary");
+                        if (s != null && !s.isEmpty()) {
+                            cliSummary = s;
+                        }
+                        continue;
+                    }
+                    // First user message → fallback summary (used only if CLI
+                    // hasn't written a {"type":"summary"} entry yet).
+                    if (firstUserSummary == null && "user".equals(type)) {
                         Map<String, Object> msg = JsonParser.getMap(obj, "message");
                         if (msg != null) {
                             Object content = msg.get("content");
                             String text = extractUserText(content);
+                            // Strip the file-XML prefix (handleInput prepends
+                            // <file path=…>…</file> blocks for active-file pin
+                            // and @-mentions — they are not part of what the
+                            // user typed and should not appear in the title).
+                            text = stripPrependedFileBlocksForSummary(text);
                             if (text != null && !text.isEmpty()) {
-                                summary = text.length() > 60 ? text.substring(0, 57) + "..." : text;
+                                firstUserSummary = text.length() > 60
+                                        ? text.substring(0, 57) + "..."
+                                        : text;
                             }
                         }
                     }
@@ -144,11 +165,26 @@ public class JsonlSessionScanner {
 
         if (messageCount == 0) return null; // not really a conversation
 
+        // Prefer CLI's auto-generated summary; fall back to first user message
+        String summary = (cliSummary != null && !cliSummary.isEmpty())
+                ? (cliSummary.length() > 60 ? cliSummary.substring(0, 57) + "..." : cliSummary)
+                : firstUserSummary;
         info.setSummary(summary);
         info.setMessageCount(messageCount);
         info.setModel(model);
         if (createdAt > 0) info.setStartTime(createdAt);
         return info;
+    }
+
+    /**
+     * Strip leading {@code <file path="…">…</file>} blocks from text when used
+     * as a summary. Mirrors {@code stripPrependedFileBlocks} in
+     * ClaudeConversationView. Idempotent on already-clean text.
+     */
+    static String stripPrependedFileBlocksForSummary(String s) {
+        if (s == null || s.isEmpty()) return s;
+        // (?is) = case-insensitive + dotall
+        return s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
     }
 
     @SuppressWarnings("unchecked")
