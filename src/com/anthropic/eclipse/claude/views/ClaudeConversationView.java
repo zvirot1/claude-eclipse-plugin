@@ -1919,6 +1919,19 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Returns MessageBlocks for plain user messages and final (stop_reason != null)
      * assistant messages. Skips intermediate streaming snapshots and tool-result turns.
      */
+    /**
+     * Strips any leading {@code <file path="…">…</file>} blocks that
+     * {@link #handleInput()} prepends to the CLI text — so when we replay
+     * user messages from JSONL on resume, the bubble shows only what the
+     * user typed (not the entire file body that Claude saw).
+     * Idempotent on already-clean text.
+     */
+    private static String stripPrependedFileBlocks(String s) {
+        if (s == null || s.isEmpty()) return s;
+        // (?is) = case-insensitive + dotall (so .*? spans newlines)
+        return s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+    }
+
     @SuppressWarnings("unchecked")
     private List<MessageBlock> loadSessionHistoryFromJsonl(String sessionId) {
         List<MessageBlock> blocks = new ArrayList<>();
@@ -1978,6 +1991,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                             }
                             text = sb.toString();
                         }
+                        // Backport from IntelliJ commit c79d6e0: strip the
+                        // <file path="…">…</file> blocks that handleInput prepends
+                        // to cliText. JSONL stores what the CLI received, so on
+                        // replay we'd otherwise dump the entire file body into
+                        // the user's bubble.
+                        text = stripPrependedFileBlocks(text);
                         if (text != null && !text.trim().isEmpty()) {
                             MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
                             MessageBlock.TextSegment seg = new MessageBlock.TextSegment();
@@ -2095,7 +2114,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         touchStreamActivity(); // streaming started — reset timeout clock
         asyncExec(() -> {
-            hideThinkingIndicator();
+            // Backport from IntelliJ ef00374: do NOT hide the "thinking" indicator
+            // here. assistant_message_started fires before any text/tool has
+            // arrived, so on slow latency the user sees the bubble appear empty
+            // for many seconds. Keep the indicator visible until the first real
+            // chunk (text delta or tool call) lands.
             MessageComposite widget = new MessageComposite(messageContainer, block);
             widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
@@ -2118,6 +2141,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         asyncExec(() -> {
             if (renderingSuppressed) return;  // Double-check inside asyncExec
+            // Backport from IntelliJ ef00374: first real text chunk has arrived,
+            // so the "thinking" indicator can finally be removed.
+            hideThinkingIndicator();
             MessageComposite widget = messageWidgetMap.get(block);
             if (widget != null && !widget.isDisposed()) {
                 widget.appendStreamingText(delta);
