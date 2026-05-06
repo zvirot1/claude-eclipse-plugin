@@ -33,6 +33,59 @@ public class JsonlSessionScanner {
      * If {@code projectDir} is non-null, restricts to sessions whose project
      * directory matches that path.
      */
+    /**
+     * Fast variant: returns SessionInfo for every JSONL with ONLY filename +
+     * mtime — no file content read. Used to populate the Session History list
+     * instantly. Call {@link #fillSessionDetails(SessionInfo)} on demand to
+     * fetch summary/model/messageCount for a row the user is interested in.
+     */
+    public static List<SessionInfo> listSessionsFast(String projectDir) {
+        List<SessionInfo> result = new ArrayList<>();
+        File projectsRoot = new File(System.getProperty("user.home") + "/.claude/projects");
+        if (!projectsRoot.isDirectory()) return result;
+        File[] projectDirs = projectsRoot.listFiles(File::isDirectory);
+        if (projectDirs == null) return result;
+        String matchPrefix = (projectDir != null && !projectDir.isEmpty())
+                ? encodeProjectKey(projectDir).toLowerCase() : null;
+        for (File dir : projectDirs) {
+            if (matchPrefix != null) {
+                String lower = dir.getName().toLowerCase();
+                if (!lower.equals(matchPrefix) && !lower.startsWith(matchPrefix + "-")) continue;
+            }
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (!f.isFile()) continue;
+                String n = f.getName();
+                if (!n.endsWith(".jsonl")) continue;
+                String sessionId = n.substring(0, n.length() - 6);
+                if (!isUuid(sessionId)) continue;
+                SessionInfo info = new SessionInfo(sessionId);
+                info.setLastActiveTime(f.lastModified());
+                info.setStartTime(f.lastModified());
+                info.setWorkingDirectory(decodeProjectKey(dir.getName()));
+                info.setMessageCount(0); // unknown until detailed read
+                result.add(info);
+            }
+        }
+        result.sort(Comparator.comparingLong(SessionInfo::getLastActiveTime).reversed());
+        return result;
+    }
+
+    /**
+     * Lazily read summary/model/messageCount for a single SessionInfo by
+     * locating its .jsonl on disk. Mutates the input. No-op if not found.
+     */
+    public static void fillSessionDetails(SessionInfo info) {
+        if (info == null || info.getSessionId() == null) return;
+        SessionInfo full = findSessionById(info.getSessionId());
+        if (full == null) return;
+        if (full.getSummary() != null) info.setSummary(full.getSummary());
+        if (full.getModel() != null)   info.setModel(full.getModel());
+        if (full.getMessageCount() > 0) info.setMessageCount(full.getMessageCount());
+        if (full.getStartTime() > 0)   info.setStartTime(full.getStartTime());
+    }
+
     public static List<SessionInfo> listSessions(String projectDir) {
         List<SessionInfo> result = new ArrayList<>();
         File projectsRoot = new File(System.getProperty("user.home") + "/.claude/projects");
@@ -122,12 +175,41 @@ public class JsonlSessionScanner {
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new FileInputStream(jsonl), StandardCharsets.UTF_8))) {
             String line;
-            while ((line = br.readLine()) != null) {
+            int linesRead = 0;
+            // Cap at 500 lines per file. With many GB of JSONL across all
+            // projects, full scans block the dialog for minutes. The first
+            // 500 lines reliably contain the first user message and any
+            // early CLI summary; messageCount becomes a lower bound.
+            final int MAX_LINES_PER_FILE = 500;
+            while ((line = br.readLine()) != null && linesRead++ < MAX_LINES_PER_FILE) {
                 if (line.isEmpty()) continue;
+                // Fast-path: skip JSON parse on lines that aren't of a type we
+                // care about. Tool-use / tool-result lines can be megabytes
+                // long; parsing them just to discard the result was the main
+                // hot-spot when scanning big workspaces.
+                // Cheap pre-filter: we only care about user/assistant/summary
+                // entries. Skip lines that don't mention any of those values.
+                // CLI 2.1.107+ omits top-level type for assistant turns —
+                // detect them via "role":"assistant" inside the message obj.
+                if (line.indexOf("\"type\":\"user\"")      < 0
+                 && line.indexOf("\"type\":\"assistant\"") < 0
+                 && line.indexOf("\"type\":\"summary\"")   < 0
+                 && line.indexOf("\"role\":\"assistant\"") < 0) continue;
                 try {
                     Map<String, Object> obj = JsonParser.parseObject(line);
                     String type = JsonParser.getString(obj, "type");
-                    if (type == null) continue;
+                    if (type == null) {
+                        // CLI 2.1.107+: derive type from message.role for
+                        // assistant turns that no longer carry top-level type.
+                        Map<String, Object> mm = JsonParser.getMap(obj, "message");
+                        if (mm != null) {
+                            String role = JsonParser.getString(mm, "role");
+                            if ("assistant".equals(role) || "user".equals(role)) {
+                                type = role;
+                            }
+                        }
+                        if (type == null) continue;
+                    }
                     // CLI writes timestamp per entry as ISO-8601 string — use first one as createdAt
                     if (createdAt == 0L) {
                         String ts = JsonParser.getString(obj, "timestamp");
@@ -207,7 +289,9 @@ public class JsonlSessionScanner {
     static String stripPrependedFileBlocksForSummary(String s) {
         if (s == null || s.isEmpty()) return s;
         // (?is) = case-insensitive + dotall
-        return s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+        s = s.replaceAll("(?is)^\\s*\\[Active editor context:[^\\]]*\\]\\s*", "");
+        s = s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+        return s;
     }
 
     @SuppressWarnings("unchecked")
