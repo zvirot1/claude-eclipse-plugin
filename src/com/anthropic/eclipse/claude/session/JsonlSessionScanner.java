@@ -85,6 +85,29 @@ public class JsonlSessionScanner {
      * as proxy for messageCount (not perfect but cheap).
      */
     @SuppressWarnings("unchecked")
+    /**
+     * Look up the SessionInfo (including summary) for a given sessionId by
+     * searching every project under {@code ~/.claude/projects/} for a
+     * matching {@code <id>.jsonl}. Returns null when no such file exists.
+     * Used by Resume to derive the tab title without regenerating it.
+     */
+    public static SessionInfo findSessionById(String sessionId) {
+        if (sessionId == null || sessionId.isEmpty()) return null;
+        String home = System.getProperty("user.home");
+        java.io.File root = new java.io.File(home, ".claude/projects");
+        if (!root.exists() || !root.isDirectory()) return null;
+        java.io.File[] dirs = root.listFiles(java.io.File::isDirectory);
+        if (dirs == null) return null;
+        for (java.io.File dir : dirs) {
+            java.io.File candidate = new java.io.File(dir, sessionId + ".jsonl");
+            if (!candidate.exists()) continue;
+            try {
+                return buildSessionInfo(candidate, sessionId, dir.getName());
+            } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
     private static SessionInfo buildSessionInfo(File jsonl, String sessionId, String projectKey) {
         SessionInfo info = new SessionInfo(sessionId);
         info.setLastActiveTime(jsonl.lastModified());

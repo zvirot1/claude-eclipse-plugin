@@ -1825,10 +1825,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Save current session
         saveCurrentSession();
 
-        // Stop current process
-        if (cliManager.isRunning()) {
-            cliManager.stop();
-        }
+        // Backport from IntelliJ 32ca7d9: ALWAYS stop, even when isRunning()
+        // returns false. The previous guard left storedConfig holding the OLD
+        // session id when the panel was Disconnected at Resume time, so a
+        // subsequent Reconnect happily revived the old session — making the
+        // CLI answer the next message from the wrong context, even though
+        // the panel showed the resumed transcript.
+        try { cliManager.stop(); } catch (Exception ignored) {}
 
         // Clear model (fires onConversationCleared → clears UI + adds welcome message)
         model.clear();
@@ -1843,8 +1846,29 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
 
-        // Reset tab title so first user message from loaded history can re-set it
-        partNameSet = false;
+        // Backport from IntelliJ 7e4e9e7: derive the tab title from the
+        // RESUMED session's stored summary (CLI auto-summary preferred,
+        // first user message as fallback) and lock it in by keeping
+        // partNameSet=true. Previously we reset it to false, which let the
+        // user's NEXT message become the new title — overwriting B's title
+        // with whatever the user happened to type after Resume.
+        try {
+            com.anthropic.eclipse.claude.model.SessionInfo info =
+                    com.anthropic.eclipse.claude.session.JsonlSessionScanner.findSessionById(sessionId);
+            if (info != null && info.getSummary() != null && !info.getSummary().isBlank()) {
+                String title = info.getSummary().trim();
+                if (title.length() > 30) title = title.substring(0, 30) + "…";
+                setPartName(title);
+                partNameSet = true;
+            } else {
+                // No summary yet (e.g. brand-new session) — fall through and
+                // let the history loader below set the title from the first
+                // user message it finds. Reset to false so it can.
+                partNameSet = false;
+            }
+        } catch (Exception ex) {
+            partNameSet = false;
+        }
 
         // Start with resume flag
         String cliPath = cliManager.getCliPath();
