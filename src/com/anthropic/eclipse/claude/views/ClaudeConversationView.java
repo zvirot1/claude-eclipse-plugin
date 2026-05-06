@@ -191,6 +191,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private org.eclipse.ui.IMemento savedMemento;
     private static final String MEMENTO_SESSION_ID  = "claudeSessionId";
     private static final String MEMENTO_TAB_TITLE   = "claudeTabTitle";
+    /**
+     * "Sticky" session id for this view — last id we KNOW belongs to this
+     * tab, regardless of whether {@code model.sessionInfo} is currently
+     * populated. Set on (a) successful CLI system-init, (b) start of a
+     * Resume operation. Persisted to the memento so a CLI resume failure
+     * on the next launch doesn't permanently lose the id.
+     */
+    private volatile String stickySessionId;
 
     // Slash command autocomplete
     private org.eclipse.swt.widgets.Shell autocompletePopup;
@@ -216,8 +224,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private void writeMementoState(org.eclipse.ui.IMemento memento) {
         if (memento == null) return;
         SessionInfo info = (model != null) ? model.getSessionInfo() : null;
-        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
-            memento.putString(MEMENTO_SESSION_ID, info.getSessionId());
+        String sid = (info != null) ? info.getSessionId() : null;
+        // Fall back to the sticky id so a failed CLI resume on a previous
+        // launch doesn't erase the tab's session forever.
+        if (sid == null || sid.isEmpty()) sid = stickySessionId;
+        if (sid != null && !sid.isEmpty()) {
+            memento.putString(MEMENTO_SESSION_ID, sid);
         }
         String title = getPartName();
         if (title != null && !title.equals("Claude Code")) {
@@ -289,6 +301,34 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             savedTitle = savedMemento.getString(MEMENTO_TAB_TITLE);
             savedMemento = null; // consumed
         }
+        // Recovery: if a previous build saved title but lost the sessionId
+        // (e.g. CLI resume failed and the model was rebuilt empty), try to
+        // find a JSONL whose summary matches the saved title.
+        if ((resumeId == null || resumeId.isEmpty())
+                && savedTitle != null && !savedTitle.isEmpty()) {
+            try {
+                String norm = savedTitle.trim();
+                if (norm.endsWith("…")) norm = norm.substring(0, norm.length() - 1).trim();
+                java.util.List<com.anthropic.eclipse.claude.model.SessionInfo> all =
+                        com.anthropic.eclipse.claude.session.JsonlSessionScanner.listSessionsFast(null);
+                for (com.anthropic.eclipse.claude.model.SessionInfo s : all) {
+                    com.anthropic.eclipse.claude.session.JsonlSessionScanner.fillSessionDetails(s);
+                    String sum = s.getSummary();
+                    if (sum == null) continue;
+                    String snorm = sum.trim();
+                    if (snorm.endsWith("...")) snorm = snorm.substring(0, snorm.length() - 3).trim();
+                    if (snorm.startsWith(norm) || norm.startsWith(snorm)) {
+                        resumeId = s.getSessionId();
+                        Activator.logWarning("[Resume] recovered sessionId=" + resumeId
+                                + " from title match");
+                        break;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        Activator.logWarning("[Resume] memento resumeId="
+                + (resumeId == null ? "<null>" : resumeId)
+                + " title=" + (savedTitle == null ? "<null>" : savedTitle));
 
         if (savedTitle != null && !savedTitle.isEmpty()) {
             setPartName(savedTitle);
@@ -1837,6 +1877,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Public method to resume a session by ID (called by ResumeSessionHandler).
      */
     public void resumeSession(String sessionId) {
+        Activator.logWarning("[Resume] enter sessionId=" + sessionId);
+        // Make the id sticky so it survives a failed CLI resume.
+        if (sessionId != null && !sessionId.isEmpty()) stickySessionId = sessionId;
         // Save current session
         saveCurrentSession();
 
@@ -1885,25 +1928,26 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             partNameSet = false;
         }
 
-        // Start with resume flag
+        // Start with resume flag. CLI start failure must NOT abort history
+        // loading — on Eclipse restart the user expects to see past messages
+        // even if the CLI process has not yet been (re-)launched.
         String cliPath = cliManager.getCliPath();
-        if (cliPath == null) {
-            showError("CLI not found.");
-            return;
-        }
-        String workDir = getDefaultWorkingDirectory();
-        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
-        String cliModel = mapModelName(prefs.getString(PreferenceConstants.MODEL));
-
-        try {
-            CliProcessConfig config = new CliProcessConfig.Builder(cliPath, workDir)
-                .model(cliModel)
-                .resumeSessionId(sessionId)
-                .build();
-            cliManager.start(config);
-        } catch (ClaudeCliManager.CliException e) {
-            showError("Failed to resume session: " + e.getMessage());
-            return;
+        if (cliPath != null) {
+            String workDir = getDefaultWorkingDirectory();
+            IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+            String cliModel = mapModelName(prefs.getString(PreferenceConstants.MODEL));
+            try {
+                CliProcessConfig config = new CliProcessConfig.Builder(cliPath, workDir)
+                    .model(cliModel)
+                    .resumeSessionId(sessionId)
+                    .build();
+                cliManager.start(config);
+            } catch (ClaudeCliManager.CliException e) {
+                Activator.logWarning("[Resume] CLI start failed (continuing with history-only): "
+                        + e.getMessage());
+            }
+        } else {
+            Activator.logWarning("[Resume] CLI path not configured; loading history only.");
         }
 
         // Load conversation history from JSONL in background
@@ -1911,6 +1955,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         final String sessionIdFinal = sessionId;
         new Thread(() -> {
             List<MessageBlock> history = loadSessionHistoryFromJsonl(sessionIdFinal);
+            Activator.logWarning("[Resume] sessionId=" + sessionIdFinal
+                    + " history.size=" + history.size());
             if (!history.isEmpty()) {
                 // Clear the welcome message widget on the UI thread first,
                 // then queue the history events (which also go through asyncExec)
@@ -2050,7 +2096,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private static String stripPrependedFileBlocks(String s) {
         if (s == null || s.isEmpty()) return s;
         // (?is) = case-insensitive + dotall (so .*? spans newlines)
-        return s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+        // Strip [Active editor context: ...] prefix (single-line, may end before \n\n)
+        s = s.replaceAll("(?is)^\\s*\\[Active editor context:[^\\]]*\\]\\s*", "");
+        // Strip one-or-more <file path="…">…</file> blocks
+        s = s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+        return s;
     }
 
     @SuppressWarnings("unchecked")
@@ -2083,6 +2133,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     if (msg == null) continue;
 
                     String role = JsonParser.getString(msg, "role");
+                    // CLI 2.1.107+ stopped writing top-level "type":"assistant"
+                    // for model turns — they're now {"parentUuid":...,"message":{...}}
+                    // with no outer type. Fall back to message.role so replay
+                    // doesn't silently drop every assistant message.
+                    if (type == null && role != null) type = role;
 
                     if ("user".equals(type) && "user".equals(role)) {
                         // User turn: skip tool_result arrays, keep plain text
@@ -2180,6 +2235,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onSessionInitialized(SessionInfo info) {
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            stickySessionId = info.getSessionId();
+        }
         // Register this session with the session manager so save works
         if (sessionManager != null && sessionManager.getCurrentSession() == null) {
             String workDir = info.getWorkingDirectory() != null
@@ -3352,6 +3410,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             if (file == null) return null;
 
             String filePath = file.getLocation().toOSString();
+            // Respect Active-file chip state: if user dismissed (X) the chip
+            // for this path, or globally turned off active-file pinning, do
+            // NOT inject the editor context either.
+            if (!activeFilePinned) return null;
+            if (filePath != null && dismissedActiveFilePaths.contains(filePath)) return null;
             String fileName = file.getName();
             String projectName = file.getProject().getName();
 
