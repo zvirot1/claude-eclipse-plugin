@@ -3200,18 +3200,27 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      */
     /**
      * Update the chip pill widgets to reflect the currently focused editor.
-     *   - File open + pinned   → 📌 + blue filename + × visible
-     *   - File open + not pin  → 📎 + default filename + × hidden
-     *   - No file open         → hide the entire context bar (no row taken up)
+     *   - File open + global pin ON + path NOT dismissed → 📌 + blue + ×
+     *   - Global pin OFF, OR path dismissed via ×, OR no file open
+     *                                                  → hide chip row entirely
      *
-     * Visual mirrors IntelliJ commits 09be592 + d0a5b6a + b5558d7.
+     * Mirrors IntelliJ commit 590724b "per-path dismiss memory" — clicking
+     * × on a chip should make it disappear for that file (per-path memory),
+     * not switch it into a still-visible "unpinned" state.
      */
     private void updateActiveFileChipLabel() {
         if (chipPill == null || chipPill.isDisposed()) return;
         IFile file = getActiveFileFromEditor();
-        boolean show = (file != null);
+        String path = (file != null && file.getLocation() != null)
+                ? file.getLocation().toOSString() : null;
+        boolean dismissedForPath = path != null && dismissedActiveFilePaths.contains(path);
 
-        // Hide / show the entire chip row depending on whether a file editor is active.
+        // Show the chip ONLY when:
+        //   1) there is an editor with a file
+        //   2) the global "auto-attach active file" preference is on
+        //   3) the user hasn't dismissed this specific file via the × button
+        boolean show = (file != null) && activeFilePinned && !dismissedForPath;
+
         if (contextBar != null && !contextBar.isDisposed()) {
             GridData gd = (GridData) contextBar.getLayoutData();
             if (gd != null) gd.exclude = !show;
@@ -3225,27 +3234,21 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             return;
         }
 
-        // Resolve effective pinned state: global pref ON AND not dismissed-for-path
-        String path = file.getLocation() != null ? file.getLocation().toOSString() : null;
-        boolean dismissedForPath = path != null && dismissedActiveFilePaths.contains(path);
-        boolean pinnedNow = activeFilePinned && !dismissedForPath;
-
-        // Update icon, name, and dismiss visibility based on pinned state
-        chipIconLabel.setText(pinnedNow ? "📌" : "📎");
+        // Visible state: always pinned (Q-style — pinned-or-hidden, no greyed
+        // intermediate state). Show 📌 + filename + × dismiss button, blue.
+        chipIconLabel.setText("📌");
         chipNameLabel.setText(file.getName());
-        chipDismissButton.setVisible(pinnedNow);
-        // Reserve no space when hidden
+        chipDismissButton.setVisible(true);
         if (chipDismissButton.getLayoutData() == null) {
             chipDismissButton.setLayoutData(new GridData());
         }
-        ((GridData) chipDismissButton.getLayoutData()).exclude = !pinnedNow;
+        ((GridData) chipDismissButton.getLayoutData()).exclude = false;
 
-        // Blue accent when pinned (matches Q's pinned-state visual).
         try {
             org.eclipse.swt.graphics.Color blue = chipPill.getDisplay()
                     .getSystemColor(SWT.COLOR_LINK_FOREGROUND);
-            chipNameLabel.setForeground(pinnedNow ? blue : null);
-            chipIconLabel.setForeground(pinnedNow ? blue : null);
+            chipNameLabel.setForeground(blue);
+            chipIconLabel.setForeground(blue);
         } catch (Throwable ignored) {}
 
         chipPill.layout(true, true);
