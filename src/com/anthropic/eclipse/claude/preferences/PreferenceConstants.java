@@ -45,4 +45,14 @@ public class PreferenceConstants {
     // either via the Browse button in the Skills dialog or via this preference
     // in Window > Preferences > Claude AI. Both paths write to the same key.
     public static final String SKILLS_FOLDER = "skillsFolder";
+
+    // Tab-title strategy for new conversation tabs. Values:
+    //   "self_generated" (default) — after the first user message, run a
+    //     one-shot `claude -p` in the background to produce a 3-5 word topic
+    //     title and update the tab. Mirrors IntelliJ commit a122d84.
+    //   "first_message" — keep the previous behaviour: truncate the first
+    //     user message and use that.
+    // The CLI's auto-generated session summary is also picked up on Resume
+    // and Session History, regardless of this preference.
+    public static final String TAB_TITLE_STRATEGY = "tabTitleStrategy";
 }

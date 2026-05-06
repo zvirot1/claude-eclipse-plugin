@@ -1440,6 +1440,21 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             String tabTitle = text.trim();
             if (tabTitle.length() > 30) tabTitle = tabTitle.substring(0, 30) + "\u2026";
             setPartName(tabTitle);
+
+            // Backport from IntelliJ a122d84 + ac63c73 + f0bfa64: when the
+            // user's chosen strategy is "self_generated" (default), spawn a
+            // background `claude -p` to generate a 3-5 word topic title and
+            // upgrade the tab name in place. The first-message title above
+            // is the immediate fallback so the tab is never empty.
+            String strategy = "self_generated";
+            try {
+                strategy = Activator.getDefault().getPreferenceStore()
+                        .getString(PreferenceConstants.TAB_TITLE_STRATEGY);
+                if (strategy == null || strategy.isBlank()) strategy = "self_generated";
+            } catch (Exception ignored) {}
+            if ("self_generated".equals(strategy)) {
+                kickoffSelfGeneratedTitle(text.trim());
+            }
         }
 
         // Send to CLI
@@ -1943,6 +1958,88 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Returns MessageBlocks for plain user messages and final (stop_reason != null)
      * assistant messages. Skips intermediate streaming snapshots and tool-result turns.
      */
+    /**
+     * Spawns a one-shot {@code claude -p} call to generate a 3-5 word topic
+     * title for the new tab. Runs on a daemon thread; on success, updates
+     * the tab display name via setPartName. The first-message title is
+     * already shown immediately so the tab is never empty while this runs.
+     *
+     * Mirrors IntelliJ commits a122d84 + ac63c73 (run from user.home so
+     * project CLAUDE.md doesn't taint the title) + f0bfa64 (pipe via stdin
+     * as UTF-8 so non-Latin prompts survive on Windows where argv is in
+     * the system ANSI code page).
+     */
+    private void kickoffSelfGeneratedTitle(final String firstMessage) {
+        if (firstMessage == null || firstMessage.trim().isEmpty()) return;
+        Thread t = new Thread(() -> {
+            try {
+                String cliPath = cliManager.getCliPath();
+                if (cliPath == null) return;
+                String prompt = "You are a title generator. Ignore any project context, "
+                        + "CLAUDE.md, or files in the working directory — they are irrelevant. "
+                        + "Read ONLY the user question below and output a 3-5 word topic title "
+                        + "describing what THE QUESTION is about. Same language as the question. "
+                        + "No surrounding quotes, no trailing punctuation, no preamble — output "
+                        + "the title and nothing else.\n\n"
+                        + "User question:\n" + firstMessage;
+                ProcessBuilder pb = new ProcessBuilder(cliPath, "-p");
+                // user.home cwd: don't accidentally pick up the IDE project's
+                // CLAUDE.md / settings as context — it produces wildly off-topic titles.
+                pb.directory(new java.io.File(System.getProperty("user.home")));
+                pb.redirectErrorStream(false);
+                Process p = pb.start();
+                // Pipe prompt via STDIN as UTF-8 — Windows argv is encoded in
+                // the system ANSI code page and would mangle Hebrew/Unicode.
+                try (java.io.OutputStreamWriter w = new java.io.OutputStreamWriter(
+                        p.getOutputStream(), java.nio.charset.StandardCharsets.UTF_8)) {
+                    w.write(prompt);
+                    w.flush();
+                }
+                StringBuilder out = new StringBuilder();
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(p.getInputStream(),
+                                java.nio.charset.StandardCharsets.UTF_8))) {
+                    String l;
+                    while ((l = br.readLine()) != null) out.append(l).append('\n');
+                }
+                if (!p.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)) {
+                    p.destroyForcibly();
+                    return;
+                }
+                if (p.exitValue() != 0) return;
+                String title = out.toString().trim();
+                // Strip surrounding quotes (straight or curly) the model sometimes adds.
+                title = title.replaceAll("^[\"'“”‘’]+", "")
+                             .replaceAll("[\"'“”‘’\\.\\!\\?]+$", "")
+                             .trim();
+                int nl = title.indexOf('\n');
+                if (nl >= 0) title = title.substring(0, nl).trim();
+                if (title.isEmpty()) return;
+                if (title.length() > 50) title = title.substring(0, 50) + "…";
+                final String finalTitle = title;
+                asyncExec(() -> {
+                    if (!isPartNameDisposed()) {
+                        setPartName(finalTitle);
+                    }
+                });
+            } catch (Exception ignored) {
+                // Title-gen is best-effort; the first-message title remains.
+            }
+        }, "Claude-Title-Gen");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Cheap guard: avoid setPartName after the view has been disposed. */
+    private boolean isPartNameDisposed() {
+        try {
+            return getSite() == null || getSite().getShell() == null
+                    || getSite().getShell().isDisposed();
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
     /**
      * Strips any leading {@code <file path="…">…</file>} blocks that
      * {@link #handleInput()} prepends to the CLI text — so when we replay
