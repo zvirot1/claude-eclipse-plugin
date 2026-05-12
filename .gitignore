@@ -4,3 +4,4 @@ target/
 .settings/
 .claude/
 *.class
+*.zip
