@@ -29,10 +29,8 @@ A full-featured Eclipse IDE plugin for working with **Claude Code** directly ins
 
 ### Quick Install (Recommended)
 
-1. Go to **[Releases](https://github.com/zvirot1/claude-eclipse-plugin/releases)**
-2. Download the latest ZIP for your Eclipse version:
-   - **Eclipse 4.38 / 2025-12** → `claude-eclipse-plugin-update-site-4.38-...autopin.zip`
-   - **Eclipse 4.32 / 2024-06** → `claude-eclipse-plugin-update-site-4.32-...autopin.zip`
+1. Browse the **[releases folder on Azure DevOps](https://vstsleumi.visualstudio.com/AI-helper-extensions/_git/claude-eclipse-plugin?path=/releases&version=GBeclipse-4.32-main)**
+2. Download the latest ZIP for **Eclipse 4.32** (`claude-eclipse-plugin-update-site-4.32-*.zip`)
 3. In Eclipse: **Help → Install New Software → Add → Archive...**
 4. Pick the downloaded ZIP, name it (e.g. *Claude AI*), click **Add**
 5. Check **Claude AI Eclipse Plugin** → **Next** → **Next** → accept license → **Finish**
