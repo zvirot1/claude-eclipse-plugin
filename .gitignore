@@ -19,3 +19,4 @@ sources.txt
 /jdbc-server.log
 /update-site-extracted/
 /jdbc-server.log.*
+*.zip
