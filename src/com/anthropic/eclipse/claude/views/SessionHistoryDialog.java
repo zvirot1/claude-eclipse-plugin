@@ -185,11 +185,15 @@ public class SessionHistoryDialog extends TitleAreaDialog {
     // ==================== Load Sessions ====================
 
     private void loadSessions() {
+        long t0 = System.currentTimeMillis();
         // Phase 1 (fast, on UI thread): enumerate .jsonl filenames + mtimes.
         // No file CONTENT is read — that was the >30s hang on a 1.5GB store.
         allSessions = com.anthropic.eclipse.claude.session.JsonlSessionScanner
                 .listSessionsFast(null);
         populateTable(allSessions);
+        com.anthropic.eclipse.claude.Activator.logDiag(
+                "[DIAG-PERF] SessionHistoryDialog.loadSessions phase1 elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms count=" + allSessions.size());
         // Phase 2 (background): fill summary/model/messageCount for each row.
         previewText.setText(allSessions.isEmpty()
                 ? "(no sessions found)" : "Select a session to preview its content.");
@@ -199,16 +203,22 @@ public class SessionHistoryDialog extends TitleAreaDialog {
             // the table as each completes. The user can already scroll, search
             // by date, click a row to load the preview — they don't have to
             // wait for this background pass to finish.
+            long fillT0 = System.currentTimeMillis();
+            int filled = 0;
             for (final SessionInfo info : new java.util.ArrayList<>(allSessions)) {
                 try {
                     com.anthropic.eclipse.claude.session.JsonlSessionScanner
                             .fillSessionDetails(info);
+                    filled++;
                 } catch (Throwable ignored) {}
                 display.asyncExec(() -> {
                     if (sessionsTable.isDisposed()) return;
                     refreshRowFor(info);
                 });
             }
+            com.anthropic.eclipse.claude.Activator.logDiag(
+                    "[DIAG-PERF] SessionHistoryDialog.loadSessions phase2 elapsed="
+                            + (System.currentTimeMillis() - fillT0) + "ms filled=" + filled);
         }, "claude-session-list");
         t.setDaemon(true);
         t.start();

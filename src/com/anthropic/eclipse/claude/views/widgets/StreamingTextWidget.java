@@ -96,6 +96,8 @@ public class StreamingTextWidget extends Composite {
         if (finalized) return;
         finalized = true;
 
+        long t0 = System.currentTimeMillis();
+
         // Flush any remaining text first
         flushPendingText();
 
@@ -142,6 +144,10 @@ public class StreamingTextWidget extends Composite {
             // Only set RTL on the StyledText itself — do NOT propagate to parent
             // composites, as that flips the entire layout (tool calls, buttons, headers)
             updateHeight();
+            com.anthropic.eclipse.claude.Activator.logDiag(
+                    "[DIAG-PERF] StreamingTextWidget.finalizeContent elapsed="
+                            + (System.currentTimeMillis() - t0) + "ms textLen="
+                            + rawMarkdown.length());
         }
     }
 
