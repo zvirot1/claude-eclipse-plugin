@@ -331,7 +331,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 if (norm.endsWith("…")) norm = norm.substring(0, norm.length() - 1).trim();
                 java.util.List<com.anthropic.eclipse.claude.model.SessionInfo> all =
                         com.anthropic.eclipse.claude.session.JsonlSessionScanner.listSessionsFast(null);
-                final int MAX_RECOVERY_SCAN = 100;
+                final int MAX_RECOVERY_SCAN = 15;
                 for (com.anthropic.eclipse.claude.model.SessionInfo s : all) {
                     if (scanned++ >= MAX_RECOVERY_SCAN) break;
                     com.anthropic.eclipse.claude.session.JsonlSessionScanner.fillSessionDetails(s);
