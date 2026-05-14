@@ -59,11 +59,19 @@ public class NdjsonProtocolHandler {
      * Write a raw NDJSON line to stdin.
      */
     public synchronized void writeRawNdjson(String jsonLine) {
+        long t0 = System.currentTimeMillis();
+        int bytesWritten = 0;
         try {
             byte[] bytes = (jsonLine + "\n").getBytes(StandardCharsets.UTF_8);
+            bytesWritten = bytes.length;
             stdin.write(bytes);
             stdin.flush();
+            Activator.logDiag("[DIAG-PERF] writeRawNdjson elapsed="
+                    + (System.currentTimeMillis() - t0) + "ms bytes=" + bytesWritten);
         } catch (IOException e) {
+            Activator.logDiag("[DIAG-PERF] writeRawNdjson elapsed="
+                    + (System.currentTimeMillis() - t0) + "ms bytes=" + bytesWritten
+                    + " err=" + e.getMessage());
             for (ICliMessageListener listener : listeners) {
                 listener.onConnectionError(e);
             }

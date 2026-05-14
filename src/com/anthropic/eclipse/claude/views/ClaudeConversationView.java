@@ -1,7 +1,10 @@
 package com.anthropic.eclipse.claude.views;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -160,6 +163,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     /** File paths the user has explicitly dismissed via the chip's × button. */
     private final java.util.Set<String> dismissedActiveFilePaths = new java.util.HashSet<>();
     private org.eclipse.ui.IPartListener2 activeFilePartListener;
+    // Active-file pin content cache — refreshed in the background when the
+    // editor changes; read from cache (no file I/O) on every send. On a
+    // corporate machine with a network-mounted home dir, reading the file
+    // synchronously per send was stalling the UI thread for hundreds of ms.
+    private volatile String cachedActiveFilePath;
+    private volatile long   cachedActiveFileMtime;
+    private volatile String cachedActiveFileContent;
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -304,14 +314,26 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Recovery: if a previous build saved title but lost the sessionId
         // (e.g. CLI resume failed and the model was rebuilt empty), try to
         // find a JSONL whose summary matches the saved title.
+        //
+        // listSessionsFast() returns sessions newest-first. The full sweep
+        // calls fillSessionDetails() on every JSONL — on a corporate box
+        // with hundreds of sessions across many projects this blocks tab
+        // restoration for many seconds. Cap at the most-recent N sessions:
+        // a recovered tab is almost always for something the user worked
+        // on within the last few days, so further-back sessions are not
+        // worth the I/O.
         if ((resumeId == null || resumeId.isEmpty())
                 && savedTitle != null && !savedTitle.isEmpty()) {
+            long recoveryT0 = System.currentTimeMillis();
+            int scanned = 0;
             try {
                 String norm = savedTitle.trim();
                 if (norm.endsWith("…")) norm = norm.substring(0, norm.length() - 1).trim();
                 java.util.List<com.anthropic.eclipse.claude.model.SessionInfo> all =
                         com.anthropic.eclipse.claude.session.JsonlSessionScanner.listSessionsFast(null);
+                final int MAX_RECOVERY_SCAN = 100;
                 for (com.anthropic.eclipse.claude.model.SessionInfo s : all) {
+                    if (scanned++ >= MAX_RECOVERY_SCAN) break;
                     com.anthropic.eclipse.claude.session.JsonlSessionScanner.fillSessionDetails(s);
                     String sum = s.getSummary();
                     if (sum == null) continue;
@@ -325,6 +347,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     }
                 }
             } catch (Exception ignored) {}
+            Activator.logDiag("[DIAG-PERF] titleRecovery elapsed="
+                    + (System.currentTimeMillis() - recoveryT0) + "ms"
+                    + " scanned=" + scanned
+                    + " hit=" + (resumeId != null && !resumeId.isEmpty()));
         }
         Activator.logWarning("[Resume] memento resumeId="
                 + (resumeId == null ? "<null>" : resumeId)
@@ -2105,7 +2131,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @SuppressWarnings("unchecked")
     private List<MessageBlock> loadSessionHistoryFromJsonl(String sessionId) {
+        long t0 = System.currentTimeMillis();
         List<MessageBlock> blocks = new ArrayList<>();
+        int linesScanned = 0;
+        long fileSize = 0L;
+        boolean capped = false;
         try {
             File claudeProjects = new File(System.getProperty("user.home") + "/.claude/projects");
             if (!claudeProjects.exists()) return blocks;
@@ -2122,10 +2152,31 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 }
             }
             if (jsonlFile == null) return blocks;
+            fileSize = jsonlFile.length();
 
-            List<String> lines = Files.readAllLines(jsonlFile.toPath(), StandardCharsets.UTF_8);
-            for (String line : lines) {
-                if (line.trim().isEmpty()) continue;
+            // Stream the JSONL line-by-line. The previous Files.readAllLines()
+            // approach loaded the entire file into memory before parsing — on
+            // a corporate machine with hundreds-of-MB JSONL this dominated
+            // resume time. Pre-filter cheap substrings before JSON parse so
+            // multi-megabyte tool_result lines don't burn the parser. Mirrors
+            // JsonlSessionScanner.buildSessionInfo() but with a higher line
+            // cap (resume needs the full conversation, not just a summary).
+            final int MAX_LINES = 20_000;
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(jsonlFile), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    if (linesScanned++ >= MAX_LINES) {
+                        capped = true;
+                        break;
+                    }
+                    if (line.isEmpty()) continue;
+                    // Cheap pre-filter: skip lines that obviously aren't user
+                    // or assistant turns. CLI 2.1.107+ omits top-level type
+                    // for assistant turns — detect via "role":"assistant".
+                    if (line.indexOf("\"type\":\"user\"")      < 0
+                     && line.indexOf("\"type\":\"assistant\"") < 0
+                     && line.indexOf("\"role\":\"assistant\"") < 0) continue;
                 try {
                     Map<String, Object> obj = JsonParser.parseObject(line);
                     String type = JsonParser.getString(obj, "type");
@@ -2224,10 +2275,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 } catch (Exception lineEx) {
                     // Skip invalid lines silently (e.g. queue-operation entries)
                 }
-            }
+                } // end while-loop
+            } // end try-with-resources (BufferedReader)
         } catch (Exception e) {
             Activator.logError("Failed to load session history for " + sessionId + ": " + e.getMessage(), e);
         }
+        Activator.logDiag("[DIAG-PERF] loadSessionHistoryFromJsonl session=" + sessionId
+                + " elapsed=" + (System.currentTimeMillis() - t0) + "ms"
+                + " linesScanned=" + linesScanned
+                + " blocks=" + blocks.size()
+                + " fileSize=" + fileSize
+                + " capped=" + capped);
         return blocks;
     }
 
@@ -3313,6 +3371,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (contextBar != null && contextBar.getParent() != null) {
             contextBar.getParent().layout(true, true);
         }
+        // Warm the content cache on a background thread so the next send
+        // doesn't have to do file I/O on the UI thread.
+        scheduleActiveFileCacheWarm();
     }
 
     private String getActiveFilePathOrNull() {
@@ -3365,36 +3426,127 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     /**
      * If the "Active file" chip is enabled and an editor is open, return a
      * &lt;file&gt; context block with the full content; otherwise null.
+     * <p>
+     * Reads from {@link #cachedActiveFileContent} when fresh (path + mtime
+     * match the editor's current file). On cache miss, falls back to a
+     * 200ms-bounded synchronous read so a slow network home dir cannot
+     * stall the UI; on timeout the chip is skipped for this send and a
+     * warning is logged.
      */
     private String buildActiveFilePinContext() {
         if (!activeFilePinned) return null;
         IFile file = getActiveFileFromEditor();
         if (file == null) return null;
-        // Respect per-path dismissals
-        String path0 = file.getLocation() != null ? file.getLocation().toOSString() : null;
-        if (path0 != null && dismissedActiveFilePaths.contains(path0)) return null;
+        if (file.getLocation() == null) return null;
+        String path = file.getLocation().toOSString();
+        if (dismissedActiveFilePaths.contains(path)) return null;
+
+        long t0 = System.currentTimeMillis();
+        String content = null;
+        boolean cacheHit = false;
         try {
-            String path = file.getLocation().toOSString();
-            String content = new String(java.nio.file.Files.readAllBytes(
-                    java.nio.file.Paths.get(path)), java.nio.charset.StandardCharsets.UTF_8);
-            // Cap very large files to avoid blowing up the prompt
-            int MAX = 64 * 1024;
-            String truncatedNote = "";
-            if (content.length() > MAX) {
-                content = content.substring(0, MAX);
-                truncatedNote = "\n... (truncated to 64KB)";
+            java.nio.file.Path nio = java.nio.file.Paths.get(path);
+            long mtime = java.nio.file.Files.getLastModifiedTime(nio).toMillis();
+            if (path.equals(cachedActiveFilePath)
+                    && cachedActiveFileContent != null
+                    && cachedActiveFileMtime == mtime) {
+                content = cachedActiveFileContent;
+                cacheHit = true;
+            } else {
+                content = readActiveFileBounded(nio, 200);
+                if (content != null) {
+                    cachedActiveFilePath = path;
+                    cachedActiveFileMtime = mtime;
+                    cachedActiveFileContent = content;
+                }
             }
-            StringBuilder sb = new StringBuilder();
-            sb.append("<file path=\"").append(path).append("\" pinned=\"active-editor\">\n");
-            sb.append(content);
-            sb.append(truncatedNote);
-            if (!content.endsWith("\n")) sb.append("\n");
-            sb.append("</file>\n\n");
-            return sb.toString();
         } catch (Exception e) {
-            Activator.logWarning("[ActiveFile] failed to read pinned file: " + e.getMessage());
+            Activator.logWarning("[ActiveFile] failed to stat pinned file: " + e.getMessage());
+        }
+        Activator.logDiag("[DIAG-PERF] buildActiveFilePinContext elapsed="
+                + (System.currentTimeMillis() - t0) + "ms path=" + path
+                + " size=" + (content != null ? content.length() : -1)
+                + " cacheHit=" + cacheHit);
+
+        if (content == null) return null;
+
+        // Cap very large files to avoid blowing up the prompt
+        int MAX = 64 * 1024;
+        String truncatedNote = "";
+        if (content.length() > MAX) {
+            content = content.substring(0, MAX);
+            truncatedNote = "\n... (truncated to 64KB)";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("<file path=\"").append(path).append("\" pinned=\"active-editor\">\n");
+        sb.append(content);
+        sb.append(truncatedNote);
+        if (!content.endsWith("\n")) sb.append("\n");
+        sb.append("</file>\n\n");
+        return sb.toString();
+    }
+
+    /** Bounded synchronous read — never blocks the UI thread for more than {@code timeoutMs}. */
+    private static String readActiveFileBounded(java.nio.file.Path nio, long timeoutMs) {
+        java.util.concurrent.CompletableFuture<String> fut = java.util.concurrent.CompletableFuture
+                .supplyAsync(() -> {
+                    try {
+                        return new String(java.nio.file.Files.readAllBytes(nio),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                    } catch (Exception e) {
+                        throw new java.util.concurrent.CompletionException(e);
+                    }
+                });
+        try {
+            return fut.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException te) {
+            Activator.logWarning("[ActiveFile] read timed out after " + timeoutMs
+                    + "ms — skipping chip injection for this send (" + nio + ")");
+            return null;
+        } catch (Exception e) {
+            Activator.logWarning("[ActiveFile] read failed: " + e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Warm or refresh the active-file content cache on a background thread.
+     * Called whenever the active editor changes so that {@link #buildActiveFilePinContext}
+     * has a fresh value to serve without doing UI-thread I/O.
+     */
+    private void scheduleActiveFileCacheWarm() {
+        if (!activeFilePinned) return;
+        IFile file = getActiveFileFromEditor();
+        if (file == null || file.getLocation() == null) return;
+        String path = file.getLocation().toOSString();
+        if (dismissedActiveFilePaths.contains(path)) return;
+        Thread t = new Thread(() -> {
+            long t0 = System.currentTimeMillis();
+            try {
+                java.nio.file.Path nio = java.nio.file.Paths.get(path);
+                long mtime = java.nio.file.Files.getLastModifiedTime(nio).toMillis();
+                // Skip re-read when nothing changed
+                if (path.equals(cachedActiveFilePath)
+                        && cachedActiveFileContent != null
+                        && cachedActiveFileMtime == mtime) {
+                    return;
+                }
+                String content = new String(java.nio.file.Files.readAllBytes(nio),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                cachedActiveFilePath = path;
+                cachedActiveFileMtime = mtime;
+                cachedActiveFileContent = content;
+                Activator.logDiag("[DIAG-PERF] scheduleActiveFileCacheWarm elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms path=" + path
+                        + " size=" + content.length());
+            } catch (Exception e) {
+                Activator.logDiag("[DIAG-PERF] scheduleActiveFileCacheWarm failed elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms path=" + path
+                        + " err=" + e.getMessage());
+            }
+        }, "ActiveFile-CacheWarm");
+        t.setDaemon(true);
+        t.start();
     }
 
     private String getActiveEditorContext() {

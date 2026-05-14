@@ -40,6 +40,7 @@ public class JsonlSessionScanner {
      * fetch summary/model/messageCount for a row the user is interested in.
      */
     public static List<SessionInfo> listSessionsFast(String projectDir) {
+        long t0 = System.currentTimeMillis();
         List<SessionInfo> result = new ArrayList<>();
         File projectsRoot = new File(System.getProperty("user.home") + "/.claude/projects");
         if (!projectsRoot.isDirectory()) return result;
@@ -69,6 +70,9 @@ public class JsonlSessionScanner {
             }
         }
         result.sort(Comparator.comparingLong(SessionInfo::getLastActiveTime).reversed());
+        Activator.logDiag("[DIAG-PERF] listSessionsFast elapsed="
+                + (System.currentTimeMillis() - t0) + "ms files=" + result.size()
+                + " projectDir=" + projectDir);
         return result;
     }
 
@@ -162,6 +166,7 @@ public class JsonlSessionScanner {
     }
 
     private static SessionInfo buildSessionInfo(File jsonl, String sessionId, String projectKey) {
+        long t0 = System.currentTimeMillis();
         SessionInfo info = new SessionInfo(sessionId);
         info.setLastActiveTime(jsonl.lastModified());
         info.setWorkingDirectory(decodeProjectKey(projectKey));
@@ -268,7 +273,12 @@ public class JsonlSessionScanner {
             return null;
         }
 
-        if (messageCount == 0) return null; // not really a conversation
+        if (messageCount == 0) {
+            Activator.logDiag("[DIAG-PERF] buildSessionInfo elapsed="
+                    + (System.currentTimeMillis() - t0) + "ms session=" + sessionId
+                    + " result=empty fileSize=" + jsonl.length());
+            return null; // not really a conversation
+        }
 
         // Prefer CLI's auto-generated summary; fall back to first user message
         String summary = (cliSummary != null && !cliSummary.isEmpty())
@@ -278,6 +288,9 @@ public class JsonlSessionScanner {
         info.setMessageCount(messageCount);
         info.setModel(model);
         if (createdAt > 0) info.setStartTime(createdAt);
+        Activator.logDiag("[DIAG-PERF] buildSessionInfo elapsed="
+                + (System.currentTimeMillis() - t0) + "ms session=" + sessionId
+                + " msgs=" + messageCount + " fileSize=" + jsonl.length());
         return info;
     }
 
