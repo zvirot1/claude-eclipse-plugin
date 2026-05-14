@@ -170,6 +170,27 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private volatile String cachedActiveFilePath;
     private volatile long   cachedActiveFileMtime;
     private volatile String cachedActiveFileContent;
+    // Last orientation applied to the input field. Used to suppress redundant
+    // setOrientation/setTextDirection calls during typing: each such call on
+    // Windows resets the IME keyboard layout back to system default (English),
+    // so a user mid-typing in Hebrew gets interrupted. We only apply when the
+    // orientation actually changed, and we debounce the apply via
+    // applyInputOrientation so it never fires mid-keystroke.
+    private int lastAppliedInputOrientation = SWT.NONE;
+    private final Runnable applyInputOrientation = () -> {
+        if (inputField == null || inputField.isDisposed()) return;
+        String text = inputField.getText();
+        if (text.isEmpty()) return;
+        int orientation = StreamingTextWidget.detectOrientation(text);
+        if (orientation != lastAppliedInputOrientation) {
+            inputField.setOrientation(orientation);
+            inputField.setTextDirection(orientation);
+            inputField.redraw();
+            lastAppliedInputOrientation = orientation;
+            Activator.logDiag("[DIAG] applyInputOrientation orientation="
+                    + (orientation == SWT.RIGHT_TO_LEFT ? "RTL" : "LTR"));
+        }
+    };
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -1058,14 +1079,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             } else {
                 dismissAutocomplete();
             }
-            // RTL auto-detection: update both orientation and text direction on every change.
-            // Skip when text is empty so that clearing the field after sending doesn't
-            // reset the keyboard language back to English.
+            // RTL auto-detection: DEBOUNCED.
+            // On Windows, every setOrientation/setTextDirection call resets the
+            // IME keyboard layout to the system default (English). If we apply
+            // on every keystroke, a user typing a long Hebrew message gets
+            // their keyboard reset to English mid-word as soon as the detector
+            // flips from LTR to RTL. Instead we schedule the apply 1500ms after
+            // the LAST keystroke, so it only runs once the user has paused.
+            // Display.timerExec with the same Runnable cancels and reschedules,
+            // so each new keystroke pushes the apply further out.
             if (!text.isEmpty()) {
-                int orientation = StreamingTextWidget.detectOrientation(text);
-                inputField.setOrientation(orientation);
-                inputField.setTextDirection(orientation);
-                inputField.redraw();
+                Display.getDefault().timerExec(1500, applyInputOrientation);
             }
         });
 
