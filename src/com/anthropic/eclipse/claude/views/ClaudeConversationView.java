@@ -1145,6 +1145,36 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                                     cb.dispose();
                                 }
                             }
+                            // [DIAG] Log every focus / IME-related Windows message so we can
+                            // see in the Eclipse log exactly what is causing the Hebrew
+                            // keyboard to revert to English on the corporate machine.
+                            if (msg == 0x0008 /* WM_KILLFOCUS */) {
+                                long newFocusHwnd = wParam; // hwnd that is gaining focus
+                                long curHkl = 0;
+                                try { curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0); } catch (Throwable ignored) {}
+                                Activator.logDiag("[DIAG-KBD] WM_KILLFOCUS gainedBy=0x"
+                                        + Long.toHexString(newFocusHwnd)
+                                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                                        + " pendingRestoreHkl=0x" + Long.toHexString(self.pendingRestoreHkl)
+                                        + " blockLang=" + self.blockLanguageChange);
+                            } else if (msg == 0x0007 /* WM_SETFOCUS */) {
+                                long lostFocusHwnd = wParam; // hwnd that is losing focus
+                                long curHkl = 0;
+                                try { curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0); } catch (Throwable ignored) {}
+                                Activator.logDiag("[DIAG-KBD] WM_SETFOCUS lostBy=0x"
+                                        + Long.toHexString(lostFocusHwnd)
+                                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                                        + " pendingRestoreHkl=0x" + Long.toHexString(self.pendingRestoreHkl));
+                            } else if (msg == 0x0050 /* WM_INPUTLANGCHANGEREQUEST */) {
+                                Activator.logDiag("[DIAG-KBD] WM_INPUTLANGCHANGEREQUEST wParam=0x"
+                                        + Long.toHexString(wParam)
+                                        + " lParam=0x" + Long.toHexString(lParam)
+                                        + " blockLang=" + self.blockLanguageChange);
+                            } else if (msg == 0x0051 /* WM_INPUTLANGCHANGE */) {
+                                Activator.logDiag("[DIAG-KBD] WM_INPUTLANGCHANGE wParam=0x"
+                                        + Long.toHexString(wParam)
+                                        + " newHkl=0x" + Long.toHexString(lParam));
+                            }
                             // Block keyboard language changes during send operation
                             if (msg == 0x0050 /* WM_INPUTLANGCHANGEREQUEST */ && self.blockLanguageChange) {
                                 return 0;
@@ -1203,6 +1233,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // keyboard layout. We keep restoring on every FocusIn until the user starts typing.
         if (SWT.getPlatform().equals("win32")) {
             inputField.addListener(SWT.FocusIn, e -> {
+                long curHkl = 0;
+                try { curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0); } catch (Throwable ignored) {}
+                Activator.logDiag("[DIAG-KBD] SWT.FocusIn inputField"
+                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                        + " pendingRestoreHkl=0x" + Long.toHexString(pendingRestoreHkl));
                 if (pendingRestoreHkl != 0) {
                     try {
                         org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(pendingRestoreHkl, 0);
@@ -1221,6 +1256,20 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         // Dismiss autocomplete when input loses focus
         inputField.addListener(SWT.FocusOut, e -> {
+            if (SWT.getPlatform().equals("win32")) {
+                long curHkl = 0;
+                long fgHwnd = 0;
+                long focHwnd = 0;
+                try {
+                    curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0);
+                    fgHwnd = org.eclipse.swt.internal.win32.OS.GetForegroundWindow();
+                    focHwnd = org.eclipse.swt.internal.win32.OS.GetFocus();
+                } catch (Throwable ignored) {}
+                Activator.logDiag("[DIAG-KBD] SWT.FocusOut inputField"
+                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                        + " foregroundHwnd=0x" + Long.toHexString(fgHwnd)
+                        + " focusHwnd=0x" + Long.toHexString(focHwnd));
+            }
             Display.getDefault().timerExec(200, () -> dismissAutocomplete());
         });
     }
