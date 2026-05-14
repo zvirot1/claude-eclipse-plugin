@@ -46,42 +46,61 @@ public class ClaudeCliManager {
     private NdjsonProtocolHandler protocolHandler;
     private CliProcessConfig config;
     private ScheduledExecutorService healthChecker;
-    private String detectedCliPath;
+    private String detectedCliPath; // per-instance override (setCliPath); empty otherwise.
+
+    // JVM-wide cache of `where claude` / `which claude` result. Detecting the CLI
+    // runs a `where`/`which` subprocess which on corporate machines (security
+    // monitors, AV hooks) can take seconds. The CLI binary doesn't move during
+    // a JVM lifetime, so we detect once and cache.
+    private static volatile String JVM_DETECTED_CLI_PATH;
+    private static volatile boolean JVM_DETECTION_DONE;
+
+    // Diagnostic timing markers populated by start() / NDJSON handler so callers
+    // can compute "process spawn → first SystemInit" latency.
+    public volatile long diagStartNanos;
 
     private final List<ICliStateListener> stateListeners = new CopyOnWriteArrayList<>();
     private final List<ICliMessageListener> messageListeners = new CopyOnWriteArrayList<>();
 
     public ClaudeCliManager() {
-        detectCLI();
+        // CLI detection is lazy via ensureDetected(); the constructor used to
+        // spawn `where`/`which` synchronously per tab, which on corporate
+        // Windows boxes added a multi-second pause on every new tab.
     }
 
     // ==================== CLI Detection ====================
 
     /**
      * Auto-detect Claude Code CLI installation.
+     * Idempotent and cached JVM-wide — safe to call from any thread.
      * @return true if CLI was found
      */
     public boolean detectCLI() {
-        // First try PATH
-        String fromPath = findInPath("claude");
-        if (fromPath != null) {
-            detectedCliPath = fromPath;
-            return true;
-        }
-
-        // Try known locations
-        for (String path : SEARCH_PATHS) {
-            File f = new File(path);
-            if (f.exists() && f.canExecute()) {
-                detectedCliPath = path;
-                return true;
-            }
-        }
-
-        return false;
+        ensureDetected();
+        return JVM_DETECTED_CLI_PATH != null;
     }
 
-    private String findInPath(String command) {
+    private static synchronized void ensureDetected() {
+        if (JVM_DETECTION_DONE) return;
+        long t0 = System.currentTimeMillis();
+        String found = findInPath("claude");
+        if (found == null) {
+            for (String path : SEARCH_PATHS) {
+                File f = new File(path);
+                if (f.exists() && f.canExecute()) {
+                    found = path;
+                    break;
+                }
+            }
+        }
+        JVM_DETECTED_CLI_PATH = found;
+        JVM_DETECTION_DONE = true;
+        Activator.logDiag("[DIAG-PERF] ClaudeCliManager.ensureDetected elapsed="
+                + (System.currentTimeMillis() - t0) + "ms found=" + found);
+    }
+
+    private static String findInPath(String command) {
+        long t0 = System.currentTimeMillis();
         try {
             ProcessBuilder pb = new ProcessBuilder(
                 isWindows() ? "where" : "which", command
@@ -90,9 +109,14 @@ public class ClaudeCliManager {
             String result = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
             p.waitFor(5, TimeUnit.SECONDS);
             if (!result.isEmpty() && new File(result.split("\n")[0]).exists()) {
-                return result.split("\n")[0].trim();
+                String hit = result.split("\n")[0].trim();
+                Activator.logDiag("[DIAG-PERF] findInPath(" + command + ") elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms found=" + hit);
+                return hit;
             }
         } catch (Exception ignored) {}
+        Activator.logDiag("[DIAG-PERF] findInPath(" + command + ") elapsed="
+                + (System.currentTimeMillis() - t0) + "ms found=null");
         return null;
     }
 
@@ -143,10 +167,17 @@ public class ClaudeCliManager {
     }
 
     /**
-     * Get the CLI path (preference-configured, or auto-detected).
+     * Get the CLI path (preference-configured, per-instance override, or JVM-cached detection).
+     * <p>
+     * Order:
+     * <ol>
+     *   <li>Preference-configured path if valid — skips detection entirely.</li>
+     *   <li>Per-instance override set via {@link #setCliPath(String)}.</li>
+     *   <li>JVM-wide cached detection (runs `where`/`which` at most once per JVM).</li>
+     * </ol>
      */
     public String getCliPath() {
-        // Check preferences first
+        // 1) Preference-configured path takes priority (no detection cost)
         try {
             if (Activator.getDefault() != null) {
                 IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
@@ -159,7 +190,11 @@ public class ClaudeCliManager {
                 }
             }
         } catch (Exception ignored) {}
-        return detectedCliPath;
+        // 2) Per-instance manual override
+        if (detectedCliPath != null) return detectedCliPath;
+        // 3) Lazy JVM-wide detection (cached after first call)
+        ensureDetected();
+        return JVM_DETECTED_CLI_PATH;
     }
 
     /**
@@ -206,7 +241,11 @@ public class ClaudeCliManager {
 
             pb.redirectErrorStream(false); // separate stderr for error logging
 
+            long startT0 = System.currentTimeMillis();
             cliProcess = pb.start();
+            diagStartNanos = System.nanoTime();
+            Activator.logDiag("[DIAG-PERF] ClaudeCliManager.start ProcessBuilder.start elapsed="
+                    + (System.currentTimeMillis() - startT0) + "ms pid=" + cliProcess.pid());
 
             // Wire up the protocol handler
             protocolHandler = new NdjsonProtocolHandler(
@@ -214,6 +253,23 @@ public class ClaudeCliManager {
                 cliProcess.getOutputStream(),
                 cliProcess.getErrorStream()
             );
+
+            // Internal listener: capture the elapsed time from process spawn to
+            // the first SystemInit message. This is the CLI "cold start" cost
+            // — on a corporate Windows box with AV / security tools intercepting
+            // every Node.js spawn it can be several seconds.
+            final long initStartNanos = diagStartNanos;
+            protocolHandler.addListener(new ICliMessageListener() {
+                private volatile boolean logged = false;
+                @Override public void onMessage(CliMessage msg) {
+                    if (!logged && msg instanceof CliMessage.SystemInit) {
+                        logged = true;
+                        long elapsedMs = (System.nanoTime() - initStartNanos) / 1_000_000L;
+                        Activator.logDiag("[DIAG-PERF] CLI coldStart elapsed=" + elapsedMs + "ms"
+                                + " sessionId=" + ((CliMessage.SystemInit) msg).getSessionId());
+                    }
+                }
+            });
 
             // Forward all message listeners to the protocol handler
             for (ICliMessageListener listener : messageListeners) {
@@ -655,7 +711,7 @@ public class ClaudeCliManager {
         }
     }
 
-    private boolean isWindows() {
+    private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
 
