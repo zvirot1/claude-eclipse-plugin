@@ -68,6 +68,20 @@ public class ConversationModel implements ICliMessageListener {
      */
     private volatile boolean retriedSilentEmpty;
 
+    /**
+     * Wall-clock nanos when the current turn's addUserMessage() ran, so the
+     * first streamed text delta can log T1.5 (time-to-first-token).
+     */
+    private volatile long turnSendNanos;
+    private volatile boolean firstTokenLoggedThisTurn;
+
+    /**
+     * Hook timing — populated on hook_started, consumed on hook_response.
+     * Lets us measure how long the corporate AIM hook actually took.
+     */
+    private volatile long pendingHookStartNanos;
+    private volatile String pendingHookName;
+
     // ==================== ICliMessageListener Implementation ====================
 
     @Override
@@ -174,6 +188,8 @@ public class ConversationModel implements ICliMessageListener {
         lastErrorNotification = null;
         lastUserPrompt = content;
         retriedSilentEmpty = false;
+        turnSendNanos = System.nanoTime();
+        firstTokenLoggedThisTurn = false;
 
         MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
         MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
@@ -383,9 +399,31 @@ public class ConversationModel implements ICliMessageListener {
                 + " hook=" + n.getHookName()
                 + " hasError=" + n.hasErrorIndicator());
 
+        // Track hook latency so we can isolate AIM-proxy / corporate-environment
+        // cost from the "send → first token" budget.
+        if ("hook_started".equals(n.getSubtype())) {
+            pendingHookStartNanos = System.nanoTime();
+            pendingHookName = n.getHookName();
+            Activator.logDiag("[DIAG-PERF] hook_started name=" + pendingHookName);
+            return;
+        }
+
         // Only act on hook_response (the final outcome of a hook) to avoid spamming.
         if (!"hook_response".equals(n.getSubtype())) {
             return;
+        }
+
+        // hook_response → log elapsed since matching hook_started (best-effort).
+        if (pendingHookStartNanos > 0) {
+            long elapsedMs = (System.nanoTime() - pendingHookStartNanos) / 1_000_000L;
+            Activator.logDiag("[DIAG-PERF] hook_response name="
+                    + (n.getHookName() != null ? n.getHookName() : pendingHookName)
+                    + " elapsed=" + elapsedMs + "ms hasError=" + n.hasErrorIndicator());
+            pendingHookStartNanos = 0;
+            pendingHookName = null;
+        } else {
+            Activator.logDiag("[DIAG-PERF] hook_response name="
+                    + n.getHookName() + " (no matching start) hasError=" + n.hasErrorIndicator());
         }
 
         if (n.hasErrorIndicator()) {
@@ -546,6 +584,14 @@ public class ConversationModel implements ICliMessageListener {
             String snip = dt.substring(0, Math.min(30, dt.length())).replace("\n", "\\n");
             Activator.logDiag("[DIAG] text_delta idx=" + event.getIndex()
                     + " len=" + dt.length() + " snip='" + snip + "'");
+            // T1.5 — first text token of the current turn. The gap between
+            // turnSendNanos and now isolates "send → model first byte" from
+            // the rest of the streaming latency.
+            if (!firstTokenLoggedThisTurn && turnSendNanos > 0) {
+                firstTokenLoggedThisTurn = true;
+                long elapsedMs = (System.nanoTime() - turnSendNanos) / 1_000_000L;
+                Activator.logDiag("[DIAG-TIMING] T1.5 firstToken elapsed=" + elapsedMs + "ms");
+            }
             hadTextInCurrentTurn = true; // any text delta proves the model produced output
             // Append text to the current text segment
             MessageBlock.TextSegment textSeg = currentStreamingBlock.getOrCreateLastTextSegment();
