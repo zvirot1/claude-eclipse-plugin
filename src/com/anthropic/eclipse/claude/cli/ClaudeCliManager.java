@@ -246,6 +246,10 @@ public class ClaudeCliManager {
             diagStartNanos = System.nanoTime();
             Activator.logDiag("[DIAG-PERF] ClaudeCliManager.start ProcessBuilder.start elapsed="
                     + (System.currentTimeMillis() - startT0) + "ms pid=" + cliProcess.pid());
+            // Record the PID on disk so an Eclipse crash before normal stop()
+            // leaves a breadcrumb the next plug-in startup can use to kill the
+            // orphaned CLI process.
+            ClaudeCliPidTracker.registerPid(cliProcess.pid());
 
             // Wire up the protocol handler
             protocolHandler = new NdjsonProtocolHandler(
@@ -318,12 +322,18 @@ public class ClaudeCliManager {
     public synchronized void stop() {
         if (cliProcess == null || !cliProcess.isAlive()) {
             state = ProcessState.STOPPED;
+            // Make sure the PID tracker doesn't keep a stale entry around.
+            if (cliProcess != null) {
+                ClaudeCliPidTracker.unregisterPid(cliProcess.pid());
+            }
             return;
         }
 
         ProcessState oldState = state;
         state = ProcessState.STOPPING;
         fireStateChanged(oldState, ProcessState.STOPPING);
+
+        long pidForTracker = cliProcess.pid();
 
         // Stop health monitor
         if (healthChecker != null) {
@@ -345,6 +355,7 @@ public class ClaudeCliManager {
         }
 
         state = ProcessState.STOPPED;
+        ClaudeCliPidTracker.unregisterPid(pidForTracker);
         fireStateChanged(ProcessState.STOPPING, ProcessState.STOPPED);
     }
 
@@ -385,6 +396,7 @@ public class ClaudeCliManager {
         Process proc = cliProcess;  // snapshot — avoid races
         if (proc != null && proc.isAlive()) {
             destroyProcessTree(proc);
+            ClaudeCliPidTracker.unregisterPid(proc.pid());
             Activator.logInfo("[Stop] Process tree killed for PID " + proc.pid());
         }
 
@@ -650,6 +662,7 @@ public class ClaudeCliManager {
         Process proc = cliProcess;
         if (proc != null && proc.isAlive()) {
             destroyProcessTree(proc);
+            ClaudeCliPidTracker.unregisterPid(proc.pid());
         }
 
         Thread killer = new Thread(() -> {
