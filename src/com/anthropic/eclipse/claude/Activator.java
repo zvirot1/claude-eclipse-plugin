@@ -11,6 +11,7 @@ import org.eclipse.ui.plugin.AbstractUIPlugin;
 import org.osgi.framework.BundleContext;
 
 import com.anthropic.eclipse.claude.cli.ClaudeCliManager;
+import com.anthropic.eclipse.claude.cli.ClaudeCliPidTracker;
 import com.anthropic.eclipse.claude.diff.CheckpointManager;
 import com.anthropic.eclipse.claude.diff.EditDecisionManager;
 import com.anthropic.eclipse.claude.model.ConversationModel;
@@ -65,6 +66,22 @@ public class Activator extends AbstractUIPlugin {
     public void start(BundleContext context) throws Exception {
         super.start(context);
         plugin = this;
+
+        // Reap any Claude CLI processes left running by a previous Eclipse
+        // session that did not shut down cleanly (crash, taskkill, hard
+        // logoff). The tracker writes PIDs at spawn time and removes them on
+        // normal stop; whatever's left here is orphaned and would otherwise
+        // double-charge the corporate AV / Bedrock proxy when the user opens
+        // a new tab.
+        try {
+            int killed = ClaudeCliPidTracker.cleanupOrphans();
+            if (killed > 0) {
+                logInfo("[PidTracker] Reaped " + killed + " orphaned Claude CLI process(es) from previous session");
+            }
+        } catch (Throwable t) {
+            // Never block plug-in start on tracker hygiene.
+            logWarning("[PidTracker] cleanup failed at startup: " + t.getMessage());
+        }
 
         // Initialize singleton services (no CLI manager here — one per session)
         sessionManager = new ClaudeSessionManager();

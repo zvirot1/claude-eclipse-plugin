@@ -124,6 +124,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private org.eclipse.swt.widgets.Canvas thinkingDotsCanvas;
     private int thinkingAnimFrame = 0;
     private boolean extendedThinking = false;
+    // Set true after the CLI emits SystemInit. While false, the indicator and
+    // costBar show "Starting Claude CLI…" instead of "Claude is thinking…" —
+    // the cold start on corporate machines (AV scanning, slow node bootstrap,
+    // hook latency) can be 15-35 seconds and the user otherwise sees no
+    // distinction between "still booting" and "model is composing a reply".
+    private volatile boolean sessionReady = false;
+    private long thinkingStartedAt = 0L;
 
     // State
     private final Map<MessageBlock, MessageComposite> messageWidgetMap = new LinkedHashMap<>();
@@ -527,13 +534,26 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     ClaudeConversationView.ID, secondaryId, IWorkbenchPage.VIEW_ACTIVATE);
 
             // Move the freshly-opened view into our own stack (best effort —
-            // any error leaves the view where Eclipse placed it). We defer
-            // via asyncExec to give the E4 compat layer a chance to finish
-            // wiring the MPart into the model.
-            Display.getDefault().asyncExec(() -> relocateToOwnStack(newView));
+            // any error leaves the view where Eclipse placed it). The E4
+            // compat layer may not have wired the MPlaceholder of the new
+            // view into the model yet, so we retry up to 5 times with a
+            // 100ms backoff before giving up. asyncExec alone (the old
+            // behaviour) was racing the model wiring on slower machines —
+            // the new view would land in the default (bottom) folder and
+            // stay there.
+            tryRelocateWithRetry(newView, 0);
         } catch (Exception ex) {
             Activator.logError("Could not open new conversation window", ex);
         }
+    }
+
+    private void tryRelocateWithRetry(org.eclipse.ui.IViewPart newView, int attempt) {
+        if (newView == null || attempt >= 5) return;
+        Display.getDefault().timerExec(attempt == 0 ? 0 : 100, () -> {
+            if (relocateToOwnStack(newView)) return;
+            // Not yet ready (placeholder not in model, or services unavailable).
+            tryRelocateWithRetry(newView, attempt + 1);
+        });
     }
 
     /**
@@ -548,8 +568,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * {@link EModelService#findPlaceholderFor} and move the <em>placeholder</em>
      * — not the MPart — into our own stack.</p>
      */
-    private void relocateToOwnStack(org.eclipse.ui.IViewPart newView) {
-        if (newView == null) return;
+    /**
+     * @return {@code true} when the relocation either succeeded or failed in a
+     *         way that retrying won't help (e.g. missing services). Returns
+     *         {@code false} when the E4 model isn't ready yet (the placeholder
+     *         of the new view hasn't been wired in) and the caller should retry.
+     */
+    private boolean relocateToOwnStack(org.eclipse.ui.IViewPart newView) {
+        if (newView == null) return true;
         try {
             org.eclipse.e4.ui.model.application.ui.basic.MPart thisPart =
                     getSite().getService(org.eclipse.e4.ui.model.application.ui.basic.MPart.class);
@@ -566,15 +592,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 Activator.logWarning("[relocate] missing service — thisPart="
                         + thisPart + " newPart=" + newPart
                         + " modelSvc=" + modelService + " partSvc=" + partService);
-                return;
+                return true; // services unavailable — no point retrying
             }
-            if (newPart == thisPart) return;
+            if (newPart == thisPart) return true;
 
             org.eclipse.e4.ui.model.application.ui.basic.MWindow window =
                     modelService.getTopLevelWindowFor(thisPart);
             if (window == null) {
                 Activator.logWarning("[relocate] no top-level window");
-                return;
+                return true;
             }
 
             // Find placeholders in the active perspective.
@@ -591,6 +617,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             org.eclipse.e4.ui.model.application.ui.MUIElement newAnchor =
                     (newPh != null) ? newPh : newPart;
 
+            // If the new view isn't attached anywhere yet, the E4 compat layer
+            // is still wiring it — ask caller to retry.
+            if (newAnchor.getParent() == null) {
+                Activator.logDiag("[relocate] newAnchor not yet attached — retry");
+                return false;
+            }
+
             // Walk up from thisAnchor to find the enclosing MPartStack.
             org.eclipse.e4.ui.model.application.ui.MUIElement cursor = thisAnchor.getParent();
             org.eclipse.e4.ui.model.application.ui.basic.MPartStack targetStack = null;
@@ -602,14 +635,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 cursor = cursor.getParent();
             }
 
-            Activator.logWarning("[relocate] thisAnchor.parent=" + thisAnchor.getParent()
+            Activator.logDiag("[relocate] thisAnchor.parent=" + thisAnchor.getParent()
                     + " targetStack=" + targetStack
                     + " newAnchor.parent=" + newAnchor.getParent());
 
-            if (targetStack == null) return;
+            if (targetStack == null) {
+                Activator.logDiag("[relocate] no enclosing MPartStack — retry");
+                return false; // our own anchor may also be mid-wiring
+            }
             if ((Object) newAnchor.getParent() == (Object) targetStack) {
-                Activator.logWarning("[relocate] already in target stack");
-                return;
+                Activator.logDiag("[relocate] already in target stack");
+                return true;
             }
 
             // Detach from current container, attach to our stack.
@@ -628,11 +664,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             targetStack.setSelectedElement(
                     (org.eclipse.e4.ui.model.application.ui.basic.MStackElement) newAnchor);
             partService.activate(newPart);
-            Activator.logWarning("[relocate] moved newAnchor into target stack (success)");
+            Activator.logDiag("[relocate] moved newAnchor into target stack (success)");
+            return true;
         } catch (Throwable t) {
             // Soft-fail: the view is still usable, just in the wrong folder
             Activator.logWarning(
                     "Could not relocate new conversation to same stack: " + t);
+            return true;
         }
     }
 
@@ -1587,7 +1625,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 + " viewHash=" + System.identityHashCode(this));
         stopButton.setEnabled(true);
         setSendButtonToStop();
-        costBar.setStatus("Streaming...");
+        // If SystemInit hasn't arrived yet (cold start), show that explicitly
+        // so the user understands why nothing is streaming yet. The thinking
+        // indicator's elapsed-time counter complements this.
+        costBar.setStatus(sessionReady ? "Streaming..." : "Waiting for Claude CLI…");
         // Queue AFTER the user message asyncExec so indicator appears below the user message
         Display.getDefault().asyncExec(this::showThinkingIndicator);
     }
@@ -2351,6 +2392,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 ? info.getWorkingDirectory() : getDefaultWorkingDirectory();
             sessionManager.startNewSession(workDir);
         }
+        // CLI cold-start is over. If a thinking indicator was already showing
+        // (user pressed Send before SystemInit arrived), reset its base time
+        // so the counter measures only the actual model latency, not the
+        // boot delay, and refresh the label text to "Claude is thinking\u2026".
+        sessionReady = true;
+        asyncExec(() -> {
+            if (thinkingIndicator != null && !thinkingIndicator.isDisposed()) {
+                thinkingStartedAt = System.currentTimeMillis();
+                updateThinkingLabel();
+                // A send was already in flight while we waited for SystemInit \u2014
+                // flip the cost-bar message from "Waiting for Claude CLI\u2026" to
+                // the in-flight streaming state.
+                costBar.setStatus("Streaming...");
+            } else {
+                costBar.setStatus("Ready");
+            }
+        });
 
         asyncExec(() -> {
             costBar.updateSession(info);
@@ -2882,12 +2940,22 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         asyncExec(() -> {
             switch (newState) {
                 case STARTING:
+                    sessionReady = false;
                     connectionStatus.setText("Starting...");
+                    costBar.setStatus("Starting Claude CLI\u2026");
                     break;
                 case RUNNING:
-                    connectionStatus.setText("\u2713 Connected");
-                    connectionStatus.setForeground(connectedColor);
-                    costBar.setStatus("Ready");
+                    // RUNNING means the process was spawned, NOT that the CLI
+                    // is ready to take input \u2014 SystemInit (handled in
+                    // onSessionInitialized) is what makes it actually ready.
+                    // Cold start on corporate machines (AV scanning, slow node
+                    // bootstrap, hook latency) can be 15-35s \u2014 without this
+                    // the user would see "Ready" while the CLI is still
+                    // booting and conclude the plug-in is hung.
+                    connectionStatus.setText("Starting\u2026");
+                    if (!sessionReady) {
+                        costBar.setStatus("Starting Claude CLI\u2026");
+                    }
                     if (oldState != ClaudeCliManager.ProcessState.STARTING) {
                         costBar.showToast("\u2713 Claude reconnected", 2500);
                     }
@@ -2896,6 +2964,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     connectionStatus.setText("Stopping...");
                     break;
                 case STOPPED:
+                    sessionReady = false;
                     connectionStatus.setText("\u25CF Disconnected");
                     connectionStatus.setForeground(disconnectedColor);
                     costBar.setStatus("Stopped");
@@ -2903,6 +2972,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     if (model != null) model.markActiveToolCallsFailed("CLI stopped");
                     break;
                 case ERROR:
+                    sessionReady = false;
                     connectionStatus.setText("\u2717 Error - CLI process crashed");
                     connectionStatus.setForeground(errorColor);
                     costBar.setStatus("Error");
@@ -4250,9 +4320,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         Color dimColor = new Color(128, 128, 128);
         thinkingLabel.setForeground(dimColor);
         thinkingLabel.addDisposeListener(ev -> dimColor.dispose());
-        thinkingLabel.setText("\u2728 Claude is thinking\u2026");
+        thinkingStartedAt = System.currentTimeMillis();
+        updateThinkingLabel();
 
-        // Animation timer: 470ms per frame (1.4s total cycle / 3 dots)
+        // Animation timer: 470ms per frame (1.4s total cycle / 3 dots).
+        // Every frame we also refresh the label so the elapsed counter
+        // (e.g. "Starting Claude CLI\u2026 (7s)") ticks forward \u2014 this is what
+        // tells the user the plug-in is alive while the CLI cold-starts.
         thinkingAnimFrame = 0;
         Display.getDefault().timerExec(470, new Runnable() {
             @Override
@@ -4260,11 +4334,41 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 if (thinkingDotsCanvas == null || thinkingDotsCanvas.isDisposed()) return;
                 thinkingAnimFrame = (thinkingAnimFrame + 1) % 3;
                 thinkingDotsCanvas.redraw();
+                updateThinkingLabel();
                 Display.getDefault().timerExec(470, this);
             }
         });
 
         scrollToBottom();
+    }
+
+    /**
+     * Refresh the thinking-indicator label according to the current state.
+     * Three cases:
+     *   1) The CLI hasn't emitted SystemInit yet → "⏳ Starting Claude CLI… (Ns)"
+     *   2) Extended thinking is on → "🧠 Claude is reasoning…"
+     *   3) Normal in-flight turn → "✨ Claude is thinking… (Ns)"
+     * The counter helps users distinguish "still alive, just slow" from "stuck".
+     */
+    private void updateThinkingLabel() {
+        if (thinkingLabel == null || thinkingLabel.isDisposed()) return;
+        long elapsed = thinkingStartedAt > 0
+                ? (System.currentTimeMillis() - thinkingStartedAt) / 1000L
+                : 0L;
+        String text;
+        if (!sessionReady) {
+            text = "⏳ Starting Claude CLI… (" + elapsed + "s)";
+        } else if (extendedThinking) {
+            text = "🧠 Claude is reasoning… (" + elapsed + "s)";
+        } else {
+            text = "✨ Claude is thinking… (" + elapsed + "s)";
+        }
+        thinkingLabel.setText(text);
+        // Recompute layout so the label width adapts when text changes (e.g.,
+        // 0s → 10s adds a digit).
+        if (thinkingIndicator != null && !thinkingIndicator.isDisposed()) {
+            thinkingIndicator.layout(true, true);
+        }
     }
 
     /**
