@@ -51,6 +51,68 @@ public abstract class CliMessage {
     }
 
     /**
+     * Non-init system message — hooks (SessionStart, UserPromptSubmit, etc.),
+     * compact_boundary, and other notifications the CLI emits with type=system
+     * and a non-init subtype.
+     *
+     * In particular, enterprise installations frequently configure SessionStart
+     * hooks that talk to AWS SSO / Bedrock for auth; if the token has expired,
+     * the hook surfaces the error here via {@code stderr} while still reporting
+     * {@code outcome:"success"} — so {@code stderr} is the only signal.
+     */
+    public static class SystemNotification extends CliMessage {
+        private String subtype;       // hook_started, hook_progress, hook_response, compact_boundary, etc.
+        private String hookName;
+        private String hookEvent;
+        private String hookId;
+        private String stdout;
+        private String stderr;
+        private Integer exitCode;
+        private String outcome;
+        private String sessionId;
+        private String rawJson;       // full JSON snippet for diagnostics
+
+        public SystemNotification() { super("system"); }
+
+        public String getSubtype() { return subtype; }
+        public void setSubtype(String s) { this.subtype = s; }
+        public String getHookName() { return hookName; }
+        public void setHookName(String s) { this.hookName = s; }
+        public String getHookEvent() { return hookEvent; }
+        public void setHookEvent(String s) { this.hookEvent = s; }
+        public String getHookId() { return hookId; }
+        public void setHookId(String s) { this.hookId = s; }
+        public String getStdout() { return stdout; }
+        public void setStdout(String s) { this.stdout = s; }
+        public String getStderr() { return stderr; }
+        public void setStderr(String s) { this.stderr = s; }
+        public Integer getExitCode() { return exitCode; }
+        public void setExitCode(Integer e) { this.exitCode = e; }
+        public String getOutcome() { return outcome; }
+        public void setOutcome(String s) { this.outcome = s; }
+        public String getSessionId() { return sessionId; }
+        public void setSessionId(String s) { this.sessionId = s; }
+        public String getRawJson() { return rawJson; }
+        public void setRawJson(String s) { this.rawJson = s; }
+
+        /**
+         * True if {@code stderr} or {@code stdout} contains a recognizable error pattern.
+         * Used to decide whether to surface this notification to the user.
+         */
+        public boolean hasErrorIndicator() {
+            String s = (stderr != null ? stderr : "") + " " + (stdout != null ? stdout : "");
+            String low = s.toLowerCase();
+            return low.contains("[error]")
+                || low.contains("error:")
+                || low.contains("token has expired")
+                || low.contains("authentication failed")
+                || low.contains("unauthorized")
+                || low.contains("permission denied")
+                || (exitCode != null && exitCode != 0);
+        }
+    }
+
+    /**
      * "assistant" message - a full assistant turn with content blocks.
      * Content can include text blocks and tool_use blocks.
      */
@@ -275,6 +337,31 @@ public abstract class CliMessage {
         public void setToolInput(Object toolInput) { this.toolInput = toolInput; }
         public Map<String, Object> getRawJson() { return rawJson; }
         public void setRawJson(Map<String, Object> rawJson) { this.rawJson = rawJson; }
+    }
+
+    // ==================== Rate Limit Event ====================
+
+    /**
+     * Informational event about API rate limits.
+     * {@code status} is "allowed" when the request proceeds normally,
+     * and something else (e.g. "rejected", "throttled") when actually blocked.
+     * {@code overageStatus} describes the POLICY for overage, not the current request.
+     */
+    public static class RateLimitEvent extends CliMessage {
+        private String status;
+        private String overageStatus;
+
+        public RateLimitEvent() { super("rate_limit_event"); }
+
+        public String getStatus() { return status; }
+        public void setStatus(String status) { this.status = status; }
+        public String getOverageStatus() { return overageStatus; }
+        public void setOverageStatus(String overageStatus) { this.overageStatus = overageStatus; }
+
+        /** True when the API actually rejected/throttled the request. */
+        public boolean isRejected() {
+            return status != null && !"allowed".equals(status);
+        }
     }
 
     // ==================== User Input Message (for stdin) ====================

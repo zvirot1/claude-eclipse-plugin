@@ -51,49 +51,65 @@ public class SyntaxHighlighter {
         return highlightWithRegex(code, lang, tm, colorOwner);
     }
 
-    // ======================== Java via JDT IScanner ========================
+    // ======================== Java via JDT IScanner (reflection) ========================
+    // Uses reflection to avoid compile-time dependency on JDT classes that may
+    // change between Eclipse versions (e.g. InvalidInputException removed in 4.35).
 
     private static StyleRange[] highlightJava(String code, ThemeManager tm,
                                                org.eclipse.swt.widgets.Widget colorOwner) {
         try {
-            return doHighlightJava(code, tm, colorOwner);
+            return doHighlightJavaReflection(code, tm, colorOwner);
         } catch (Exception e) {
             // JDT not available or scan error — fall back to regex
             return highlightWithRegex(code, "java", tm, colorOwner);
         }
     }
 
-    private static StyleRange[] doHighlightJava(String code, ThemeManager tm,
+    private static StyleRange[] doHighlightJavaReflection(String code, ThemeManager tm,
                                                   org.eclipse.swt.widgets.Widget colorOwner) throws Exception {
-        org.eclipse.jdt.core.compiler.IScanner scanner =
-            org.eclipse.jdt.core.ToolFactory.createScanner(
-                true,  // tokenizeComments
-                true,  // tokenizeWhiteSpace
-                true,  // recordLineSeparator
-                "21"   // sourceLevel
-            );
-        scanner.setSource(code.toCharArray());
+        // Get scanner via reflection
+        Class<?> toolFactoryClass = Class.forName("org.eclipse.jdt.core.ToolFactory");
+        java.lang.reflect.Method createScanner = toolFactoryClass.getMethod("createScanner",
+                boolean.class, boolean.class, boolean.class, String.class);
+        Object scanner = createScanner.invoke(null, true, true, true, "21");
+
+        // Get IScanner methods
+        Class<?> scannerClass = scanner.getClass();
+        java.lang.reflect.Method setSource = scannerClass.getMethod("setSource", char[].class);
+        java.lang.reflect.Method getNextToken = scannerClass.getMethod("getNextToken");
+        java.lang.reflect.Method getCurrentTokenStart = scannerClass.getMethod("getCurrentTokenStartPosition");
+        java.lang.reflect.Method getCurrentTokenEnd = scannerClass.getMethod("getCurrentTokenEndPosition");
+
+        // Get token constants via reflection
+        Class<?> termSymbols = Class.forName("org.eclipse.jdt.core.compiler.ITerminalSymbols");
+        int tokenEOF = getStaticInt(termSymbols, "TokenNameEOF");
+
+        // Build token-to-color map
+        Map<Integer, RGB> tokenColorMap = buildTokenColorMap(termSymbols, tm);
+        Set<Integer> commentTokens = buildCommentTokenSet(termSymbols);
+
+        setSource.invoke(scanner, (Object) code.toCharArray());
 
         List<StyleRange> styles = new ArrayList<>();
-        int token;
         while (true) {
+            int token;
             try {
-                token = scanner.getNextToken();
-            } catch (org.eclipse.jdt.core.compiler.InvalidInputException e) {
+                token = (Integer) getNextToken.invoke(scanner);
+            } catch (Exception e) {
                 break;
             }
-            if (token == org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameEOF) break;
+            if (token == tokenEOF) break;
 
-            int start = scanner.getCurrentTokenStartPosition();
-            int end = scanner.getCurrentTokenEndPosition();
+            int start = (Integer) getCurrentTokenStart.invoke(scanner);
+            int end = (Integer) getCurrentTokenEnd.invoke(scanner);
             int length = end - start + 1;
 
-            RGB colorRgb = mapJdtTokenToColor(token, tm);
+            RGB colorRgb = tokenColorMap.get(token);
             if (colorRgb != null) {
                 Color color = tm.getColor(colorRgb);
                 colorOwner.addDisposeListener(e -> color.dispose());
                 StyleRange sr = new StyleRange(start, length, color, null);
-                if (isJdtCommentToken(token)) {
+                if (commentTokens.contains(token)) {
                     sr.fontStyle = SWT.ITALIC;
                 }
                 styles.add(sr);
@@ -102,96 +118,61 @@ public class SyntaxHighlighter {
         return styles.toArray(new StyleRange[0]);
     }
 
-    @SuppressWarnings("deprecation")
-    private static RGB mapJdtTokenToColor(int token, ThemeManager tm) {
-        // Keywords
-        switch (token) {
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameabstract:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameassert:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamebreak:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamecase:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamecatch:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameclass:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamecontinue:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamedefault:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamedo:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameelse:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameenum:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameextends:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamefinal:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamefinally:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamefor:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameif:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameimplements:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameimport:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameinstanceof:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameinterface:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamenew:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamepackage:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameprivate:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameprotected:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamepublic:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamereturn:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamestatic:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamesuper:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameswitch:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamesynchronized:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamethis:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamethrow:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamethrows:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNametransient:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNametry:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamevolatile:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamewhile:
-                return tm.syntaxKeyword;
-
-            // Primitive types
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameboolean:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamebyte:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamechar:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamedouble:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamefloat:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameint:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamelong:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameshort:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamevoid:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamenull:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNametrue:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNamefalse:
-                return tm.syntaxType;
-
-            // Strings
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameStringLiteral:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCharacterLiteral:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameTextBlock:
-                return tm.syntaxString;
-
-            // Numbers
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameIntegerLiteral:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameLongLiteral:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameFloatingPointLiteral:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameDoubleLiteral:
-                return tm.syntaxNumber;
-
-            // Comments
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCOMMENT_LINE:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCOMMENT_BLOCK:
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCOMMENT_JAVADOC:
-                return tm.syntaxComment;
-
-            // Annotations (@Override, etc.)
-            case org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameAT:
-                return tm.syntaxAnnotation;
-
-            default:
-                return null;
+    private static int getStaticInt(Class<?> cls, String fieldName) {
+        try {
+            return cls.getField(fieldName).getInt(null);
+        } catch (Exception e) {
+            return -999;
         }
     }
 
-    private static boolean isJdtCommentToken(int token) {
-        return token == org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCOMMENT_LINE
-            || token == org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCOMMENT_BLOCK
-            || token == org.eclipse.jdt.core.compiler.ITerminalSymbols.TokenNameCOMMENT_JAVADOC;
+    private static Map<Integer, RGB> buildTokenColorMap(Class<?> termSymbols, ThemeManager tm) {
+        Map<Integer, RGB> map = new HashMap<>();
+        // Keywords
+        String[] keywords = {
+            "TokenNameabstract", "TokenNameassert", "TokenNamebreak", "TokenNamecase",
+            "TokenNamecatch", "TokenNameclass", "TokenNamecontinue", "TokenNamedefault",
+            "TokenNamedo", "TokenNameelse", "TokenNameenum", "TokenNameextends",
+            "TokenNamefinal", "TokenNamefinally", "TokenNamefor", "TokenNameif",
+            "TokenNameimplements", "TokenNameimport", "TokenNameinstanceof",
+            "TokenNameinterface", "TokenNamenew", "TokenNamepackage", "TokenNameprivate",
+            "TokenNameprotected", "TokenNamepublic", "TokenNamereturn", "TokenNamestatic",
+            "TokenNamesuper", "TokenNameswitch", "TokenNamesynchronized", "TokenNamethis",
+            "TokenNamethrow", "TokenNamethrows", "TokenNametransient", "TokenNametry",
+            "TokenNamevolatile", "TokenNamewhile"
+        };
+        for (String k : keywords) map.put(getStaticInt(termSymbols, k), tm.syntaxKeyword);
+        // Types
+        String[] types = {
+            "TokenNameboolean", "TokenNamebyte", "TokenNamechar", "TokenNamedouble",
+            "TokenNamefloat", "TokenNameint", "TokenNamelong", "TokenNameshort",
+            "TokenNamevoid", "TokenNamenull", "TokenNametrue", "TokenNamefalse"
+        };
+        for (String t : types) map.put(getStaticInt(termSymbols, t), tm.syntaxType);
+        // Strings
+        String[] strings = {"TokenNameStringLiteral", "TokenNameCharacterLiteral", "TokenNameTextBlock"};
+        for (String s : strings) map.put(getStaticInt(termSymbols, s), tm.syntaxString);
+        // Numbers
+        String[] numbers = {"TokenNameIntegerLiteral", "TokenNameLongLiteral",
+            "TokenNameFloatingPointLiteral", "TokenNameDoubleLiteral"};
+        for (String n : numbers) map.put(getStaticInt(termSymbols, n), tm.syntaxNumber);
+        // Comments
+        String[] comments = {"TokenNameCOMMENT_LINE", "TokenNameCOMMENT_BLOCK", "TokenNameCOMMENT_JAVADOC"};
+        for (String c : comments) map.put(getStaticInt(termSymbols, c), tm.syntaxComment);
+        // Annotations
+        map.put(getStaticInt(termSymbols, "TokenNameAT"), tm.syntaxAnnotation);
+        // Remove invalid entries
+        map.remove(-999);
+        return map;
+    }
+
+    private static Set<Integer> buildCommentTokenSet(Class<?> termSymbols) {
+        Set<Integer> set = new HashSet<>();
+        set.add(getStaticInt(termSymbols, "TokenNameCOMMENT_LINE"));
+        set.add(getStaticInt(termSymbols, "TokenNameCOMMENT_BLOCK"));
+        set.add(getStaticInt(termSymbols, "TokenNameCOMMENT_JAVADOC"));
+        set.remove(-999);
+        return set;
     }
 
     // ======================== Regex-based highlighting ========================

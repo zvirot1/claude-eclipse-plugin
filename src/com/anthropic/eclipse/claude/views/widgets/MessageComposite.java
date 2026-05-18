@@ -29,6 +29,9 @@ public class MessageComposite extends Composite {
     private final List<ToolCallComposite> toolCallWidgets = new ArrayList<>();
     private final List<CodeBlockComposite> codeBlockWidgets = new ArrayList<>();
     private boolean hasStreamedText = false; // true if any text was rendered during streaming
+    private boolean fullTextRendered = false; // true ONLY if renderExistingContent wrote the full segment text
+                                              // (used to skip late-arriving deltas in the race-condition case
+                                              // where the widget was created after the block was already complete)
     private boolean finalized = false; // prevent double finalization
 
     /** Callback for fork action from context menu. */
@@ -190,7 +193,10 @@ public class MessageComposite extends Composite {
                     ensureTextWidget();
                     currentTextWidget.appendText(textSeg.getText());
                     hasStreamedText = true; // Prevent finalizeContent() from re-adding this text
+                    fullTextRendered = true; // Block late streaming deltas from duplicating this content
                 }
+            } else if (seg instanceof MessageBlock.ImageSegment) {
+                addImageWidget((MessageBlock.ImageSegment) seg);
             } else if (seg instanceof MessageBlock.ToolCallSegment) {
                 addToolCallWidget((MessageBlock.ToolCallSegment) seg);
             }
@@ -202,9 +208,129 @@ public class MessageComposite extends Composite {
      */
     public void appendStreamingText(String delta) {
         if (isDisposed() || finalized) return;
+        // Race fix: if the MessageComposite was created AFTER the underlying
+        // MessageBlock was already complete, renderExistingContent() in the
+        // constructor already wrote the full text. Late-arriving streaming
+        // deltas (from buffered asyncExecs) would duplicate it. Skip them.
+        //
+        // IMPORTANT: only check the dedicated fullTextRendered flag — checking
+        // messageBlock.isComplete() would over-trigger and drop legitimate
+        // late deltas in the normal streaming case (content_block_stop fires
+        // before all queued asyncExecs are processed on a busy UI thread).
+        if (fullTextRendered) return;
         ensureTextWidget();
         currentTextWidget.appendText(delta);
         hasStreamedText = true;
+    }
+
+    /**
+     * Render an attached image inline as a thumbnail (max ~200px) under the
+     * current text. Click opens the full-size image in Eclipse's default
+     * image viewer (via a temp file).
+     */
+    public void addImageWidget(MessageBlock.ImageSegment imageSeg) {
+        if (isDisposed() || imageSeg.getBytes() == null) return;
+        // Close current text widget so the image renders below
+        if (currentTextWidget != null && !currentTextWidget.isFinalized()) {
+            finalizeAndExtractCodeBlocks(currentTextWidget);
+            currentTextWidget = null;
+        }
+        try {
+            org.eclipse.swt.graphics.ImageData full = new org.eclipse.swt.graphics.ImageData(
+                    new java.io.ByteArrayInputStream(imageSeg.getBytes()));
+            // Scale to max 200x200 keeping aspect ratio
+            int maxDim = 200;
+            int w = full.width, h = full.height;
+            if (w > maxDim || h > maxDim) {
+                if (w >= h) { h = (int) ((double) h * maxDim / w); w = maxDim; }
+                else        { w = (int) ((double) w * maxDim / h); h = maxDim; }
+            }
+            final org.eclipse.swt.graphics.Image thumb =
+                    new org.eclipse.swt.graphics.Image(getDisplay(), full.scaledTo(w, h));
+
+            org.eclipse.swt.widgets.Composite wrap = new org.eclipse.swt.widgets.Composite(contentArea, SWT.NONE);
+            GridLayout wl = new GridLayout(1, false);
+            wl.marginWidth = 0; wl.marginHeight = 4; wl.verticalSpacing = 2;
+            wrap.setLayout(wl);
+            wrap.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            wrap.setBackground(getBackground());
+
+            Label imgLabel = new Label(wrap, SWT.NONE);
+            imgLabel.setImage(thumb);
+            imgLabel.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            imgLabel.setToolTipText("Click to open " + imageSeg.getName() + " (" + full.width + "×" + full.height + ")");
+            imgLabel.setBackground(getBackground());
+            imgLabel.setCursor(getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+            imgLabel.addDisposeListener(e -> { if (!thumb.isDisposed()) thumb.dispose(); });
+            imgLabel.addListener(SWT.MouseDown, e -> openImageInExternalViewer(imageSeg));
+
+            Label nameLabel = new Label(wrap, SWT.NONE);
+            nameLabel.setText(imageSeg.getName() + "  (" + full.width + "×" + full.height + ")");
+            nameLabel.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            nameLabel.setBackground(getBackground());
+            org.eclipse.swt.graphics.Color fg = getForeground();
+            if (fg != null) nameLabel.setForeground(fg);
+
+            relayoutParent();
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logWarning(
+                    "[MessageComposite] Failed to render image '" + imageSeg.getName() + "': " + ex.getMessage());
+        }
+    }
+
+    private void openImageInExternalViewer(MessageBlock.ImageSegment imageSeg) {
+        java.nio.file.Path tmp = null;
+        try {
+            String safeName = imageSeg.getName().replaceAll("[^A-Za-z0-9._-]", "_");
+            if (!safeName.toLowerCase().endsWith(".png") && !safeName.toLowerCase().endsWith(".jpg")
+                    && !safeName.toLowerCase().endsWith(".jpeg") && !safeName.toLowerCase().endsWith(".gif")) {
+                safeName += ".png";
+            }
+            tmp = java.nio.file.Files.createTempFile("claude-img-", "-" + safeName);
+            java.nio.file.Files.write(tmp, imageSeg.getBytes());
+            String absPath = tmp.toAbsolutePath().toString();
+
+            // 1. Try SWT's Program.launch (preferred — uses OS file association)
+            boolean launched = org.eclipse.swt.program.Program.launch(absPath);
+            if (launched) {
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via Program.launch: " + absPath);
+                return;
+            }
+
+            // 2. Fallback: rundll32 url.dll on Windows (always works on Windows
+            //    even if no file association is registered for SWT)
+            String os = System.getProperty("os.name", "").toLowerCase();
+            if (os.contains("win")) {
+                new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", absPath)
+                        .inheritIO().start();
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via rundll32: " + absPath);
+                return;
+            }
+
+            // 3. Fallback: AWT Desktop (last resort, may fail in headless / SWT)
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(tmp.toFile());
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via Desktop: " + absPath);
+                return;
+            }
+
+            com.anthropic.eclipse.claude.Activator.logWarning(
+                    "[MessageComposite] No way to open image. Saved at: " + absPath);
+            // Show user where the file was saved so they can open manually
+            org.eclipse.jface.dialogs.MessageDialog.openInformation(getShell(),
+                    "Image saved",
+                    "Could not open the image automatically.\n\nThe image was saved at:\n" + absPath);
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logError(
+                    "[MessageComposite] Failed to open image: " + ex.getMessage(), ex);
+            String pathInfo = tmp != null ? "\n\nThe image was saved at:\n" + tmp.toAbsolutePath() : "";
+            org.eclipse.jface.dialogs.MessageDialog.openError(getShell(),
+                    "Could not open image",
+                    "Failed to open the image: " + ex.getMessage() + pathInfo);
+        }
     }
 
     /**

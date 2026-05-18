@@ -59,11 +59,19 @@ public class NdjsonProtocolHandler {
      * Write a raw NDJSON line to stdin.
      */
     public synchronized void writeRawNdjson(String jsonLine) {
+        long t0 = System.currentTimeMillis();
+        int bytesWritten = 0;
         try {
             byte[] bytes = (jsonLine + "\n").getBytes(StandardCharsets.UTF_8);
+            bytesWritten = bytes.length;
             stdin.write(bytes);
             stdin.flush();
+            Activator.logDiag("[DIAG-PERF] writeRawNdjson elapsed="
+                    + (System.currentTimeMillis() - t0) + "ms bytes=" + bytesWritten);
         } catch (IOException e) {
+            Activator.logDiag("[DIAG-PERF] writeRawNdjson elapsed="
+                    + (System.currentTimeMillis() - t0) + "ms bytes=" + bytesWritten
+                    + " err=" + e.getMessage());
             for (ICliMessageListener listener : listeners) {
                 listener.onConnectionError(e);
             }
@@ -172,7 +180,13 @@ public class NdjsonProtocolHandler {
 
         switch (type) {
             case "system":
-                return parseSystemInit(json);
+                {
+                    String subtype = JsonParser.getString(json, "subtype");
+                    if (subtype == null || "init".equals(subtype)) {
+                        return parseSystemInit(json);
+                    }
+                    return parseSystemNotification(json, jsonLine);
+                }
             case "assistant":
                 return parseAssistantMessage(json);
             case "user":
@@ -189,12 +203,15 @@ public class NdjsonProtocolHandler {
                 // New CLI format for permission prompts (can_use_tool subtype)
                 return parseControlRequest(json);
             case "rate_limit_event":
-                // Informational event about API rate limits — no action needed by the plugin
-                Activator.logInfo("[NDJSON] rate_limit_event: status="
-                    + JsonParser.getString(JsonParser.getMap(json, "rate_limit_info"), "status")
-                    + " overageStatus="
-                    + JsonParser.getString(JsonParser.getMap(json, "rate_limit_info"), "overageStatus"));
-                return null;
+                Map<String, Object> rlInfo = JsonParser.getMap(json, "rate_limit_info");
+                String rlStatus = JsonParser.getString(rlInfo, "status");
+                String rlOverage = JsonParser.getString(rlInfo, "overageStatus");
+                Activator.logInfo("[NDJSON] rate_limit_event: status=" + rlStatus
+                    + " overageStatus=" + rlOverage);
+                CliMessage.RateLimitEvent rlEvent = new CliMessage.RateLimitEvent();
+                rlEvent.setStatus(rlStatus);
+                rlEvent.setOverageStatus(rlOverage);
+                return rlEvent;
             case "tool_use_summary":
                 // Informational summary of a completed tool use — no action needed
                 return null;
@@ -208,6 +225,22 @@ public class NdjsonProtocolHandler {
                 }
                 return null;
         }
+    }
+
+    private CliMessage.SystemNotification parseSystemNotification(Map<String, Object> json, String rawLine) {
+        CliMessage.SystemNotification n = new CliMessage.SystemNotification();
+        n.setSubtype(JsonParser.getString(json, "subtype"));
+        n.setHookName(JsonParser.getString(json, "hook_name"));
+        n.setHookEvent(JsonParser.getString(json, "hook_event"));
+        n.setHookId(JsonParser.getString(json, "hook_id"));
+        n.setStdout(JsonParser.getString(json, "stdout"));
+        n.setStderr(JsonParser.getString(json, "stderr"));
+        Object ec = json.get("exit_code");
+        if (ec instanceof Number) n.setExitCode(((Number) ec).intValue());
+        n.setOutcome(JsonParser.getString(json, "outcome"));
+        n.setSessionId(JsonParser.getString(json, "session_id"));
+        n.setRawJson(rawLine.length() > 1000 ? rawLine.substring(0, 1000) : rawLine);
+        return n;
     }
 
     private CliMessage.SystemInit parseSystemInit(Map<String, Object> json) {

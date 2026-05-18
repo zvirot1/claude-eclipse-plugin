@@ -100,6 +100,14 @@ public class ThemeManager {
     // Attachment chip
     public final RGB chipBg;
 
+    // Floating popup (mode selector, autocomplete) — same palette for both
+    public final RGB popupBg;
+    public final RGB popupText;
+    public final RGB popupBorder;
+    public final RGB popupHoverBg;
+    public final RGB popupAccent;      // filled dot in effort slider, active highlight
+    public final RGB popupAccentDim;   // unselected dots in effort slider
+
     // ==================== Construction ====================
 
     private ThemeManager(Display display, boolean darkMode) {
@@ -151,6 +159,13 @@ public class ThemeManager {
 
             hintText = new RGB(120, 120, 125);
             chipBg = new RGB(50, 60, 80);
+
+            popupBg       = new RGB(42, 42, 48);
+            popupText     = new RGB(220, 220, 220);
+            popupBorder   = new RGB(70, 70, 76);
+            popupHoverBg  = new RGB(56, 56, 62);
+            popupAccent   = new RGB(220, 220, 220);
+            popupAccentDim = new RGB(100, 100, 108);
         } else {
             // ---- Light Theme ----
             viewBg = new RGB(246, 246, 246);
@@ -196,6 +211,13 @@ public class ThemeManager {
 
             hintText = new RGB(100, 100, 100);
             chipBg = new RGB(220, 235, 255);
+
+            popupBg       = new RGB(252, 252, 253);
+            popupText     = new RGB(30, 30, 30);
+            popupBorder   = new RGB(210, 210, 215);
+            popupHoverBg  = new RGB(238, 238, 242);
+            popupAccent   = new RGB(40, 40, 40);
+            popupAccentDim = new RGB(185, 185, 190);
         }
     }
 

@@ -1,7 +1,10 @@
 package com.anthropic.eclipse.claude.views;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -39,8 +42,9 @@ import org.eclipse.swt.dnd.Clipboard;
 import org.eclipse.swt.dnd.ImageTransfer;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.graphics.ImageData;
-import org.eclipse.swt.graphics.ImageLoader;
+import org.eclipse.swt.graphics.PaletteData;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.layout.RowLayout;
@@ -71,6 +75,7 @@ import com.anthropic.eclipse.claude.model.ConversationModel;
 import com.anthropic.eclipse.claude.model.IConversationListener;
 import com.anthropic.eclipse.claude.model.MessageBlock;
 import com.anthropic.eclipse.claude.model.SessionInfo;
+import com.anthropic.eclipse.claude.session.ClaudeSettingsReader;
 import com.anthropic.eclipse.claude.model.UsageInfo;
 import com.anthropic.eclipse.claude.preferences.PreferenceConstants;
 import com.anthropic.eclipse.claude.session.ClaudeSessionManager;
@@ -106,6 +111,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private CostStatusBar costBar;
     private Label connectionStatus;
     private Button sendButton;
+    private boolean sendButtonIsStop = false; // true when send button is showing stop icon
+    private volatile long diagSendTime = 0; // diagnostic: when last user message was sent
+    private long lastSendTimestamp = 0; // debounce: prevent double-send within 300ms
+    private Image sendIcon;   // blue circle with ↑ arrow
+    private Image stopIcon;   // red circle with ■ square
     private Button stopButton;
 
     // Thinking indicator (shown while waiting for Claude's first response token)
@@ -114,12 +124,22 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private org.eclipse.swt.widgets.Canvas thinkingDotsCanvas;
     private int thinkingAnimFrame = 0;
     private boolean extendedThinking = false;
+    // Set true after the CLI emits SystemInit. While false, the indicator and
+    // costBar show "Starting Claude CLI…" instead of "Claude is thinking…" —
+    // the cold start on corporate machines (AV scanning, slow node bootstrap,
+    // hook latency) can be 15-35 seconds and the user otherwise sees no
+    // distinction between "still booting" and "model is composing a reply".
+    private volatile boolean sessionReady = false;
+    private long thinkingStartedAt = 0L;
 
     // State
     private final Map<MessageBlock, MessageComposite> messageWidgetMap = new LinkedHashMap<>();
     // Direct toolId → ToolCallComposite map for reliable status updates
     private final Map<String, com.anthropic.eclipse.claude.views.widgets.ToolCallComposite> toolCallWidgetById = new java.util.concurrent.ConcurrentHashMap<>();
-    private MessageBlock welcomeBlock; // tracked so we can dismiss it on first real message
+    // Welcome screen shown in an empty conversation. Was a MessageBlock but is now
+    // a standalone Composite (icon + friendly text, VS Code style) — simpler and
+    // avoids rendering it as a message bubble.
+    private Composite welcomeComposite;
 
     // Streaming timeout: if Claude doesn't respond within this many ms, show a warning.
     // 120 seconds — the model often needs >1 min to think between inter-turn tool calls
@@ -140,6 +160,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     // Attachment state — managed by AttachmentManager (initialized after attachmentBar is created)
     private Composite attachmentBar;
+    // Active-file chip: shows the currently focused editor's file name; clicking toggles auto-attach
+    private Composite contextBar;
+    private Composite chipPill;          // the rounded pill that wraps the chip widgets
+    private Label    chipIconLabel;      // 📎 / 📌 icon
+    private Label    chipNameLabel;      // file name text
+    private Button   chipDismissButton;  // × button to unpin
+    private boolean  activeFilePinned = false;
+    /** File paths the user has explicitly dismissed via the chip's × button. */
+    private final java.util.Set<String> dismissedActiveFilePaths = new java.util.HashSet<>();
+    private org.eclipse.ui.IPartListener2 activeFilePartListener;
+    // Active-file pin content cache — refreshed in the background when the
+    // editor changes; read from cache (no file I/O) on every send. On a
+    // corporate machine with a network-mounted home dir, reading the file
+    // synchronously per send was stalling the UI thread for hundreds of ms.
+    private volatile String cachedActiveFilePath;
+    private volatile long   cachedActiveFileMtime;
+    private volatile String cachedActiveFileContent;
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -152,24 +189,97 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     // Selection indicator
     private Label selectionIndicatorLabel;
 
+    // Per-view permission mode & effort — NOT singletons. Each tab owns its own.
+    // Initialized from preferences / settings.json on view creation; changed
+    // via the inline mode popup or Shift+Tab. When changed while the CLI is
+    // running, the view hot-swaps the CLI via --resume so conversation memory
+    // is preserved.
+    private com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode currentMode;
+    private String currentEffort; // null = Auto (no --effort flag)
+    private Button modeButton;
+    private com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup activeModePopup;
+
+    // Eclipse memento — used to persist session ID across Eclipse restarts.
+    // Matches VS Code behaviour: each view is 1:1 with a session, and state is
+    // per-view (not global). If Eclipse successfully restored a memento for
+    // this view we auto-resume; otherwise we start fresh (exactly like VS Code
+    // which leaves restored panels empty and lets the user pick from the
+    // session list). No global fallback file, no time-based freshness window.
+    private org.eclipse.ui.IMemento savedMemento;
+    private static final String MEMENTO_SESSION_ID  = "claudeSessionId";
+    private static final String MEMENTO_TAB_TITLE   = "claudeTabTitle";
+    /**
+     * "Sticky" session id for this view — last id we KNOW belongs to this
+     * tab, regardless of whether {@code model.sessionInfo} is currently
+     * populated. Set on (a) successful CLI system-init, (b) start of a
+     * Resume operation. Persisted to the memento so a CLI resume failure
+     * on the next launch doesn't permanently lose the id.
+     */
+    private volatile String stickySessionId;
+
     // Slash command autocomplete
     private org.eclipse.swt.widgets.Shell autocompletePopup;
     private org.eclipse.swt.widgets.Table autocompleteTable;
 
     @Override
+    public void init(org.eclipse.ui.IViewSite site, org.eclipse.ui.IMemento memento) throws org.eclipse.ui.PartInitException {
+        super.init(site, memento);
+        this.savedMemento = memento; // may be null on first launch
+    }
+
+    @Override
+    public void saveState(org.eclipse.ui.IMemento memento) {
+        super.saveState(memento);
+        writeMementoState(memento);
+    }
+
+    /**
+     * Populate the given memento with this view's session state so Eclipse
+     * can restore it on the next launch. Each view saves its own memento —
+     * there is no global state. This matches VS Code's per-panel state model.
+     */
+    private void writeMementoState(org.eclipse.ui.IMemento memento) {
+        if (memento == null) return;
+        SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+        String sid = (info != null) ? info.getSessionId() : null;
+        // Fall back to the sticky id so a failed CLI resume on a previous
+        // launch doesn't erase the tab's session forever.
+        if (sid == null || sid.isEmpty()) sid = stickySessionId;
+        if (sid != null && !sid.isEmpty()) {
+            memento.putString(MEMENTO_SESSION_ID, sid);
+        }
+        String title = getPartName();
+        if (title != null && !title.equals("Claude Code")) {
+            memento.putString(MEMENTO_TAB_TITLE, title);
+        }
+    }
+
+    @Override
     public void createPartControl(Composite parent) {
-        // Get services
-        cliManager = Activator.getDefault().getCliManager();
+        // Get shared services
         editDecisionManager = Activator.getDefault().getEditDecisionManager();
         sessionManager = Activator.getDefault().getSessionManager();
+
+        // Each view owns its own dedicated CLI process — no cross-tab sharing.
+        cliManager = Activator.getDefault().createCliManager();
 
         model = new ConversationModel();
         model.addListener(this);
         cliManager.addMessageListener(model);
         cliManager.addStateListener(this);
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " INITIAL model=" + System.identityHashCode(model)
+                + " cli=" + System.identityHashCode(cliManager));
 
-        // Make the model accessible to other components (e.g. status bar)
+        // Make the model and CLI accessible to other components (e.g. status bar).
+        // Since each tab has its own CLI, the status bar reflects whichever tab is active.
         Activator.getDefault().setConversationModel(model);
+        Activator.getDefault().setActiveCliManager(cliManager);
+
+        // Initialize per-view permission mode + effort from preferences, falling back
+        // to ~/.claude/settings.json, then to defaults. These are PER-VIEW state —
+        // changing the mode in one tab does not affect other tabs.
+        initModeAndEffortFromPreferences();
 
         initColors(parent.getDisplay());
 
@@ -189,11 +299,80 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             ((GridData) costBar.getLayoutData()).exclude = true;
         }
 
-        // Auto-start CLI if available
+        // Auto-start CLI if available (may be overridden by auto-resume below)
         autoStartCli();
 
         // Track editor selection to show "N lines selected" indicator
         registerSelectionListener();
+
+        // Auto-resume from memento if Eclipse restored one for this specific view.
+        // This is the same semantics as VS Code's deserializeWebviewPanel: each
+        // view/panel owns its own state, so brand-new views (including "New
+        // Conversation Window" clicks) always start fresh because their memento
+        // is null. No global fallback file, no time-based freshness heuristic.
+        String resumeId = null;
+        String savedTitle = null;
+
+        if (savedMemento != null) {
+            resumeId = savedMemento.getString(MEMENTO_SESSION_ID);
+            savedTitle = savedMemento.getString(MEMENTO_TAB_TITLE);
+            savedMemento = null; // consumed
+        }
+        // Recovery: if a previous build saved title but lost the sessionId
+        // (e.g. CLI resume failed and the model was rebuilt empty), try to
+        // find a JSONL whose summary matches the saved title.
+        //
+        // listSessionsFast() returns sessions newest-first. The full sweep
+        // calls fillSessionDetails() on every JSONL — on a corporate box
+        // with hundreds of sessions across many projects this blocks tab
+        // restoration for many seconds. Cap at the most-recent N sessions:
+        // a recovered tab is almost always for something the user worked
+        // on within the last few days, so further-back sessions are not
+        // worth the I/O.
+        if ((resumeId == null || resumeId.isEmpty())
+                && savedTitle != null && !savedTitle.isEmpty()) {
+            long recoveryT0 = System.currentTimeMillis();
+            int scanned = 0;
+            try {
+                String norm = savedTitle.trim();
+                if (norm.endsWith("…")) norm = norm.substring(0, norm.length() - 1).trim();
+                java.util.List<com.anthropic.eclipse.claude.model.SessionInfo> all =
+                        com.anthropic.eclipse.claude.session.JsonlSessionScanner.listSessionsFast(null);
+                final int MAX_RECOVERY_SCAN = 15;
+                for (com.anthropic.eclipse.claude.model.SessionInfo s : all) {
+                    if (scanned++ >= MAX_RECOVERY_SCAN) break;
+                    com.anthropic.eclipse.claude.session.JsonlSessionScanner.fillSessionDetails(s);
+                    String sum = s.getSummary();
+                    if (sum == null) continue;
+                    String snorm = sum.trim();
+                    if (snorm.endsWith("...")) snorm = snorm.substring(0, snorm.length() - 3).trim();
+                    if (snorm.startsWith(norm) || norm.startsWith(snorm)) {
+                        resumeId = s.getSessionId();
+                        Activator.logWarning("[Resume] recovered sessionId=" + resumeId
+                                + " from title match");
+                        break;
+                    }
+                }
+            } catch (Exception ignored) {}
+            Activator.logDiag("[DIAG-PERF] titleRecovery elapsed="
+                    + (System.currentTimeMillis() - recoveryT0) + "ms"
+                    + " scanned=" + scanned
+                    + " hit=" + (resumeId != null && !resumeId.isEmpty()));
+        }
+        Activator.logWarning("[Resume] memento resumeId="
+                + (resumeId == null ? "<null>" : resumeId)
+                + " title=" + (savedTitle == null ? "<null>" : savedTitle));
+
+        if (savedTitle != null && !savedTitle.isEmpty()) {
+            setPartName(savedTitle);
+            partNameSet = true;
+        }
+
+        if (resumeId != null && !resumeId.isEmpty()) {
+            // Defer resume so the UI is fully built first
+            final String finalResumeId = resumeId;
+            Display.getDefault().asyncExec(() -> resumeSession(finalResumeId));
+        }
     }
 
     // ==================== UI Creation ====================
@@ -206,6 +385,68 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         connectedColor = tm.getColor(tm.connectedColor);
         disconnectedColor = tm.getColor(tm.disconnectedColor);
         errorColor = tm.getColor(tm.errorColor);
+    }
+
+    /**
+     * Create a 16x16 send icon: white ↑ arrow on a round blue background.
+     */
+    private Image createSendIcon(Display display) {
+        int s = 20;
+        PaletteData pal = new PaletteData(0xFF0000, 0x00FF00, 0x0000FF);
+        ImageData d = new ImageData(s, s, 24, pal);
+        d.alphaData = new byte[s * s];
+        double r = s / 2.0;
+        int blue = (59 << 16) | (130 << 8) | 246;
+        for (int y = 0; y < s; y++) {
+            for (int x = 0; x < s; x++) {
+                double dx = x - r + 0.5, dy = y - r + 0.5;
+                double dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist <= r) {
+                    d.setPixel(x, y, blue);
+                    d.alphaData[y * s + x] = (byte) 255;
+                }
+            }
+        }
+        // White arrow: vertical shaft + chevron head
+        int cx = s / 2;
+        for (int t = -1; t <= 0; t++) { // 2px wide shaft
+            for (int y = 4; y <= 15; y++) setPixelIfInCircle(d, cx + t, y, s, 0xFFFFFF);
+        }
+        for (int i = 1; i <= 5; i++) { // chevron arms
+            setPixelIfInCircle(d, cx - 1 - i, 4 + i, s, 0xFFFFFF);
+            setPixelIfInCircle(d, cx + i, 4 + i, s, 0xFFFFFF);
+            setPixelIfInCircle(d, cx - 2 - i, 4 + i, s, 0xFFFFFF);
+            setPixelIfInCircle(d, cx + 1 + i, 4 + i, s, 0xFFFFFF);
+        }
+        return new Image(display, d);
+    }
+
+    private Image createStopIcon(Display display) {
+        int s = 20;
+        PaletteData pal = new PaletteData(0xFF0000, 0x00FF00, 0x0000FF);
+        ImageData d = new ImageData(s, s, 24, pal);
+        d.alphaData = new byte[s * s];
+        double r = s / 2.0;
+        int red = (239 << 16) | (68 << 8) | 68;
+        for (int y = 0; y < s; y++) {
+            for (int x = 0; x < s; x++) {
+                double dx = x - r + 0.5, dy = y - r + 0.5;
+                double dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist <= r) {
+                    // White square in center (6,6)-(13,13)
+                    d.setPixel(x, y, (x >= 6 && x <= 13 && y >= 6 && y <= 13) ? 0xFFFFFF : red);
+                    d.alphaData[y * s + x] = (byte) 255;
+                }
+            }
+        }
+        return new Image(display, d);
+    }
+
+    private void setPixelIfInCircle(ImageData d, int x, int y, int s, int color) {
+        if (x >= 0 && x < s && y >= 0 && y < s) {
+            double r = s / 2.0, dx = x - r + 0.5, dy = y - r + 0.5;
+            if (Math.sqrt(dx * dx + dy * dy) <= r) d.setPixel(x, y, color);
+        }
     }
 
     private void createActionBar(Composite parent) {
@@ -249,19 +490,16 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         Button resumeBtn = new Button(toolbar, SWT.PUSH | SWT.FLAT);
         resumeBtn.setText("\u21BA");
-        setTooltip(resumeBtn, "Resume session");
-        resumeBtn.addListener(SWT.Selection, e -> showResumeDialog());
+        setTooltip(resumeBtn, "Resume session (browse history with preview)");
+        // Open the full history dialog (table + preview) instead of the old
+        // plain-list resume dialog — same data source, richer UI.
+        resumeBtn.addListener(SWT.Selection, e -> showHistoryDialog());
 
         stopButton = new Button(toolbar, SWT.PUSH | SWT.FLAT);
         stopButton.setText("\u25A0");
         setTooltip(stopButton, "Stop current query");
         stopButton.setEnabled(false);
-        stopButton.addListener(SWT.Selection, e -> {
-            renderingSuppressed = true;  // Block ALL further UI updates immediately
-            cancelStreamingTimeout();
-            cliManager.interruptCurrentQuery();
-            stopButton.setEnabled(false);
-        });
+        stopButton.addListener(SWT.Selection, e -> handleStop());
 
         Button clearBtn = new Button(toolbar, SWT.PUSH | SWT.FLAT);
         clearBtn.setText("\u2715");
@@ -279,14 +517,160 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         newWindowBtn.addListener(SWT.Selection, e -> openNewConversationWindow());
     }
 
-    /** Open a new independent Claude Code conversation window (tab). */
+    /**
+     * Open a new independent Claude Code conversation as a sibling tab in the
+     * same part stack as this view. {@code page.showView} alone creates the
+     * view wherever the perspective originally placed Claude Code — if the
+     * user has dragged the current view to a different folder, new instances
+     * land in the default (often bottom) pane instead of next to us. After
+     * showing the view we reach into the E4 model and relocate the new MPart
+     * to sit next to our own MPart.
+     */
     private void openNewConversationWindow() {
         try {
             String secondaryId = String.valueOf(System.currentTimeMillis());
-            getSite().getPage().showView(ClaudeConversationView.ID, secondaryId,
-                    org.eclipse.ui.IWorkbenchPage.VIEW_ACTIVATE);
+            IWorkbenchPage page = getSite().getPage();
+            org.eclipse.ui.IViewPart newView = page.showView(
+                    ClaudeConversationView.ID, secondaryId, IWorkbenchPage.VIEW_ACTIVATE);
+
+            // Move the freshly-opened view into our own stack (best effort —
+            // any error leaves the view where Eclipse placed it). The E4
+            // compat layer may not have wired the MPlaceholder of the new
+            // view into the model yet, so we retry up to 5 times with a
+            // 100ms backoff before giving up. asyncExec alone (the old
+            // behaviour) was racing the model wiring on slower machines —
+            // the new view would land in the default (bottom) folder and
+            // stay there.
+            tryRelocateWithRetry(newView, 0);
         } catch (Exception ex) {
             Activator.logError("Could not open new conversation window", ex);
+        }
+    }
+
+    private void tryRelocateWithRetry(org.eclipse.ui.IViewPart newView, int attempt) {
+        if (newView == null || attempt >= 5) return;
+        Display.getDefault().timerExec(attempt == 0 ? 0 : 100, () -> {
+            if (relocateToOwnStack(newView)) return;
+            // Not yet ready (placeholder not in model, or services unavailable).
+            tryRelocateWithRetry(newView, attempt + 1);
+        });
+    }
+
+    /**
+     * Move the given new view so it becomes a sibling tab of this view.
+     *
+     * <p>E4 subtlety: a 3.x {@code IViewPart} shown via {@code page.showView}
+     * is stored as a <em>shared</em> {@code MPart} in the top-level window,
+     * and its visual presence inside a perspective is represented by an
+     * {@code MPlaceholder}. {@code thisPart.getParent()} therefore returns
+     * the shared-elements container, not the {@code MPartStack} that holds
+     * the tab. We have to look up the {@code MPlaceholder} via
+     * {@link EModelService#findPlaceholderFor} and move the <em>placeholder</em>
+     * — not the MPart — into our own stack.</p>
+     */
+    /**
+     * @return {@code true} when the relocation either succeeded or failed in a
+     *         way that retrying won't help (e.g. missing services). Returns
+     *         {@code false} when the E4 model isn't ready yet (the placeholder
+     *         of the new view hasn't been wired in) and the caller should retry.
+     */
+    private boolean relocateToOwnStack(org.eclipse.ui.IViewPart newView) {
+        if (newView == null) return true;
+        try {
+            org.eclipse.e4.ui.model.application.ui.basic.MPart thisPart =
+                    getSite().getService(org.eclipse.e4.ui.model.application.ui.basic.MPart.class);
+            org.eclipse.e4.ui.model.application.ui.basic.MPart newPart =
+                    newView.getSite().getService(
+                            org.eclipse.e4.ui.model.application.ui.basic.MPart.class);
+            org.eclipse.e4.ui.workbench.modeling.EModelService modelService =
+                    getSite().getService(org.eclipse.e4.ui.workbench.modeling.EModelService.class);
+            org.eclipse.e4.ui.workbench.modeling.EPartService partService =
+                    getSite().getService(org.eclipse.e4.ui.workbench.modeling.EPartService.class);
+
+            if (thisPart == null || newPart == null
+                    || modelService == null || partService == null) {
+                Activator.logWarning("[relocate] missing service — thisPart="
+                        + thisPart + " newPart=" + newPart
+                        + " modelSvc=" + modelService + " partSvc=" + partService);
+                return true; // services unavailable — no point retrying
+            }
+            if (newPart == thisPart) return true;
+
+            org.eclipse.e4.ui.model.application.ui.basic.MWindow window =
+                    modelService.getTopLevelWindowFor(thisPart);
+            if (window == null) {
+                Activator.logWarning("[relocate] no top-level window");
+                return true;
+            }
+
+            // Find placeholders in the active perspective.
+            org.eclipse.e4.ui.model.application.ui.advanced.MPlaceholder thisPh =
+                    modelService.findPlaceholderFor(window, thisPart);
+            org.eclipse.e4.ui.model.application.ui.advanced.MPlaceholder newPh =
+                    modelService.findPlaceholderFor(window, newPart);
+
+            // The element that actually sits inside an MPartStack is either
+            // the placeholder (for shared parts) or the MPart itself (for
+            // per-perspective parts). Fall back to the MPart if no placeholder.
+            org.eclipse.e4.ui.model.application.ui.MUIElement thisAnchor =
+                    (thisPh != null) ? thisPh : thisPart;
+            org.eclipse.e4.ui.model.application.ui.MUIElement newAnchor =
+                    (newPh != null) ? newPh : newPart;
+
+            // If the new view isn't attached anywhere yet, the E4 compat layer
+            // is still wiring it — ask caller to retry.
+            if (newAnchor.getParent() == null) {
+                Activator.logDiag("[relocate] newAnchor not yet attached — retry");
+                return false;
+            }
+
+            // Walk up from thisAnchor to find the enclosing MPartStack.
+            org.eclipse.e4.ui.model.application.ui.MUIElement cursor = thisAnchor.getParent();
+            org.eclipse.e4.ui.model.application.ui.basic.MPartStack targetStack = null;
+            while (cursor != null) {
+                if (cursor instanceof org.eclipse.e4.ui.model.application.ui.basic.MPartStack) {
+                    targetStack = (org.eclipse.e4.ui.model.application.ui.basic.MPartStack) cursor;
+                    break;
+                }
+                cursor = cursor.getParent();
+            }
+
+            Activator.logDiag("[relocate] thisAnchor.parent=" + thisAnchor.getParent()
+                    + " targetStack=" + targetStack
+                    + " newAnchor.parent=" + newAnchor.getParent());
+
+            if (targetStack == null) {
+                Activator.logDiag("[relocate] no enclosing MPartStack — retry");
+                return false; // our own anchor may also be mid-wiring
+            }
+            if ((Object) newAnchor.getParent() == (Object) targetStack) {
+                Activator.logDiag("[relocate] already in target stack");
+                return true;
+            }
+
+            // Detach from current container, attach to our stack.
+            org.eclipse.e4.ui.model.application.ui.MElementContainer<?> oldParent = newAnchor.getParent();
+            if (oldParent != null) {
+                @SuppressWarnings({ "unchecked", "rawtypes" })
+                java.util.List children = oldParent.getChildren();
+                children.remove(newAnchor);
+            }
+            // Both MPart and MPlaceholder implement MStackElement, which is
+            // what MPartStack.getChildren() / setSelectedElement expects.
+            // Raw-list append avoids the generic-arg check.
+            @SuppressWarnings({ "unchecked", "rawtypes" })
+            java.util.List stackChildren = targetStack.getChildren();
+            stackChildren.add(newAnchor);
+            targetStack.setSelectedElement(
+                    (org.eclipse.e4.ui.model.application.ui.basic.MStackElement) newAnchor);
+            partService.activate(newPart);
+            Activator.logDiag("[relocate] moved newAnchor into target stack (success)");
+            return true;
+        } catch (Throwable t) {
+            // Soft-fail: the view is still usable, just in the wrong folder
+            Activator.logWarning(
+                    "Could not relocate new conversation to same stack: " + t);
+            return true;
         }
     }
 
@@ -351,6 +735,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         new MenuItem(menu, SWT.SEPARATOR);
 
+        MenuItem renameItem = new MenuItem(menu, SWT.PUSH);
+        renameItem.setText("Rename Tab...");
+        renameItem.addListener(SWT.Selection, e -> renameTab());
+
         MenuItem historyItem = new MenuItem(menu, SWT.PUSH);
         historyItem.setText("Session History  (/history)");
         historyItem.addListener(SWT.Selection, e -> showHistoryDialog());
@@ -360,6 +748,25 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             anchor.getLocation().y + anchor.getSize().y);
         menu.setLocation(loc);
         menu.setVisible(true);
+    }
+
+    /**
+     * Show an input dialog to rename the current tab.
+     */
+    private void renameTab() {
+        org.eclipse.jface.dialogs.InputDialog dlg = new org.eclipse.jface.dialogs.InputDialog(
+            getViewSite().getShell(),
+            "Rename Tab",
+            "Enter a new name for this conversation tab:",
+            getPartName(),
+            null);
+        if (dlg.open() == org.eclipse.jface.window.Window.OK) {
+            String newName = dlg.getValue().trim();
+            if (!newName.isEmpty()) {
+                setPartName(newName);
+                partNameSet = true;
+            }
+        }
     }
 
     private void createMessageArea(Composite parent) {
@@ -413,6 +820,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         inputContainer.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
         inputContainer.setBackground(viewBgColor);
 
+        // (Active-file chip moved below — it now lives INSIDE the input frame
+        // for Amazon-Q-style parity. See contextBar creation after inputBox.)
+
         // Attachment chips bar - shown only when files/images are attached
         attachmentBar = new Composite(inputContainer, SWT.NONE);
         RowLayout rowLayout = new RowLayout(SWT.HORIZONTAL);
@@ -438,6 +848,74 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         inputBox.setLayoutData(new GridData(SWT.FILL, SWT.BOTTOM, true, false));
         inputBox.setBackground(inputBgColor);
 
+        // Row 0: Active-file chip — IntelliJ/Q-style pill INSIDE the input frame.
+        // Container "contextBar" hosts the rounded "chipPill" composite.
+        contextBar = new Composite(inputBox, SWT.NONE);
+        RowLayout cbLayout = new RowLayout(SWT.HORIZONTAL);
+        cbLayout.wrap = true;
+        cbLayout.spacing = 4;
+        cbLayout.marginWidth = 0;
+        cbLayout.marginHeight = 0;
+        contextBar.setLayout(cbLayout);
+        GridData cbGd = new GridData(SWT.FILL, SWT.CENTER, true, false);
+        contextBar.setLayoutData(cbGd);
+        contextBar.setBackground(inputBgColor);
+
+        // The chip pill: bordered Composite with [📎 / 📌] [name] [×]
+        chipPill = new Composite(contextBar, SWT.BORDER);
+        GridLayout pillLayout = new GridLayout(3, false);
+        pillLayout.marginWidth = 4;
+        pillLayout.marginHeight = 1;
+        pillLayout.horizontalSpacing = 4;
+        chipPill.setLayout(pillLayout);
+        chipPill.setBackground(inputBgColor);
+        chipPill.setToolTipText("Active editor file. Click the icon or name to pin/unpin.\n"
+                + "× removes the pin. Updates when you switch editors.");
+
+        chipIconLabel = new Label(chipPill, SWT.NONE);
+        chipIconLabel.setText("📎"); // 📎 paperclip
+        chipIconLabel.setBackground(inputBgColor);
+        chipIconLabel.setCursor(parent.getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+
+        chipNameLabel = new Label(chipPill, SWT.NONE);
+        chipNameLabel.setText("");
+        chipNameLabel.setBackground(inputBgColor);
+        chipNameLabel.setCursor(parent.getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+
+        chipDismissButton = new Button(chipPill, SWT.PUSH | SWT.FLAT);
+        chipDismissButton.setText("×"); // ×
+        chipDismissButton.setBackground(inputBgColor);
+        chipDismissButton.setToolTipText("Unpin this file");
+
+        // Click on icon or name → re-pin (clear dismissal for this path)
+        org.eclipse.swt.widgets.Listener togglePin = e -> {
+            String currentPath = getActiveFilePathOrNull();
+            if (currentPath != null && dismissedActiveFilePaths.contains(currentPath)) {
+                dismissedActiveFilePaths.remove(currentPath); // re-pin
+            } else if (currentPath != null) {
+                dismissedActiveFilePaths.add(currentPath); // toggle off
+            }
+            updateActiveFileChipLabel();
+        };
+        chipIconLabel.addListener(SWT.MouseDown, togglePin);
+        chipNameLabel.addListener(SWT.MouseDown, togglePin);
+        // × dismisses for current path (per-file memory)
+        chipDismissButton.addListener(SWT.Selection, e -> {
+            String currentPath = getActiveFilePathOrNull();
+            if (currentPath != null) {
+                dismissedActiveFilePaths.add(currentPath);
+            }
+            updateActiveFileChipLabel();
+        });
+
+        // Initial state from preference + listen to active editor changes
+        try {
+            activeFilePinned = Activator.getDefault().getPreferenceStore()
+                    .getBoolean(PreferenceConstants.ATTACH_ACTIVE_FILE);
+        } catch (Exception ignored) {}
+        installActiveEditorListener();
+        updateActiveFileChipLabel();
+
         // Row 1: Text input area (full width)
         inputField = new Text(inputBox, SWT.MULTI | SWT.WRAP | SWT.V_SCROLL);
         GridData inputGd = new GridData(SWT.FILL, SWT.FILL, true, false);
@@ -454,9 +932,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         attachmentManager = new AttachmentManager(attachmentBar, parent.getShell(),
             inputField, msg -> showError(msg));
 
-        // Row 2: Button bar inside input box [📎 attach] [/ commands] --- spacer --- [↑ send]
+        // Row 2: Button bar inside input box
+        // [📎 attach] [/ commands] --- spacer --- [✋ Ask before edits ▾] [↑ send]
         Composite buttonBar = new Composite(inputBox, SWT.NONE);
-        GridLayout bbLayout = new GridLayout(4, false);
+        GridLayout bbLayout = new GridLayout(5, false);
         bbLayout.marginWidth = 0;
         bbLayout.marginHeight = 0;
         bbLayout.horizontalSpacing = 4;
@@ -464,9 +943,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         buttonBar.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         buttonBar.setBackground(inputBgColor);
 
-        // Attach button
+        // Attach button \u2014 IntelliJ-style paperclip image (icons/paperclip.png)
         Button attachBtn = new Button(buttonBar, SWT.FLAT);
-        attachBtn.setText("\uD83D\uDCCE");
+        try {
+            org.osgi.framework.Bundle bundle = org.eclipse.core.runtime.FileLocator.class
+                    .cast(null) != null ? null : null; // dummy ref to satisfy compiler
+            java.net.URL url = Activator.getDefault().getBundle().getResource("icons/paperclip.png");
+            if (url != null) {
+                org.eclipse.swt.graphics.Image clip = org.eclipse.jface.resource.ImageDescriptor
+                        .createFromURL(url).createImage();
+                attachBtn.setImage(clip);
+                attachBtn.addDisposeListener(e -> { if (!clip.isDisposed()) clip.dispose(); });
+            } else {
+                attachBtn.setText("\uD83D\uDCCE");
+            }
+        } catch (Throwable t) {
+            attachBtn.setText("\uD83D\uDCCE");
+        }
         attachBtn.setToolTipText("Add file or image to context (Ctrl+@)");
         attachBtn.addListener(SWT.Selection, e -> showAttachMenu(attachBtn));
 
@@ -486,13 +979,32 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         spacer.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         spacer.setBackground(inputBgColor);
 
-        // Send button (arrow up in colored circle, like VS Code)
-        sendButton = new Button(buttonBar, SWT.PUSH);
-        sendButton.setText("\u2191");  // ↑ arrow
-        sendButton.setToolTipText("Send message (Enter)");
-        sendButton.addListener(SWT.Selection, e -> handleInput());
+        // Mode button — shows current permission mode, opens ModeSelectorPopup
+        // (this is the VS Code-style inline selector; it also hosts the Effort slider).
+        modeButton = new Button(buttonBar, SWT.FLAT);
+        modeButton.setToolTipText("Permission mode (Shift+Tab to cycle)");
+        modeButton.addListener(SWT.Selection, e -> openModePopup());
+        refreshModeButton();
 
-        // Context info line below input (permission mode + active file)
+        // Send button — toggles between send (↑) and stop (■) like VS Code
+        Display display = buttonBar.getDisplay();
+        sendIcon = createSendIcon(display);
+        stopIcon = createStopIcon(display);
+        sendButton = new Button(buttonBar, SWT.PUSH);
+        sendButton.setImage(sendIcon);
+        sendButton.setToolTipText("Send message (Enter)");
+        sendButton.addListener(SWT.Selection, e -> {
+            if (sendButtonIsStop) {
+                handleStop();
+            } else {
+                handleInput();
+            }
+        });
+
+        // Context info line below input (selection + active file + shortcut hint).
+        // Note: permission mode used to live here as a passive label. It moved to the
+        // interactive mode button in the input button bar (VS Code style), so the
+        // context line no longer displays it.
         Composite contextLine = new Composite(inputContainer, SWT.NONE);
         GridLayout clLayout = new GridLayout(3, false);
         clLayout.marginWidth = 2;
@@ -505,14 +1017,6 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ThemeManager tmCtx = ThemeManager.getInstance();
         Color hintColor = tmCtx.getColor(tmCtx.hintText);
         Font hintFont = new Font(parent.getDisplay(), tmCtx.getUIFontName(), 9, SWT.NORMAL);
-
-        Label permLabel = new Label(contextLine, SWT.NONE);
-        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
-        String perm = prefs.getString(PreferenceConstants.PERMISSION_MODE);
-        permLabel.setText("\uD83D\uDD12 " + (perm != null && !perm.isBlank() ? perm : "acceptEdits"));
-        permLabel.setForeground(hintColor);
-        permLabel.setBackground(viewBgColor);
-        permLabel.setFont(hintFont);
 
         // Selection indicator — shows "N lines selected" when editor has a text selection
         selectionIndicatorLabel = new Label(contextLine, SWT.NONE);
@@ -540,6 +1044,18 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         shortcutLabel.setFont(hintFont);
 
         contextLine.addDisposeListener(e -> { hintColor.dispose(); hintFont.dispose(); });
+
+        // Shift+Tab cycles through permission modes (Ask → Edit auto → Plan → wrap).
+        // We use a TraverseListener with TAB_PREVIOUS because SWT treats Shift+Tab
+        // as a traversal event on Text widgets — plain KeyDown wouldn't fire.
+        inputField.addListener(SWT.Traverse, e -> {
+            if (e.detail == SWT.TRAVERSE_TAB_PREVIOUS
+                    && (e.stateMask & SWT.SHIFT) != 0) {
+                e.doit = false;
+                cycleMode();
+            }
+        });
+
         inputField.addListener(SWT.KeyDown, e -> {
             if (e.keyCode == SWT.CR || e.keyCode == SWT.LF || e.keyCode == SWT.KEYPAD_CR) {
                 boolean enterToSend = Activator.getDefault().getPreferenceStore()
@@ -615,7 +1131,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                         e2.doit = false;
                     }
                 } else if (e2.keyCode == SWT.ESC) {
-                    dismissAutocomplete();
+                    if (autocompletePopup != null && !autocompletePopup.isDisposed()
+                            && autocompletePopup.isVisible()) {
+                        dismissAutocomplete();
+                    } else if (sendButtonIsStop) {
+                        // Escape stops the current query (like VS Code)
+                        handleStop();
+                    }
                     e2.doit = false;
                 }
             }
@@ -660,6 +1182,36 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                                 } finally {
                                     cb.dispose();
                                 }
+                            }
+                            // [DIAG] Log every focus / IME-related Windows message so we can
+                            // see in the Eclipse log exactly what is causing the Hebrew
+                            // keyboard to revert to English on the corporate machine.
+                            if (msg == 0x0008 /* WM_KILLFOCUS */) {
+                                long newFocusHwnd = wParam; // hwnd that is gaining focus
+                                long curHkl = 0;
+                                try { curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0); } catch (Throwable ignored) {}
+                                Activator.logDiag("[DIAG-KBD] WM_KILLFOCUS gainedBy=0x"
+                                        + Long.toHexString(newFocusHwnd)
+                                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                                        + " pendingRestoreHkl=0x" + Long.toHexString(self.pendingRestoreHkl)
+                                        + " blockLang=" + self.blockLanguageChange);
+                            } else if (msg == 0x0007 /* WM_SETFOCUS */) {
+                                long lostFocusHwnd = wParam; // hwnd that is losing focus
+                                long curHkl = 0;
+                                try { curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0); } catch (Throwable ignored) {}
+                                Activator.logDiag("[DIAG-KBD] WM_SETFOCUS lostBy=0x"
+                                        + Long.toHexString(lostFocusHwnd)
+                                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                                        + " pendingRestoreHkl=0x" + Long.toHexString(self.pendingRestoreHkl));
+                            } else if (msg == 0x0050 /* WM_INPUTLANGCHANGEREQUEST */) {
+                                Activator.logDiag("[DIAG-KBD] WM_INPUTLANGCHANGEREQUEST wParam=0x"
+                                        + Long.toHexString(wParam)
+                                        + " lParam=0x" + Long.toHexString(lParam)
+                                        + " blockLang=" + self.blockLanguageChange);
+                            } else if (msg == 0x0051 /* WM_INPUTLANGCHANGE */) {
+                                Activator.logDiag("[DIAG-KBD] WM_INPUTLANGCHANGE wParam=0x"
+                                        + Long.toHexString(wParam)
+                                        + " newHkl=0x" + Long.toHexString(lParam));
                             }
                             // Block keyboard language changes during send operation
                             if (msg == 0x0050 /* WM_INPUTLANGCHANGEREQUEST */ && self.blockLanguageChange) {
@@ -719,6 +1271,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // keyboard layout. We keep restoring on every FocusIn until the user starts typing.
         if (SWT.getPlatform().equals("win32")) {
             inputField.addListener(SWT.FocusIn, e -> {
+                long curHkl = 0;
+                try { curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0); } catch (Throwable ignored) {}
+                Activator.logDiag("[DIAG-KBD] SWT.FocusIn inputField"
+                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                        + " pendingRestoreHkl=0x" + Long.toHexString(pendingRestoreHkl));
                 if (pendingRestoreHkl != 0) {
                     try {
                         org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(pendingRestoreHkl, 0);
@@ -737,13 +1294,223 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         // Dismiss autocomplete when input loses focus
         inputField.addListener(SWT.FocusOut, e -> {
+            if (SWT.getPlatform().equals("win32")) {
+                long curHkl = 0;
+                long fgHwnd = 0;
+                long focHwnd = 0;
+                try {
+                    curHkl = org.eclipse.swt.internal.win32.OS.GetKeyboardLayout(0);
+                    fgHwnd = org.eclipse.swt.internal.win32.OS.GetForegroundWindow();
+                    focHwnd = org.eclipse.swt.internal.win32.OS.GetFocus();
+                } catch (Throwable ignored) {}
+                Activator.logDiag("[DIAG-KBD] SWT.FocusOut inputField"
+                        + " currentHkl=0x" + Long.toHexString(curHkl)
+                        + " foregroundHwnd=0x" + Long.toHexString(fgHwnd)
+                        + " focusHwnd=0x" + Long.toHexString(focHwnd));
+            }
             Display.getDefault().timerExec(200, () -> dismissAutocomplete());
         });
+    }
+
+    // ==================== Send/Stop Button Toggle ====================
+
+    /**
+     * Switch the send button to "stop" mode (■) — shown while streaming.
+     */
+    private void setSendButtonToStop() {
+        if (sendButton == null || sendButton.isDisposed()) return;
+        sendButtonIsStop = true;
+        sendButton.setImage(stopIcon);
+        sendButton.setToolTipText("Stop current query (Escape)");
+        sendButton.getParent().layout(true, true);
+    }
+
+    /**
+     * Switch the send button back to "send" mode (↑) — shown when idle.
+     */
+    private void setSendButtonToSend() {
+        if (sendButton == null || sendButton.isDisposed()) return;
+        sendButtonIsStop = false;
+        sendButton.setImage(sendIcon);
+        sendButton.setToolTipText("Send message (Enter)");
+        sendButton.getParent().layout(true, true);
+    }
+
+    /**
+     * Handle stop action — triggered by send button in stop mode, toolbar stop button, or /stop command.
+     * Passes the current session ID so the CLI restarts with --resume, preserving conversation memory.
+     */
+    private void handleStop() {
+        Activator.logDiag("[DIAG-FLAG] renderingSuppressed: false -> TRUE (handleStop)");
+        renderingSuppressed = true;  // Block ALL further UI updates immediately
+        cancelStreamingTimeout();
+
+        // Get the current session ID so the CLI can resume with conversation memory intact
+        String sessionId = null;
+        SessionInfo info = model.getSessionInfo();
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            sessionId = info.getSessionId();
+        }
+        cliManager.interruptCurrentQuery(sessionId);
+
+        stopButton.setEnabled(false);
+        setSendButtonToSend();
+        hideThinkingIndicator();
+        costBar.setStatus("Interrupted");
+    }
+
+    // ==================== Permission Mode & Effort (per-view) ====================
+
+    /**
+     * Initialize {@code currentMode} and {@code currentEffort} for this view.
+     * Priority: Eclipse preference > {@code ~/.claude/settings.json} > defaults.
+     * Must run before {@code createInputArea} so the mode button shows the right label.
+     */
+    private void initModeAndEffortFromPreferences() {
+        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+        ClaudeSettingsReader reader = Activator.getDefault().getSettingsReader();
+
+        // --- Permission mode ---
+        String pref = prefs.getString(PreferenceConstants.PERMISSION_MODE);
+        String cli;
+        if (pref == null || pref.isBlank()
+                || pref.equals(prefs.getDefaultString(PreferenceConstants.PERMISSION_MODE))) {
+            String fromSettings = (reader != null) ? reader.getUserPermissionMode() : null;
+            cli = (fromSettings != null && !fromSettings.isBlank()) ? fromSettings : pref;
+        } else {
+            cli = pref;
+        }
+        this.currentMode =
+            com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode.fromCliValue(cli);
+
+        // --- Effort ---
+        // Priority: Eclipse preference (user changed via popup) > settings.json > "medium" (default, same as IntelliJ)
+        String effortPref = prefs.getString(PreferenceConstants.EFFORT_LEVEL);
+        if (effortPref != null && !effortPref.isEmpty()) {
+            this.currentEffort = effortPref;
+        } else {
+            String fromSettings = (reader != null) ? reader.getUserEffortLevel() : null;
+            this.currentEffort = (fromSettings != null && !fromSettings.isEmpty())
+                                 ? fromSettings : "medium";
+        }
+    }
+
+    /**
+     * Translate the user-facing mode into the CLI value we actually pass to
+     * {@code --permission-mode}. Centralizes the stream-json compatibility
+     * fallback: "default" requires interactive prompts which don't work in
+     * stream-json, so we substitute "acceptEdits" (with PermissionBanner
+     * still handling per-tool approval via stdio).
+     */
+    private String cliPermissionModeFor(
+            com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode m) {
+        if (m == null) return "acceptEdits";
+        // Note: we keep the raw "default" value here — the CLI does honor it
+        // in stream-json when --permission-prompt-tool=stdio is set (which is
+        // our case; see ClaudeCliManager.buildCommand).
+        return m.cliValue;
+    }
+
+    /**
+     * Open the mode selector popup anchored to the mode button.
+     */
+    private void openModePopup() {
+        if (modeButton == null || modeButton.isDisposed()) return;
+        if (activeModePopup != null && activeModePopup.isOpen()) {
+            activeModePopup.close();
+            activeModePopup = null;
+            return;
+        }
+        activeModePopup = com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.show(
+            modeButton,
+            currentMode,
+            this::applyModeChange,
+            currentEffort,
+            this::applyEffortChange);
+    }
+
+    /**
+     * Apply a mode change: update per-view state, refresh button label, and
+     * hot-swap the CLI if it's running (preserving session memory via --resume).
+     */
+    private void applyModeChange(
+            com.anthropic.eclipse.claude.views.widgets.ModeSelectorPopup.Mode newMode) {
+        if (newMode == null || newMode == currentMode) return;
+        currentMode = newMode;
+        refreshModeButton();
+        hotSwapCliForModeOrEffort();
+    }
+
+    /**
+     * Apply an effort change: update per-view state and hot-swap CLI if running.
+     */
+    private void applyEffortChange(String newEffort) {
+        if (java.util.Objects.equals(newEffort, currentEffort)) return;
+        currentEffort = newEffort;
+
+        // Persist so new conversations start with the same effort level
+        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+        prefs.setValue(PreferenceConstants.EFFORT_LEVEL,
+                       newEffort != null ? newEffort : "");
+
+        hotSwapCliForModeOrEffort();
+    }
+
+    /**
+     * Cycle to the next mode (Shift+Tab handler).
+     */
+    private void cycleMode() {
+        if (currentMode == null) return;
+        applyModeChange(currentMode.next());
+    }
+
+    private void refreshModeButton() {
+        if (modeButton == null || modeButton.isDisposed() || currentMode == null) return;
+        modeButton.setText(currentMode.icon + "  " + currentMode.label);
+        modeButton.setToolTipText(currentMode.description + "\n(Shift+Tab to cycle)");
+        modeButton.getParent().layout(true, true);
+    }
+
+    /**
+     * Hot-swap the CLI with the new mode/effort, preserving session memory.
+     * Only restarts if the CLI is currently running — otherwise the new values
+     * will be picked up on next start.
+     */
+    private void hotSwapCliForModeOrEffort() {
+        if (cliManager == null) return;
+        ClaudeCliManager.ProcessState state = cliManager.getState();
+        if (state != ClaudeCliManager.ProcessState.RUNNING
+                && state != ClaudeCliManager.ProcessState.STARTING) {
+            return; // will be applied on next start
+        }
+        CliProcessConfig oldConfig = cliManager.getConfig();
+        if (oldConfig == null) return;
+
+        String sessionId = null;
+        SessionInfo info = model.getSessionInfo();
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            sessionId = info.getSessionId();
+        }
+
+        CliProcessConfig newConfig;
+        try {
+            newConfig = oldConfig.withModeAndEffort(
+                cliPermissionModeFor(currentMode), currentEffort, sessionId);
+        } catch (IllegalArgumentException e) {
+            showError("Invalid effort value: " + e.getMessage());
+            return;
+        }
+        cliManager.restartWithConfig(newConfig);
     }
 
     // ==================== Message Handling ====================
 
     private void handleInput() {
+        // Debounce: ignore rapid duplicate sends (e.g. Enter + button click in same instant)
+        long now = System.currentTimeMillis();
+        if (now - lastSendTimestamp < 300) return;
+        lastSendTimestamp = now;
+
         String text = inputField.getText().trim();
         boolean hasAttachments = attachmentManager != null && attachmentManager.hasAttachments();
         if (text.isEmpty() && !hasAttachments) return;
@@ -781,6 +1548,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             fullMessage.append(editorContext).append("\n\n");
         }
 
+        // If "Active file" chip is pinned, include the file's full content as context
+        String activeFileCtx = buildActiveFilePinContext();
+        if (activeFileCtx != null) {
+            fullMessage.append(activeFileCtx);
+        }
+
         if (attachmentManager != null) {
             fullMessage.append(attachmentManager.buildFileContext());
         }
@@ -791,13 +1564,28 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         // Collect images and build display text BEFORE clearing
         List<byte[]> images = attachmentManager != null ? new ArrayList<>(attachmentManager.getImages()) : new ArrayList<>();
+        List<String> imageNames = attachmentManager != null ? new ArrayList<>(attachmentManager.getImageNames()) : new ArrayList<>();
         String displayText = buildDisplayText(text);
 
         // Clear attachment state
         if (attachmentManager != null) attachmentManager.clearAll();
 
-        // Show in UI what was sent
-        model.addUserMessage(displayText.isEmpty() ? finalText : displayText);
+        // Show in UI what was sent (include images so the bubble renders thumbnails).
+        //
+        // IMPORTANT: NEVER fall back to finalText here — finalText contains the
+        // raw <file path=...>...</file> XML for both attachment context and the
+        // active-file pin. If we displayed it in the user's bubble the user
+        // would see a wall of file content from their own message. Mirrors the
+        // IntelliJ fix in commit 0d151b8 (split displayText vs cliText).
+        // If the user typed nothing and only attached files/active-file, we
+        // still want a non-empty bubble — fall back to chip-label list (text=""
+        // makes buildDisplayText return just "[name1] [name2] " from the
+        // attached files), or to a small marker when there's nothing.
+        String userBubbleText = displayText;
+        if (userBubbleText == null || userBubbleText.isEmpty()) {
+            userBubbleText = !text.isEmpty() ? text : "(attached files)";
+        }
+        model.addUserMessage(userBubbleText, images, imageNames);
 
         // Update tab title with first user message (only once per conversation)
         if (!partNameSet && !text.trim().isEmpty()) {
@@ -805,6 +1593,21 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             String tabTitle = text.trim();
             if (tabTitle.length() > 30) tabTitle = tabTitle.substring(0, 30) + "\u2026";
             setPartName(tabTitle);
+
+            // Backport from IntelliJ a122d84 + ac63c73 + f0bfa64: when the
+            // user's chosen strategy is "self_generated" (default), spawn a
+            // background `claude -p` to generate a 3-5 word topic title and
+            // upgrade the tab name in place. The first-message title above
+            // is the immediate fallback so the tab is never empty.
+            String strategy = "self_generated";
+            try {
+                strategy = Activator.getDefault().getPreferenceStore()
+                        .getString(PreferenceConstants.TAB_TITLE_STRATEGY);
+                if (strategy == null || strategy.isBlank()) strategy = "self_generated";
+            } catch (Exception ignored) {}
+            if ("self_generated".equals(strategy)) {
+                kickoffSelfGeneratedTitle(text.trim());
+            }
         }
 
         // Send to CLI
@@ -814,9 +1617,18 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             cliManager.sendMessage(finalText);
         }
 
+        Activator.logDiag("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (handleInput)");
         renderingSuppressed = false;  // Reset for new query
+        diagSendTime = System.currentTimeMillis();
+        Activator.logDiag("[DIAG-TIMING] T0 send at " + diagSendTime
+                + " viewModel=" + System.identityHashCode(model)
+                + " viewHash=" + System.identityHashCode(this));
         stopButton.setEnabled(true);
-        costBar.setStatus("Streaming...");
+        setSendButtonToStop();
+        // If SystemInit hasn't arrived yet (cold start), show that explicitly
+        // so the user understands why nothing is streaming yet. The thinking
+        // indicator's elapsed-time counter complements this.
+        costBar.setStatus(sessionReady ? "Streaming..." : "Waiting for Claude CLI…");
         // Queue AFTER the user message asyncExec so indicator appears below the user message
         Display.getDefault().asyncExec(this::showThinkingIndicator);
     }
@@ -839,10 +1651,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 showHelp();
                 return true;
             case "/stop":
-                renderingSuppressed = true;
-                cancelStreamingTimeout();
-                cliManager.interruptCurrentQuery();
-                stopButton.setEnabled(false);
+                handleStop();
                 return true;
             case "/resume":
                 showResumeDialog();
@@ -1066,7 +1875,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         if (cliManager.isRunning()) {
             cliManager.sendMessage(fullMessage);
+            Activator.logDiag("[DIAG-FLAG] renderingSuppressed: " + renderingSuppressed + " -> false (slash cmd)");
+            renderingSuppressed = false;
             stopButton.setEnabled(true);
+            setSendButtonToStop();
             costBar.setStatus("Streaming...");
         }
     }
@@ -1093,6 +1905,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
         Activator.getDefault().setConversationModel(model);
@@ -1137,6 +1952,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
         Activator.getDefault().setConversationModel(model);
@@ -1155,7 +1973,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             }
             messageWidgetMap.clear();
             toolCallWidgetById.clear();
-            welcomeBlock = null;
+            if (welcomeComposite != null && !welcomeComposite.isDisposed()) {
+                welcomeComposite.dispose();
+            }
+            welcomeComposite = null;
             if (messageContainer != null && !messageContainer.isDisposed()) {
                 messageContainer.layout(true, true);
             }
@@ -1172,13 +1993,19 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Public method to resume a session by ID (called by ResumeSessionHandler).
      */
     public void resumeSession(String sessionId) {
+        Activator.logWarning("[Resume] enter sessionId=" + sessionId);
+        // Make the id sticky so it survives a failed CLI resume.
+        if (sessionId != null && !sessionId.isEmpty()) stickySessionId = sessionId;
         // Save current session
         saveCurrentSession();
 
-        // Stop current process
-        if (cliManager.isRunning()) {
-            cliManager.stop();
-        }
+        // Backport from IntelliJ 32ca7d9: ALWAYS stop, even when isRunning()
+        // returns false. The previous guard left storedConfig holding the OLD
+        // session id when the panel was Disconnected at Resume time, so a
+        // subsequent Reconnect happily revived the old session — making the
+        // CLI answer the next message from the wrong context, even though
+        // the panel showed the resumed transcript.
+        try { cliManager.stop(); } catch (Exception ignored) {}
 
         // Clear model (fires onConversationCleared → clears UI + adds welcome message)
         model.clear();
@@ -1187,28 +2014,56 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
 
-        // Start with resume flag
-        String cliPath = cliManager.getCliPath();
-        if (cliPath == null) {
-            showError("CLI not found.");
-            return;
-        }
-        String workDir = getDefaultWorkingDirectory();
-        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
-        String cliModel = mapModelName(prefs.getString(PreferenceConstants.MODEL));
-
+        // Backport from IntelliJ 7e4e9e7: derive the tab title from the
+        // RESUMED session's stored summary (CLI auto-summary preferred,
+        // first user message as fallback) and lock it in by keeping
+        // partNameSet=true. Previously we reset it to false, which let the
+        // user's NEXT message become the new title — overwriting B's title
+        // with whatever the user happened to type after Resume.
         try {
-            CliProcessConfig config = new CliProcessConfig.Builder(cliPath, workDir)
-                .model(cliModel)
-                .resumeSessionId(sessionId)
-                .build();
-            cliManager.start(config);
-        } catch (ClaudeCliManager.CliException e) {
-            showError("Failed to resume session: " + e.getMessage());
-            return;
+            com.anthropic.eclipse.claude.model.SessionInfo info =
+                    com.anthropic.eclipse.claude.session.JsonlSessionScanner.findSessionById(sessionId);
+            if (info != null && info.getSummary() != null && !info.getSummary().isBlank()) {
+                String title = info.getSummary().trim();
+                if (title.length() > 30) title = title.substring(0, 30) + "…";
+                setPartName(title);
+                partNameSet = true;
+            } else {
+                // No summary yet (e.g. brand-new session) — fall through and
+                // let the history loader below set the title from the first
+                // user message it finds. Reset to false so it can.
+                partNameSet = false;
+            }
+        } catch (Exception ex) {
+            partNameSet = false;
+        }
+
+        // Start with resume flag. CLI start failure must NOT abort history
+        // loading — on Eclipse restart the user expects to see past messages
+        // even if the CLI process has not yet been (re-)launched.
+        String cliPath = cliManager.getCliPath();
+        if (cliPath != null) {
+            String workDir = getDefaultWorkingDirectory();
+            IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+            String cliModel = mapModelName(prefs.getString(PreferenceConstants.MODEL));
+            try {
+                CliProcessConfig config = new CliProcessConfig.Builder(cliPath, workDir)
+                    .model(cliModel)
+                    .resumeSessionId(sessionId)
+                    .build();
+                cliManager.start(config);
+            } catch (ClaudeCliManager.CliException e) {
+                Activator.logWarning("[Resume] CLI start failed (continuing with history-only): "
+                        + e.getMessage());
+            }
+        } else {
+            Activator.logWarning("[Resume] CLI path not configured; loading history only.");
         }
 
         // Load conversation history from JSONL in background
@@ -1216,6 +2071,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         final String sessionIdFinal = sessionId;
         new Thread(() -> {
             List<MessageBlock> history = loadSessionHistoryFromJsonl(sessionIdFinal);
+            Activator.logWarning("[Resume] sessionId=" + sessionIdFinal
+                    + " history.size=" + history.size());
             if (!history.isEmpty()) {
                 // Clear the welcome message widget on the UI thread first,
                 // then queue the history events (which also go through asyncExec)
@@ -1225,9 +2082,31 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     }
                     messageWidgetMap.clear();
                     toolCallWidgetById.clear();
-                    welcomeBlock = null; // will be re-shown only if history is empty
+                    if (welcomeComposite != null && !welcomeComposite.isDisposed()) {
+                        welcomeComposite.dispose();
+                    }
+                    welcomeComposite = null; // will be re-shown only if history is empty
                     if (messageContainer != null && !messageContainer.isDisposed()) {
                         messageContainer.layout(true, true);
+                    }
+
+                    // Update the tab title from the first user message in history
+                    // (mirrors VS Code extension behaviour — tab shows the session summary).
+                    if (!partNameSet) {
+                        for (MessageBlock b : history) {
+                            if (b.getRole() == MessageBlock.Role.USER) {
+                                String text = b.getFullText();
+                                if (text != null && !text.trim().isEmpty()) {
+                                    String tabTitle = text.trim();
+                                    if (tabTitle.length() > 30) {
+                                        tabTitle = tabTitle.substring(0, 30) + "\u2026";
+                                    }
+                                    setPartName(tabTitle);
+                                    partNameSet = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 });
                 // loadHistory fires events → listeners do asyncExec → queued after the clear above
@@ -1241,9 +2120,112 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Returns MessageBlocks for plain user messages and final (stop_reason != null)
      * assistant messages. Skips intermediate streaming snapshots and tool-result turns.
      */
+    /**
+     * Spawns a one-shot {@code claude -p} call to generate a 3-5 word topic
+     * title for the new tab. Runs on a daemon thread; on success, updates
+     * the tab display name via setPartName. The first-message title is
+     * already shown immediately so the tab is never empty while this runs.
+     *
+     * Mirrors IntelliJ commits a122d84 + ac63c73 (run from user.home so
+     * project CLAUDE.md doesn't taint the title) + f0bfa64 (pipe via stdin
+     * as UTF-8 so non-Latin prompts survive on Windows where argv is in
+     * the system ANSI code page).
+     */
+    private void kickoffSelfGeneratedTitle(final String firstMessage) {
+        if (firstMessage == null || firstMessage.trim().isEmpty()) return;
+        Thread t = new Thread(() -> {
+            try {
+                String cliPath = cliManager.getCliPath();
+                if (cliPath == null) return;
+                String prompt = "You are a title generator. Ignore any project context, "
+                        + "CLAUDE.md, or files in the working directory — they are irrelevant. "
+                        + "Read ONLY the user question below and output a 3-5 word topic title "
+                        + "describing what THE QUESTION is about. Same language as the question. "
+                        + "No surrounding quotes, no trailing punctuation, no preamble — output "
+                        + "the title and nothing else.\n\n"
+                        + "User question:\n" + firstMessage;
+                ProcessBuilder pb = new ProcessBuilder(cliPath, "-p");
+                // user.home cwd: don't accidentally pick up the IDE project's
+                // CLAUDE.md / settings as context — it produces wildly off-topic titles.
+                pb.directory(new java.io.File(System.getProperty("user.home")));
+                pb.redirectErrorStream(false);
+                Process p = pb.start();
+                // Pipe prompt via STDIN as UTF-8 — Windows argv is encoded in
+                // the system ANSI code page and would mangle Hebrew/Unicode.
+                try (java.io.OutputStreamWriter w = new java.io.OutputStreamWriter(
+                        p.getOutputStream(), java.nio.charset.StandardCharsets.UTF_8)) {
+                    w.write(prompt);
+                    w.flush();
+                }
+                StringBuilder out = new StringBuilder();
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(p.getInputStream(),
+                                java.nio.charset.StandardCharsets.UTF_8))) {
+                    String l;
+                    while ((l = br.readLine()) != null) out.append(l).append('\n');
+                }
+                if (!p.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)) {
+                    p.destroyForcibly();
+                    return;
+                }
+                if (p.exitValue() != 0) return;
+                String title = out.toString().trim();
+                // Strip surrounding quotes (straight or curly) the model sometimes adds.
+                title = title.replaceAll("^[\"'“”‘’]+", "")
+                             .replaceAll("[\"'“”‘’\\.\\!\\?]+$", "")
+                             .trim();
+                int nl = title.indexOf('\n');
+                if (nl >= 0) title = title.substring(0, nl).trim();
+                if (title.isEmpty()) return;
+                if (title.length() > 50) title = title.substring(0, 50) + "…";
+                final String finalTitle = title;
+                asyncExec(() -> {
+                    if (!isPartNameDisposed()) {
+                        setPartName(finalTitle);
+                    }
+                });
+            } catch (Exception ignored) {
+                // Title-gen is best-effort; the first-message title remains.
+            }
+        }, "Claude-Title-Gen");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Cheap guard: avoid setPartName after the view has been disposed. */
+    private boolean isPartNameDisposed() {
+        try {
+            return getSite() == null || getSite().getShell() == null
+                    || getSite().getShell().isDisposed();
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /**
+     * Strips any leading {@code <file path="…">…</file>} blocks that
+     * {@link #handleInput()} prepends to the CLI text — so when we replay
+     * user messages from JSONL on resume, the bubble shows only what the
+     * user typed (not the entire file body that Claude saw).
+     * Idempotent on already-clean text.
+     */
+    private static String stripPrependedFileBlocks(String s) {
+        if (s == null || s.isEmpty()) return s;
+        // (?is) = case-insensitive + dotall (so .*? spans newlines)
+        // Strip [Active editor context: ...] prefix (single-line, may end before \n\n)
+        s = s.replaceAll("(?is)^\\s*\\[Active editor context:[^\\]]*\\]\\s*", "");
+        // Strip one-or-more <file path="…">…</file> blocks
+        s = s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+        return s;
+    }
+
     @SuppressWarnings("unchecked")
     private List<MessageBlock> loadSessionHistoryFromJsonl(String sessionId) {
+        long t0 = System.currentTimeMillis();
         List<MessageBlock> blocks = new ArrayList<>();
+        int linesScanned = 0;
+        long fileSize = 0L;
+        boolean capped = false;
         try {
             File claudeProjects = new File(System.getProperty("user.home") + "/.claude/projects");
             if (!claudeProjects.exists()) return blocks;
@@ -1260,10 +2242,31 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 }
             }
             if (jsonlFile == null) return blocks;
+            fileSize = jsonlFile.length();
 
-            List<String> lines = Files.readAllLines(jsonlFile.toPath(), StandardCharsets.UTF_8);
-            for (String line : lines) {
-                if (line.trim().isEmpty()) continue;
+            // Stream the JSONL line-by-line. The previous Files.readAllLines()
+            // approach loaded the entire file into memory before parsing — on
+            // a corporate machine with hundreds-of-MB JSONL this dominated
+            // resume time. Pre-filter cheap substrings before JSON parse so
+            // multi-megabyte tool_result lines don't burn the parser. Mirrors
+            // JsonlSessionScanner.buildSessionInfo() but with a higher line
+            // cap (resume needs the full conversation, not just a summary).
+            final int MAX_LINES = 20_000;
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(jsonlFile), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    if (linesScanned++ >= MAX_LINES) {
+                        capped = true;
+                        break;
+                    }
+                    if (line.isEmpty()) continue;
+                    // Cheap pre-filter: skip lines that obviously aren't user
+                    // or assistant turns. CLI 2.1.107+ omits top-level type
+                    // for assistant turns — detect via "role":"assistant".
+                    if (line.indexOf("\"type\":\"user\"")      < 0
+                     && line.indexOf("\"type\":\"assistant\"") < 0
+                     && line.indexOf("\"role\":\"assistant\"") < 0) continue;
                 try {
                     Map<String, Object> obj = JsonParser.parseObject(line);
                     String type = JsonParser.getString(obj, "type");
@@ -1271,6 +2274,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     if (msg == null) continue;
 
                     String role = JsonParser.getString(msg, "role");
+                    // CLI 2.1.107+ stopped writing top-level "type":"assistant"
+                    // for model turns — they're now {"parentUuid":...,"message":{...}}
+                    // with no outer type. Fall back to message.role so replay
+                    // doesn't silently drop every assistant message.
+                    if (type == null && role != null) type = role;
 
                     if ("user".equals(type) && "user".equals(role)) {
                         // User turn: skip tool_result arrays, keep plain text
@@ -1300,6 +2308,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                             }
                             text = sb.toString();
                         }
+                        // Backport from IntelliJ commit c79d6e0: strip the
+                        // <file path="…">…</file> blocks that handleInput prepends
+                        // to cliText. JSONL stores what the CLI received, so on
+                        // replay we'd otherwise dump the entire file body into
+                        // the user's bubble.
+                        text = stripPrependedFileBlocks(text);
                         if (text != null && !text.trim().isEmpty()) {
                             MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
                             MessageBlock.TextSegment seg = new MessageBlock.TextSegment();
@@ -1351,10 +2365,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 } catch (Exception lineEx) {
                     // Skip invalid lines silently (e.g. queue-operation entries)
                 }
-            }
+                } // end while-loop
+            } // end try-with-resources (BufferedReader)
         } catch (Exception e) {
             Activator.logError("Failed to load session history for " + sessionId + ": " + e.getMessage(), e);
         }
+        Activator.logDiag("[DIAG-PERF] loadSessionHistoryFromJsonl session=" + sessionId
+                + " elapsed=" + (System.currentTimeMillis() - t0) + "ms"
+                + " linesScanned=" + linesScanned
+                + " blocks=" + blocks.size()
+                + " fileSize=" + fileSize
+                + " capped=" + capped);
         return blocks;
     }
 
@@ -1362,12 +2383,32 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onSessionInitialized(SessionInfo info) {
+        if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+            stickySessionId = info.getSessionId();
+        }
         // Register this session with the session manager so save works
         if (sessionManager != null && sessionManager.getCurrentSession() == null) {
             String workDir = info.getWorkingDirectory() != null
                 ? info.getWorkingDirectory() : getDefaultWorkingDirectory();
             sessionManager.startNewSession(workDir);
         }
+        // CLI cold-start is over. If a thinking indicator was already showing
+        // (user pressed Send before SystemInit arrived), reset its base time
+        // so the counter measures only the actual model latency, not the
+        // boot delay, and refresh the label text to "Claude is thinking\u2026".
+        sessionReady = true;
+        asyncExec(() -> {
+            if (thinkingIndicator != null && !thinkingIndicator.isDisposed()) {
+                thinkingStartedAt = System.currentTimeMillis();
+                updateThinkingLabel();
+                // A send was already in flight while we waited for SystemInit \u2014
+                // flip the cost-bar message from "Waiting for Claude CLI\u2026" to
+                // the in-flight streaming state.
+                costBar.setStatus("Streaming...");
+            } else {
+                costBar.setStatus("Ready");
+            }
+        });
 
         asyncExec(() -> {
             costBar.updateSession(info);
@@ -1411,9 +2452,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onAssistantMessageStarted(MessageBlock block) {
+        if (diagSendTime > 0) {
+            Activator.logDiag("[DIAG-TIMING] T1 onAssistantMessageStarted +"
+                    + (System.currentTimeMillis() - diagSendTime) + "ms");
+        }
         touchStreamActivity(); // streaming started — reset timeout clock
         asyncExec(() -> {
-            hideThinkingIndicator();
+            // Backport from IntelliJ ef00374: do NOT hide the "thinking" indicator
+            // here. assistant_message_started fires before any text/tool has
+            // arrived, so on slow latency the user sees the bubble appear empty
+            // for many seconds. Keep the indicator visible until the first real
+            // chunk (text delta or tool call) lands.
             MessageComposite widget = new MessageComposite(messageContainer, block);
             widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
@@ -1436,6 +2485,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         asyncExec(() -> {
             if (renderingSuppressed) return;  // Double-check inside asyncExec
+            // Backport from IntelliJ ef00374: first real text chunk has arrived,
+            // so the "thinking" indicator can finally be removed.
+            hideThinkingIndicator();
             MessageComposite widget = messageWidgetMap.get(block);
             if (widget != null && !widget.isDisposed()) {
                 widget.appendStreamingText(delta);
@@ -1565,6 +2617,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onAssistantMessageCompleted(MessageBlock block) {
+        if (diagSendTime > 0) {
+            Activator.logDiag("[DIAG-TIMING] T2 onAssistantMessageCompleted +"
+                    + (System.currentTimeMillis() - diagSendTime) + "ms"
+                    + " hasRunningTools=" + model.hasRunningToolCalls());
+        }
+        // Bug-1 fix: when no tools are running, the visible turn is effectively
+        // done — flip the send button back to "Send" immediately rather than
+        // waiting up to 15s for the result message (very visible lag on slow
+        // corporate networks where the result trails far behind the last token).
+        if (!model.hasRunningToolCalls()) {
+            asyncExec(() -> {
+                hideThinkingIndicator();
+                if (!stopButton.isDisposed()) stopButton.setEnabled(false);
+                setSendButtonToSend();
+                // Leave costBar status to handleResult so we don't flicker.
+            });
+        }
         asyncExec(() -> {
             // Just finalize the widget content (apply markdown etc.).
             // Do NOT set "Ready" or disable stop here — this event fires after every
@@ -1596,11 +2665,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onResultReceived(UsageInfo usage) {
+        if (diagSendTime > 0) {
+            Activator.logDiag("[DIAG-TIMING] T3 onResultReceived +"
+                    + (System.currentTimeMillis() - diagSendTime) + "ms");
+            diagSendTime = 0; // reset
+        }
         cancelStreamingTimeout(); // full result arrived — no timeout needed
         asyncExec(() -> {
             hideThinkingIndicator();
             costBar.updateUsage(usage);
             stopButton.setEnabled(false);
+            setSendButtonToSend();
             costBar.setStatus("Ready");
 
             // Save session state
@@ -1623,6 +2698,31 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     }
 
     @Override
+    public void onSilentEmptyShouldRetry(String lastUserPrompt) {
+        // The CLI returned an empty result on the first attempt — likely the
+        // non-deterministic AIM/UserPromptSubmit hook rejecting the prompt.
+        // Re-send the same content. The model has already set its retry flag,
+        // so a second silent-empty will fall through to onError instead of
+        // looping back here.
+        Activator.logDiag("[DIAG] auto-retry: re-sending last prompt after silent-empty");
+        asyncExec(() -> {
+            try {
+                if (cliManager != null && cliManager.isRunning()) {
+                    cliManager.sendMessage(lastUserPrompt);
+                    // Restart streaming UI state — keep stop button as "stop" since
+                    // we're effectively in another assistant turn now.
+                    stopButton.setEnabled(true);
+                    setSendButtonToStop();
+                    costBar.setStatus("Streaming…");
+                    diagSendTime = System.currentTimeMillis(); // restart timing for the retry
+                }
+            } catch (Exception ex) {
+                Activator.logError("[Retry] failed to re-send: " + ex.getMessage(), ex);
+            }
+        });
+    }
+
+    @Override
     public void onConversationCleared() {
         asyncExec(() -> {
             for (MessageComposite widget : messageWidgetMap.values()) {
@@ -1630,7 +2730,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             }
             messageWidgetMap.clear();
             toolCallWidgetById.clear();
-            welcomeBlock = null; // reset before re-adding
+            if (welcomeComposite != null && !welcomeComposite.isDisposed()) {
+                welcomeComposite.dispose();
+            }
+            welcomeComposite = null; // reset before re-adding
             addWelcomeMessage();
             scrollToBottom();
             costBar.reset();
@@ -1837,12 +2940,22 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         asyncExec(() -> {
             switch (newState) {
                 case STARTING:
+                    sessionReady = false;
                     connectionStatus.setText("Starting...");
+                    costBar.setStatus("Starting Claude CLI\u2026");
                     break;
                 case RUNNING:
-                    connectionStatus.setText("\u2713 Connected");
-                    connectionStatus.setForeground(connectedColor);
-                    costBar.setStatus("Ready");
+                    // RUNNING means the process was spawned, NOT that the CLI
+                    // is ready to take input \u2014 SystemInit (handled in
+                    // onSessionInitialized) is what makes it actually ready.
+                    // Cold start on corporate machines (AV scanning, slow node
+                    // bootstrap, hook latency) can be 15-35s \u2014 without this
+                    // the user would see "Ready" while the CLI is still
+                    // booting and conclude the plug-in is hung.
+                    connectionStatus.setText("Starting\u2026");
+                    if (!sessionReady) {
+                        costBar.setStatus("Starting Claude CLI\u2026");
+                    }
                     if (oldState != ClaudeCliManager.ProcessState.STARTING) {
                         costBar.showToast("\u2713 Claude reconnected", 2500);
                     }
@@ -1851,6 +2964,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     connectionStatus.setText("Stopping...");
                     break;
                 case STOPPED:
+                    sessionReady = false;
                     connectionStatus.setText("\u25CF Disconnected");
                     connectionStatus.setForeground(disconnectedColor);
                     costBar.setStatus("Stopped");
@@ -1858,6 +2972,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     if (model != null) model.markActiveToolCallsFailed("CLI stopped");
                     break;
                 case ERROR:
+                    sessionReady = false;
                     connectionStatus.setText("\u2717 Error - CLI process crashed");
                     connectionStatus.setForeground(errorColor);
                     costBar.setStatus("Error");
@@ -1927,13 +3042,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
         String cliModel = mapModelName(prefsModel);
 
-        // Get permission mode from preferences.
-        // In stream-json mode, "default" would try interactive terminal prompts which don't
-        // work, so fall back to "acceptEdits" which auto-approves file edits.
-        String permMode = prefs.getString(PreferenceConstants.PERMISSION_MODE);
-        if (permMode == null || permMode.isBlank() || "default".equals(permMode)) {
-            permMode = "acceptEdits";
-        }
+        // Permission mode + effort come from PER-VIEW state (set by the mode button
+        // popup or initialized from preferences in createPartControl). This keeps
+        // each tab independent — flipping the mode in one tab never affects another.
+        String permMode = cliPermissionModeFor(currentMode);
+        String effortLevel = currentEffort;
 
         // Get max turns from preferences
         int maxTurns = prefs.getInt(PreferenceConstants.MAX_TURNS);
@@ -1941,7 +3054,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         try {
             CliProcessConfig.Builder builder = new CliProcessConfig.Builder(cliPath, workDir)
                 .model(cliModel)
-                .permissionMode(permMode);
+                .permissionMode(permMode)
+                .effort(effortLevel);
 
             if (maxTurns > 0) {
                 builder.maxTurns(maxTurns);
@@ -2319,6 +3433,241 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Get context about the file currently open in the active editor.
      * This helps Claude know which file the user is referring to.
      */
+    /**
+     * Update the chip pill widgets to reflect the currently focused editor.
+     *   - File open + global pin ON + path NOT dismissed → 📌 + blue + ×
+     *   - Global pin OFF, OR path dismissed via ×, OR no file open
+     *                                                  → hide chip row entirely
+     *
+     * Mirrors IntelliJ commit 590724b "per-path dismiss memory" — clicking
+     * × on a chip should make it disappear for that file (per-path memory),
+     * not switch it into a still-visible "unpinned" state.
+     */
+    private void updateActiveFileChipLabel() {
+        if (chipPill == null || chipPill.isDisposed()) return;
+        IFile file = getActiveFileFromEditor();
+        String path = (file != null && file.getLocation() != null)
+                ? file.getLocation().toOSString() : null;
+        boolean dismissedForPath = path != null && dismissedActiveFilePaths.contains(path);
+
+        // Show the chip ONLY when:
+        //   1) there is an editor with a file
+        //   2) the global "auto-attach active file" preference is on
+        //   3) the user hasn't dismissed this specific file via the × button
+        boolean show = (file != null) && activeFilePinned && !dismissedForPath;
+
+        if (contextBar != null && !contextBar.isDisposed()) {
+            GridData gd = (GridData) contextBar.getLayoutData();
+            if (gd != null) gd.exclude = !show;
+            contextBar.setVisible(show);
+        }
+        if (!show) {
+            chipNameLabel.setText("");
+            if (contextBar != null && contextBar.getParent() != null) {
+                contextBar.getParent().layout(true, true);
+            }
+            return;
+        }
+
+        // Visible state: always pinned (Q-style — pinned-or-hidden, no greyed
+        // intermediate state). Show 📌 + filename + × dismiss button, blue.
+        chipIconLabel.setText("📌");
+        chipNameLabel.setText(file.getName());
+        chipDismissButton.setVisible(true);
+        if (chipDismissButton.getLayoutData() == null) {
+            chipDismissButton.setLayoutData(new GridData());
+        }
+        ((GridData) chipDismissButton.getLayoutData()).exclude = false;
+
+        try {
+            org.eclipse.swt.graphics.Color blue = chipPill.getDisplay()
+                    .getSystemColor(SWT.COLOR_LINK_FOREGROUND);
+            chipNameLabel.setForeground(blue);
+            chipIconLabel.setForeground(blue);
+        } catch (Throwable ignored) {}
+
+        chipPill.layout(true, true);
+        if (contextBar != null && contextBar.getParent() != null) {
+            contextBar.getParent().layout(true, true);
+        }
+        // Warm the content cache on a background thread so the next send
+        // doesn't have to do file I/O on the UI thread.
+        scheduleActiveFileCacheWarm();
+    }
+
+    private String getActiveFilePathOrNull() {
+        IFile f = getActiveFileFromEditor();
+        if (f == null || f.getLocation() == null) return null;
+        return f.getLocation().toOSString();
+    }
+
+    private IFile getActiveFileFromEditor() {
+        try {
+            org.eclipse.ui.IWorkbenchPage page = getSite().getPage();
+            if (page == null) return null;
+            org.eclipse.ui.IEditorPart ed = page.getActiveEditor();
+            if (ed == null) return null;
+            return ed.getEditorInput().getAdapter(IFile.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void installActiveEditorListener() {
+        if (activeFilePartListener != null) return; // installed once
+        activeFilePartListener = new org.eclipse.ui.IPartListener2() {
+            @Override public void partActivated(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partBroughtToTop(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partClosed(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partOpened(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partVisible(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+            @Override public void partHidden(org.eclipse.ui.IWorkbenchPartReference ref) {}
+            @Override public void partDeactivated(org.eclipse.ui.IWorkbenchPartReference ref) {}
+            @Override public void partInputChanged(org.eclipse.ui.IWorkbenchPartReference ref) {
+                asyncExec(() -> updateActiveFileChipLabel());
+            }
+        };
+        try {
+            getSite().getPage().addPartListener(activeFilePartListener);
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * If the "Active file" chip is enabled and an editor is open, return a
+     * &lt;file&gt; context block with the full content; otherwise null.
+     * <p>
+     * Reads from {@link #cachedActiveFileContent} when fresh (path + mtime
+     * match the editor's current file). On cache miss, falls back to a
+     * 200ms-bounded synchronous read so a slow network home dir cannot
+     * stall the UI; on timeout the chip is skipped for this send and a
+     * warning is logged.
+     */
+    private String buildActiveFilePinContext() {
+        if (!activeFilePinned) return null;
+        IFile file = getActiveFileFromEditor();
+        if (file == null) return null;
+        if (file.getLocation() == null) return null;
+        String path = file.getLocation().toOSString();
+        if (dismissedActiveFilePaths.contains(path)) return null;
+
+        long t0 = System.currentTimeMillis();
+        String content = null;
+        boolean cacheHit = false;
+        try {
+            java.nio.file.Path nio = java.nio.file.Paths.get(path);
+            long mtime = java.nio.file.Files.getLastModifiedTime(nio).toMillis();
+            if (path.equals(cachedActiveFilePath)
+                    && cachedActiveFileContent != null
+                    && cachedActiveFileMtime == mtime) {
+                content = cachedActiveFileContent;
+                cacheHit = true;
+            } else {
+                content = readActiveFileBounded(nio, 200);
+                if (content != null) {
+                    cachedActiveFilePath = path;
+                    cachedActiveFileMtime = mtime;
+                    cachedActiveFileContent = content;
+                }
+            }
+        } catch (Exception e) {
+            Activator.logWarning("[ActiveFile] failed to stat pinned file: " + e.getMessage());
+        }
+        Activator.logDiag("[DIAG-PERF] buildActiveFilePinContext elapsed="
+                + (System.currentTimeMillis() - t0) + "ms path=" + path
+                + " size=" + (content != null ? content.length() : -1)
+                + " cacheHit=" + cacheHit);
+
+        if (content == null) return null;
+
+        // Cap very large files to avoid blowing up the prompt
+        int MAX = 64 * 1024;
+        String truncatedNote = "";
+        if (content.length() > MAX) {
+            content = content.substring(0, MAX);
+            truncatedNote = "\n... (truncated to 64KB)";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("<file path=\"").append(path).append("\" pinned=\"active-editor\">\n");
+        sb.append(content);
+        sb.append(truncatedNote);
+        if (!content.endsWith("\n")) sb.append("\n");
+        sb.append("</file>\n\n");
+        return sb.toString();
+    }
+
+    /** Bounded synchronous read — never blocks the UI thread for more than {@code timeoutMs}. */
+    private static String readActiveFileBounded(java.nio.file.Path nio, long timeoutMs) {
+        java.util.concurrent.CompletableFuture<String> fut = java.util.concurrent.CompletableFuture
+                .supplyAsync(() -> {
+                    try {
+                        return new String(java.nio.file.Files.readAllBytes(nio),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                    } catch (Exception e) {
+                        throw new java.util.concurrent.CompletionException(e);
+                    }
+                });
+        try {
+            return fut.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException te) {
+            Activator.logWarning("[ActiveFile] read timed out after " + timeoutMs
+                    + "ms — skipping chip injection for this send (" + nio + ")");
+            return null;
+        } catch (Exception e) {
+            Activator.logWarning("[ActiveFile] read failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Warm or refresh the active-file content cache on a background thread.
+     * Called whenever the active editor changes so that {@link #buildActiveFilePinContext}
+     * has a fresh value to serve without doing UI-thread I/O.
+     */
+    private void scheduleActiveFileCacheWarm() {
+        if (!activeFilePinned) return;
+        IFile file = getActiveFileFromEditor();
+        if (file == null || file.getLocation() == null) return;
+        String path = file.getLocation().toOSString();
+        if (dismissedActiveFilePaths.contains(path)) return;
+        Thread t = new Thread(() -> {
+            long t0 = System.currentTimeMillis();
+            try {
+                java.nio.file.Path nio = java.nio.file.Paths.get(path);
+                long mtime = java.nio.file.Files.getLastModifiedTime(nio).toMillis();
+                // Skip re-read when nothing changed
+                if (path.equals(cachedActiveFilePath)
+                        && cachedActiveFileContent != null
+                        && cachedActiveFileMtime == mtime) {
+                    return;
+                }
+                String content = new String(java.nio.file.Files.readAllBytes(nio),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                cachedActiveFilePath = path;
+                cachedActiveFileMtime = mtime;
+                cachedActiveFileContent = content;
+                Activator.logDiag("[DIAG-PERF] scheduleActiveFileCacheWarm elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms path=" + path
+                        + " size=" + content.length());
+            } catch (Exception e) {
+                Activator.logDiag("[DIAG-PERF] scheduleActiveFileCacheWarm failed elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms path=" + path
+                        + " err=" + e.getMessage());
+            }
+        }, "ActiveFile-CacheWarm");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private String getActiveEditorContext() {
         try {
             org.eclipse.ui.IWorkbenchPage page = getSite().getPage();
@@ -2332,6 +3681,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             if (file == null) return null;
 
             String filePath = file.getLocation().toOSString();
+            // Respect Active-file chip state: if user dismissed (X) the chip
+            // for this path, or globally turned off active-file pinning, do
+            // NOT inject the editor context either.
+            if (!activeFilePinned) return null;
+            if (filePath != null && dismissedActiveFilePaths.contains(filePath)) return null;
             String fileName = file.getName();
             String projectName = file.getProject().getName();
 
@@ -2450,40 +3804,127 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     // ==================== UI Helpers ====================
 
+    /**
+     * Render the empty-conversation welcome screen — VS Code style: a small
+     * mascot icon centered above a friendly one-line prompt. Replaces the
+     * old feature-dump message bubble which the user had to scroll past on
+     * every new tab.
+     */
     private void addWelcomeMessage() {
-        welcomeBlock = new MessageBlock(MessageBlock.Role.SYSTEM);
-        MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
-        textSeg.appendText("Welcome to Claude Code for Eclipse!\n\n" +
-            "Features:\n" +
-            "- Real-time streaming responses\n" +
-            "- Agentic tool use (file read/write, search, commands)\n" +
-            "- Code blocks with Copy/Apply/Insert\n" +
-            "- File & image attachments\n" +
-            "- Inline edit accept/reject\n" +
-            "- Session save/resume\n\n" +
-            "Commands: /new, /clear, /cost, /help, /stop, /resume, /model\n" +
-            "CLI Commands: /commit, /review-pr, /explain, /fix, /test, /refactor\n\n" +
-            "Type a message below to get started.");
-        welcomeBlock.addSegment(textSeg);
+        if (messageContainer == null || messageContainer.isDisposed()) return;
+        if (welcomeComposite != null && !welcomeComposite.isDisposed()) return;
 
-        MessageComposite widget = new MessageComposite(messageContainer, welcomeBlock);
-        messageWidgetMap.put(welcomeBlock, widget);
+        welcomeComposite = new Composite(messageContainer, SWT.NONE);
+        GridLayout wLayout = new GridLayout(1, false);
+        wLayout.marginTop = 48;
+        wLayout.marginBottom = 24;
+        wLayout.marginWidth = 24;
+        wLayout.verticalSpacing = 12;
+        welcomeComposite.setLayout(wLayout);
+        welcomeComposite.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+        welcomeComposite.setBackground(viewBgColor);
+
+        // Mascot icon — drawn programmatically so we don't ship another asset.
+        // Orange pixel-art-ish robot face, VS Code welcome vibe.
+        Label iconLabel = new Label(welcomeComposite, SWT.NONE);
+        GridData iconGd = new GridData(SWT.CENTER, SWT.CENTER, true, false);
+        iconLabel.setLayoutData(iconGd);
+        iconLabel.setBackground(viewBgColor);
+        Image mascot = createWelcomeMascot(welcomeComposite.getDisplay());
+        iconLabel.setImage(mascot);
+        // Dispose the generated image when the welcome widget is disposed
+        iconLabel.addDisposeListener(e -> { if (mascot != null) mascot.dispose(); });
+
+        // Friendly prompt
+        Label prompt = new Label(welcomeComposite, SWT.WRAP | SWT.CENTER);
+        prompt.setText("What to do first? Ask about this codebase\nor we can start writing code.");
+        ThemeManager tm = ThemeManager.getInstance();
+        Color promptColor = tm.getColor(tm.titleColor);
+        prompt.setForeground(promptColor);
+        prompt.setBackground(viewBgColor);
+        Font promptFont = new Font(welcomeComposite.getDisplay(), tm.getUIFontName(), 11, SWT.NORMAL);
+        prompt.setFont(promptFont);
+        GridData promptGd = new GridData(SWT.CENTER, SWT.CENTER, true, false);
+        promptGd.widthHint = 420;
+        prompt.setLayoutData(promptGd);
+        prompt.addDisposeListener(e -> promptFont.dispose());
+
         scrollToBottom();
     }
 
     /**
-     * Dismiss the welcome message widget. Called when the first real message is sent
+     * Draw the small robot-face mascot used in the welcome screen. Orange
+     * body, dark eyes, minimal antenna — roughly matches the VS Code feel
+     * without requiring a separate PNG asset.
+     */
+    private Image createWelcomeMascot(Display display) {
+        int size = 48;
+        PaletteData pal = new PaletteData(0xFF0000, 0x00FF00, 0x0000FF);
+        ImageData data = new ImageData(size, size, 24, pal);
+        data.alphaData = new byte[size * size];
+
+        int orange = (204 << 16) | (85 << 8) | 45;    // #CC552D rust
+        int orangeDark = (160 << 16) | (60 << 8) | 30;
+        int dark   = (30 << 16) | (30 << 8) | 30;     // eyes
+
+        // Antenna (2px tall stalk + small dot on top)
+        fillRect(data, size, 23, 6, 2, 3, orangeDark);
+        fillRect(data, size, 22, 4, 4, 3, orangeDark);
+
+        // Body: rounded rectangle roughly 32x28 centered
+        int bx = 8, by = 10, bw = 32, bh = 28, radius = 4;
+        for (int y = by; y < by + bh; y++) {
+            for (int x = bx; x < bx + bw; x++) {
+                // Rounded corners
+                boolean corner = false;
+                int cx = 0, cy = 0;
+                if (x < bx + radius && y < by + radius) { corner = true; cx = bx + radius; cy = by + radius; }
+                else if (x >= bx + bw - radius && y < by + radius) { corner = true; cx = bx + bw - radius - 1; cy = by + radius; }
+                else if (x < bx + radius && y >= by + bh - radius) { corner = true; cx = bx + radius; cy = by + bh - radius - 1; }
+                else if (x >= bx + bw - radius && y >= by + bh - radius) { corner = true; cx = bx + bw - radius - 1; cy = by + bh - radius - 1; }
+                if (corner) {
+                    int dx = x - cx, dy = y - cy;
+                    if (dx * dx + dy * dy > radius * radius) continue;
+                }
+                data.setPixel(x, y, orange);
+                data.alphaData[y * size + x] = (byte) 255;
+            }
+        }
+
+        // Eyes — two dark rectangles
+        fillRect(data, size, 17, 20, 4, 5, dark);
+        fillRect(data, size, 27, 20, 4, 5, dark);
+
+        // Mouth — small horizontal bar
+        fillRect(data, size, 20, 30, 8, 2, dark);
+
+        return new Image(display, data);
+    }
+
+    private void fillRect(ImageData d, int canvasSize, int x, int y, int w, int h, int color) {
+        for (int yy = y; yy < y + h && yy < canvasSize; yy++) {
+            for (int xx = x; xx < x + w && xx < canvasSize; xx++) {
+                if (xx < 0 || yy < 0) continue;
+                d.setPixel(xx, yy, color);
+                d.alphaData[yy * canvasSize + xx] = (byte) 255;
+            }
+        }
+    }
+
+    /**
+     * Dismiss the welcome widget. Called when the first real message is sent
      * or when session history is loaded, so the chat area is uncluttered.
      * Must be called on the UI thread.
      */
     private void dismissWelcomeMessage() {
-        if (welcomeBlock == null) return;
-        MessageComposite w = messageWidgetMap.remove(welcomeBlock);
-        if (w != null && !w.isDisposed()) {
-            w.dispose();
-            messageContainer.layout(true, true);
+        if (welcomeComposite == null) return;
+        if (!welcomeComposite.isDisposed()) {
+            welcomeComposite.dispose();
+            if (messageContainer != null && !messageContainer.isDisposed()) {
+                messageContainer.layout(true, true);
+            }
         }
-        welcomeBlock = null;
+        welcomeComposite = null;
     }
 
     private void showError(String error) {
@@ -2775,6 +4216,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         ConversationModel oldModel = model;
         model = new ConversationModel();
         model.addListener(this);
+        Activator.logDiag("[DIAG-MODEL] view=" + System.identityHashCode(this)
+                + " replaced oldModel=" + System.identityHashCode(oldModel)
+                + " -> newModel=" + System.identityHashCode(model));
         cliManager.removeMessageListener(oldModel);
         cliManager.addMessageListener(model);
 
@@ -2876,9 +4320,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         Color dimColor = new Color(128, 128, 128);
         thinkingLabel.setForeground(dimColor);
         thinkingLabel.addDisposeListener(ev -> dimColor.dispose());
-        thinkingLabel.setText("\u2728 Claude is thinking\u2026");
+        thinkingStartedAt = System.currentTimeMillis();
+        updateThinkingLabel();
 
-        // Animation timer: 470ms per frame (1.4s total cycle / 3 dots)
+        // Animation timer: 470ms per frame (1.4s total cycle / 3 dots).
+        // Every frame we also refresh the label so the elapsed counter
+        // (e.g. "Starting Claude CLI\u2026 (7s)") ticks forward \u2014 this is what
+        // tells the user the plug-in is alive while the CLI cold-starts.
         thinkingAnimFrame = 0;
         Display.getDefault().timerExec(470, new Runnable() {
             @Override
@@ -2886,11 +4334,41 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 if (thinkingDotsCanvas == null || thinkingDotsCanvas.isDisposed()) return;
                 thinkingAnimFrame = (thinkingAnimFrame + 1) % 3;
                 thinkingDotsCanvas.redraw();
+                updateThinkingLabel();
                 Display.getDefault().timerExec(470, this);
             }
         });
 
         scrollToBottom();
+    }
+
+    /**
+     * Refresh the thinking-indicator label according to the current state.
+     * Three cases:
+     *   1) The CLI hasn't emitted SystemInit yet → "⏳ Starting Claude CLI… (Ns)"
+     *   2) Extended thinking is on → "🧠 Claude is reasoning…"
+     *   3) Normal in-flight turn → "✨ Claude is thinking… (Ns)"
+     * The counter helps users distinguish "still alive, just slow" from "stuck".
+     */
+    private void updateThinkingLabel() {
+        if (thinkingLabel == null || thinkingLabel.isDisposed()) return;
+        long elapsed = thinkingStartedAt > 0
+                ? (System.currentTimeMillis() - thinkingStartedAt) / 1000L
+                : 0L;
+        String text;
+        if (!sessionReady) {
+            text = "⏳ Starting Claude CLI… (" + elapsed + "s)";
+        } else if (extendedThinking) {
+            text = "🧠 Claude is reasoning… (" + elapsed + "s)";
+        } else {
+            text = "✨ Claude is thinking… (" + elapsed + "s)";
+        }
+        thinkingLabel.setText(text);
+        // Recompute layout so the label width adapts when text changes (e.g.,
+        // 0s → 10s adds a digit).
+        if (thinkingIndicator != null && !thinkingIndicator.isDisposed()) {
+            thinkingIndicator.layout(true, true);
+        }
     }
 
     /**
@@ -3041,6 +4519,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (inputField != null && !inputField.isDisposed()) {
             inputField.setFocus();
         }
+        // Make this tab's CLI the active one so the status bar reflects it
+        Activator activator = Activator.getDefault();
+        if (activator != null) {
+            activator.setConversationModel(model);
+            activator.setActiveCliManager(cliManager);
+        }
     }
 
     /**
@@ -3080,6 +4564,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Save session before disposing
         saveCurrentSession();
         dismissAutocomplete();
+        if (activeModePopup != null) { try { activeModePopup.close(); } catch (Exception ignored) {} }
+        if (sendIcon != null) sendIcon.dispose();
+        if (stopIcon != null) stopIcon.dispose();
+
+        // Detach the active-editor listener
+        if (activeFilePartListener != null) {
+            try { getSite().getPage().removePartListener(activeFilePartListener); } catch (Exception ignored) {}
+            activeFilePartListener = null;
+        }
 
         if (model != null) {
             model.removeListener(this);
@@ -3087,6 +4580,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (cliManager != null) {
             cliManager.removeMessageListener(model);
             cliManager.removeStateListener(this);
+            // Stop the CLI process that this view owned and release it from the Activator's
+            // tracking so it can't be reused or leak a zombie node.exe process.
+            try { cliManager.stop(); } catch (Exception ignored) {}
+            if (Activator.getDefault() != null) {
+                Activator.getDefault().releaseCliManager(cliManager);
+            }
         }
 
         // Clear the shared model reference so status bar shows "Disconnected"
