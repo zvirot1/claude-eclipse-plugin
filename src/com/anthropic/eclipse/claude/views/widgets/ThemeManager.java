@@ -70,19 +70,19 @@ public class ThemeManager {
     public final RGB toolCompletedColor;
     public final RGB toolFailedColor;
 
-    // Code block (always dark)
+    // Code block (theme-aware — dark in dark mode, light in light mode)
     public final RGB codeBg;
     public final RGB codeHeaderBg;
     public final RGB codeText;
     public final RGB codeLangText;
 
-    // Syntax highlighting (VS Code Dark+ inspired, always dark)
-    public final RGB syntaxKeyword   = new RGB(86, 156, 214);   // #569CD6 blue
-    public final RGB syntaxString    = new RGB(206, 145, 120);  // #CE9178 orange-brown
-    public final RGB syntaxComment   = new RGB(106, 153, 85);   // #6A9955 green
-    public final RGB syntaxType      = new RGB(78, 201, 176);   // #4EC9B0 teal
-    public final RGB syntaxNumber    = new RGB(181, 206, 168);  // #B5CEA8 light green
-    public final RGB syntaxAnnotation = new RGB(220, 220, 170); // #DCDCAA yellow
+    // Syntax highlighting (theme-aware — Dark+ in dark mode, Light+ in light mode)
+    public final RGB syntaxKeyword;
+    public final RGB syntaxString;
+    public final RGB syntaxComment;
+    public final RGB syntaxType;
+    public final RGB syntaxNumber;
+    public final RGB syntaxAnnotation;
 
     // Cost status bar
     public final RGB statusBarBg;
@@ -149,6 +149,14 @@ public class ThemeManager {
             codeText = new RGB(212, 212, 212);
             codeLangText = new RGB(150, 150, 150);
 
+            // VS Code Dark+ palette
+            syntaxKeyword    = new RGB(86, 156, 214);   // #569CD6 blue
+            syntaxString     = new RGB(206, 145, 120);  // #CE9178 orange-brown
+            syntaxComment    = new RGB(106, 153, 85);   // #6A9955 green
+            syntaxType       = new RGB(78, 201, 176);   // #4EC9B0 teal
+            syntaxNumber     = new RGB(181, 206, 168);  // #B5CEA8 light green
+            syntaxAnnotation = new RGB(220, 220, 170);  // #DCDCAA yellow
+
             statusBarBg = new RGB(24, 24, 24);
             statusBarText = new RGB(120, 120, 120);
             statusBarAccent = new RGB(75, 180, 100);
@@ -196,10 +204,20 @@ public class ThemeManager {
             toolCompletedColor = new RGB(40, 140, 70);
             toolFailedColor = new RGB(200, 50, 50);
 
-            codeBg = new RGB(30, 30, 30);       // code blocks always dark
-            codeHeaderBg = new RGB(45, 45, 45);
-            codeText = new RGB(212, 212, 212);
-            codeLangText = new RGB(150, 150, 150);
+            // Code blocks adapt to the surrounding theme — light background
+            // with darker text, like VS Code Light+ and the GitHub light code style.
+            codeBg = new RGB(246, 248, 250);     // off-white
+            codeHeaderBg = new RGB(232, 234, 238);
+            codeText = new RGB(36, 41, 46);      // near-black
+            codeLangText = new RGB(106, 115, 125);
+
+            // VS Code Light+ palette (works on the light background above)
+            syntaxKeyword    = new RGB(0, 0, 255);     // #0000FF blue
+            syntaxString     = new RGB(163, 21, 21);   // #A31515 dark red
+            syntaxComment    = new RGB(0, 128, 0);     // #008000 green
+            syntaxType       = new RGB(38, 127, 153);  // #267F99 teal
+            syntaxNumber     = new RGB(9, 134, 88);    // #098658 green
+            syntaxAnnotation = new RGB(121, 94, 38);   // #795E26 brown
 
             statusBarBg = new RGB(240, 240, 242);
             statusBarText = new RGB(100, 100, 100);
