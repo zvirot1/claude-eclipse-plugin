@@ -160,8 +160,9 @@ public class NdjsonProtocolHandler {
                 new InputStreamReader(stderr, StandardCharsets.UTF_8))) {
             String line;
             while (running && (line = reader.readLine()) != null) {
-                // Log stderr to System.err for debugging
+                // Log stderr — always (info), and tag for diag filtering
                 Activator.logInfo("[Claude CLI stderr] " + line);
+                Activator.logDiag("[DIAG-STDERR] " + line);
             }
         } catch (IOException e) {
             // stderr closed - normal during shutdown
@@ -177,6 +178,24 @@ public class NdjsonProtocolHandler {
         Map<String, Object> json = JsonParser.parseObject(jsonLine);
         String type = JsonParser.getString(json, "type");
         if (type == null) return null;
+
+        // Diagnostic: log full content of system + empty-result messages so we can
+        // tell init from hook-block from compact_boundary etc. (the plugin currently
+        // treats every "system" type as init, losing the subtype detail).
+        if ("system".equals(type)) {
+            String subtype = JsonParser.getString(json, "subtype");
+            String rawSnip = jsonLine.substring(0, Math.min(500, jsonLine.length())).replace("\n", "\\n");
+            Activator.logDiag("[DIAG-RAW-SYSTEM] subtype=" + subtype + " raw=" + rawSnip);
+        } else if ("result".equals(type)) {
+            String subtype = JsonParser.getString(json, "subtype");
+            String result = JsonParser.getString(json, "result");
+            int resLen = result != null ? result.length() : 0;
+            if (resLen == 0 || (subtype != null && !"success".equals(subtype))) {
+                String rawSnip = jsonLine.substring(0, Math.min(800, jsonLine.length())).replace("\n", "\\n");
+                Activator.logDiag("[DIAG-RAW-RESULT] subtype=" + subtype + " resultLen=" + resLen
+                        + " raw=" + rawSnip);
+            }
+        }
 
         switch (type) {
             case "system":
