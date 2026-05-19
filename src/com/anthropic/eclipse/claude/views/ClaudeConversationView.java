@@ -177,6 +177,20 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private volatile String cachedActiveFilePath;
     private volatile long   cachedActiveFileMtime;
     private volatile String cachedActiveFileContent;
+    // Debounced + follow-mode scroll used by onStreamingTextAppended.
+    // The previous behaviour ran scrollToBottom() — a full message-container
+    // layout + 2 nested asyncExecs walking every MessageComposite — for every
+    // text delta. With a 155-message history streaming a 5KB reply at 20
+    // deltas/second that pinned a CPU core; corporate users reported the
+    // plug-in being hot during chat. Now we coalesce repeated requests onto a
+    // single 150ms timer and skip the scroll entirely when the user has
+    // scrolled up to read earlier history.
+    private static final int SCROLL_DEBOUNCE_MS = 150;
+    private static final int SCROLL_FOLLOW_TOLERANCE_PX = 100;
+    private final Runnable scrollDebounceTick = () -> {
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        if (isNearBottom()) scrollToBottom();
+    };
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -2491,7 +2505,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             MessageComposite widget = messageWidgetMap.get(block);
             if (widget != null && !widget.isDisposed()) {
                 widget.appendStreamingText(delta);
-                scrollToBottom();
+                // Debounced + follow-mode: coalesces a burst of deltas to one
+                // layout per 150ms and skips when the user has scrolled up.
+                scheduleScrollToBottomIfFollowing();
             }
         });
     }
@@ -4236,6 +4252,43 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private void clearConversation() {
         hideThinkingIndicator();
         model.clear();
+    }
+
+    /**
+     * Schedule a scroll-to-bottom 150ms from now, coalescing repeated calls.
+     * Used by the streaming-text handler so a fast model that fires 20+ text
+     * deltas per second triggers ONE full-tree layout per 150ms instead of one
+     * per delta — eliminating the CPU hot spot users reported during long
+     * responses on long conversations.
+     * <p>
+     * If the user has scrolled away from the bottom (more than
+     * {@link #SCROLL_FOLLOW_TOLERANCE_PX}px above content end), the scroll is
+     * skipped entirely — they are reading earlier history and don't want to
+     * be yanked back. This mirrors typical chat-app "follow mode" UX.
+     */
+    private void scheduleScrollToBottomIfFollowing() {
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        // Display.timerExec with the same Runnable replaces any prior schedule,
+        // so the debounce is automatic.
+        Display.getDefault().timerExec(SCROLL_DEBOUNCE_MS, scrollDebounceTick);
+    }
+
+    /**
+     * True when the viewport is within {@link #SCROLL_FOLLOW_TOLERANCE_PX}px of
+     * the bottom of the content (i.e., the user is essentially watching the
+     * tail). Used to decide whether streaming updates should pull them down.
+     */
+    private boolean isNearBottom() {
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return true;
+        try {
+            org.eclipse.swt.graphics.Point origin = scrolledMessages.getOrigin();
+            int viewportH = scrolledMessages.getClientArea().height;
+            int contentH = messageContainer.getSize().y;
+            int distanceFromBottom = contentH - (origin.y + viewportH);
+            return distanceFromBottom <= SCROLL_FOLLOW_TOLERANCE_PX;
+        } catch (Throwable t) {
+            return true; // safe default — keep scrolling
+        }
     }
 
     private void scrollToBottom() {
