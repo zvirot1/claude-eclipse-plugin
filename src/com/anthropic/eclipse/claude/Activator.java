@@ -92,6 +92,25 @@ public class Activator extends AbstractUIPlugin {
         // Migrate API key from plain preference store to encrypted secure storage (one-time)
         SecureApiKeyStore.migrateIfNeeded();
 
+        // Ensure the configured Local skills folder exists. Without this, the
+        // Preferences page's DirectoryFieldEditor for SKILLS_FOLDER refuses to
+        // validate ("Value must be an existing directory") and disables Apply
+        // for the entire Claude AI preference page — locking the user out of
+        // every unrelated setting (model, API key, theme, ...). Idempotent.
+        try {
+            String configured = getPreferenceStore().getString(
+                    com.anthropic.eclipse.claude.preferences.PreferenceConstants.SKILLS_FOLDER);
+            if (configured == null || configured.isBlank()) {
+                configured = java.nio.file.Paths.get(
+                        System.getProperty("user.home"), ".claude", "skills").toString();
+            }
+            java.nio.file.Files.createDirectories(java.nio.file.Paths.get(configured));
+        } catch (Throwable t) {
+            // Best-effort: a permission error here just leaves the user with
+            // the original validation issue, but never breaks plug-in start.
+            logWarning("[Activator] could not create skills folder: " + t.getMessage());
+        }
+
         // Initialize DIAG_ENABLED from preference (OR'd with the system-property default)
         try {
             boolean prefEnabled = getPreferenceStore().getBoolean(
