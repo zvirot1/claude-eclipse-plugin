@@ -473,6 +473,20 @@ public class ConversationModel implements ICliMessageListener {
         String eventType = event.getEventType();
         if (eventType == null) return;
 
+        // Fire the generic listener BEFORE any type-specific dispatch so
+        // listeners see every event — used by the view to keep the
+        // streaming-timeout alive during long thinking / tool-input blocks
+        // that never produce a text_delta.
+        String deltaType = null;
+        String toolName = null;
+        try {
+            CliMessage.Delta d = event.getDelta();
+            if (d != null) deltaType = d.getType();
+            CliMessage.ContentBlock cb = event.getContentBlock();
+            if (cb != null && "tool_use".equals(cb.getType())) toolName = cb.getName();
+        } catch (Throwable ignored) {}
+        fireStreamEvent(eventType, deltaType, toolName);
+
         switch (eventType) {
             case "message_start":
                 handleMessageStart(event);
@@ -851,6 +865,12 @@ public class ConversationModel implements ICliMessageListener {
     private void fireStreamingTextAppended(MessageBlock block, String delta) {
         for (IConversationListener l : listeners) {
             try { l.onStreamingTextAppended(block, delta); } catch (Exception e) { logError(e); }
+        }
+    }
+
+    private void fireStreamEvent(String eventType, String deltaType, String toolName) {
+        for (IConversationListener l : listeners) {
+            try { l.onStreamEvent(eventType, deltaType, toolName); } catch (Exception e) { logError(e); }
         }
     }
 
