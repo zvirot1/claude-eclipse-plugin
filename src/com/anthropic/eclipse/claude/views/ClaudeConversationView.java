@@ -131,6 +131,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     // distinction between "still booting" and "model is composing a reply".
     private volatile boolean sessionReady = false;
     private long thinkingStartedAt = 0L;
+    // Last observed delta type — used by updateThinkingLabel to show
+    // "Reasoning…" vs "Building <tool>…" vs the generic "Thinking…" so the
+    // user sees what the model is doing even when no visible text streams.
+    private volatile String lastDeltaType;
+    private volatile String lastToolBeingBuilt;
 
     // State
     private final Map<MessageBlock, MessageComposite> messageWidgetMap = new LinkedHashMap<>();
@@ -2757,6 +2762,27 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     }
 
     @Override
+    public void onStreamEvent(String eventType, String deltaType, String toolName) {
+        // Treat ANY stream event as proof that the CLI is still working —
+        // this keeps the 120-s streaming-timeout alive during long thinking
+        // or tool-input phases that don't produce text_delta and otherwise
+        // would have made the check believe the stream went dead.
+        touchStreamActivity();
+        // Record the activity type so updateThinkingLabel can show what the
+        // model is currently doing.
+        if (deltaType != null) {
+            lastDeltaType = deltaType;
+        }
+        if (toolName != null) {
+            lastToolBeingBuilt = toolName;
+        }
+        // Refresh the indicator label opportunistically so the "🧠 Reasoning…
+        // (Ns)" / "🛠 Building <tool>… (Ns)" text updates promptly. Hop to
+        // the UI thread because we may be on the NDJSON reader thread.
+        asyncExec(this::updateThinkingLabel);
+    }
+
+    @Override
     public void onPermissionRequested(String toolUseId, String toolName, String description,
                                       String requestId, Object toolInput) {
         // Snapshot file BEFORE tool executes — input is fully available here (unlike onToolCallStarted)
@@ -4339,6 +4365,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (thinkingIndicator != null && !thinkingIndicator.isDisposed()) return;
 
         extendedThinking = false;
+        // Reset per-turn activity classification so the label doesn't show
+        // stale "Building <tool>…" text inherited from the previous turn.
+        lastDeltaType = null;
+        lastToolBeingBuilt = null;
 
         thinkingIndicator = new Composite(messageContainer, SWT.NONE);
         org.eclipse.swt.layout.RowLayout rowLayout = new org.eclipse.swt.layout.RowLayout(SWT.HORIZONTAL);
@@ -4411,8 +4441,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         String text;
         if (!sessionReady) {
             text = "⏳ Starting Claude CLI… (" + elapsed + "s)";
-        } else if (extendedThinking) {
+        } else if (extendedThinking || "thinking_delta".equals(lastDeltaType)) {
             text = "🧠 Claude is reasoning… (" + elapsed + "s)";
+        } else if ("input_json_delta".equals(lastDeltaType) && lastToolBeingBuilt != null) {
+            text = "🛠 Claude is building " + lastToolBeingBuilt + "… (" + elapsed + "s)";
+        } else if ("input_json_delta".equals(lastDeltaType)) {
+            text = "🛠 Claude is preparing a tool call… (" + elapsed + "s)";
         } else {
             text = "✨ Claude is thinking… (" + elapsed + "s)";
         }
@@ -4495,23 +4529,42 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         long elapsed = System.currentTimeMillis() - lastStreamActivityTime;
         if (elapsed >= STREAMING_TIMEOUT_MS) {
-            // Genuine timeout: no activity and no running tool for the full timeout period
-            streamingActive = false;
-            model.markActiveToolCallsFailed("No response for " + (elapsed / 1000) + "s — stream timed out");
-            hideThinkingIndicator();
-            // Create a tracked error block so we can dismiss it if the stream recovers
-            timeoutErrorBlock = new MessageBlock(MessageBlock.Role.ERROR);
-            MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
-            textSeg.appendText("\u23F1 Claude stopped responding after "
-                + (elapsed / 1000)
-                + " seconds with no activity.\nClick \u21BA to reconnect.");
-            timeoutErrorBlock.addSegment(textSeg);
-            MessageComposite widget = new MessageComposite(messageContainer, timeoutErrorBlock);
-            messageWidgetMap.put(timeoutErrorBlock, widget);
-            scrollToBottom();
-            if (!stopButton.isDisposed()) stopButton.setEnabled(false);
-            costBar.setStatus("Timeout");
-            costBar.showToast("\u26A0 Response timed out", 4000);
+            // No stream events for the full timeout window. With the
+            // onStreamEvent hook keeping activity alive for thinking /
+            // tool-input phases, this is a stronger signal than it used to
+            // be, but corporate proxies can still produce big batched gaps,
+            // so we treat it informationally rather than as a fatal error:
+            //   * Do NOT mark in-flight tool calls as failed.
+            //   * Do NOT disable the stop button — the user may still want
+            //     to cancel, and a recovered stream should keep working.
+            //   * Do NOT hide the thinking indicator — its elapsed counter
+            //     is still the best signal to the user that something might
+            //     yet happen.
+            //   * Replace the alarming "stopped responding" wording with a
+            //     calm informational bubble.
+            // We keep rescheduling so we can dismiss the bubble the moment
+            // activity returns (the touchStreamActivity → asyncExec path in
+            // onStreamEvent already nulls timeoutErrorBlock there).
+            long mins = elapsed / 60_000L;
+            String elapsedHuman = (mins > 0)
+                    ? (mins + " min" + (mins == 1 ? "" : "s"))
+                    : ((elapsed / 1000L) + "s");
+            String msg = "\u23F1 No visible activity for " + elapsedHuman + "."
+                    + "\nClaude is still connected; it may be reasoning or building a long result."
+                    + "\nKeep waiting, or click the \u25A0 stop button if you want to cancel.";
+            if (timeoutErrorBlock == null) {
+                timeoutErrorBlock = new MessageBlock(MessageBlock.Role.SYSTEM);
+                MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
+                textSeg.appendText(msg);
+                timeoutErrorBlock.addSegment(textSeg);
+                MessageComposite widget = new MessageComposite(messageContainer, timeoutErrorBlock);
+                messageWidgetMap.put(timeoutErrorBlock, widget);
+                scrollToBottom();
+            }
+            costBar.setStatus("Still working\u2026 (" + elapsedHuman + " silent)");
+            // Re-arm the check so we can refresh on continued silence and
+            // dismiss the moment activity returns.
+            Display.getDefault().timerExec((int) STREAMING_TIMEOUT_MS, this::checkStreamingTimeout);
         } else {
             // Activity happened after the last check — reschedule for the remaining time
             long remaining = STREAMING_TIMEOUT_MS - elapsed;
