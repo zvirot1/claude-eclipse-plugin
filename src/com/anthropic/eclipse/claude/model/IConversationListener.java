@@ -110,4 +110,21 @@ public interface IConversationListener {
      * Called when the conversation is cleared.
      */
     default void onConversationCleared() {}
+
+    /**
+     * Called for EVERY stream event the model receives — fired before any
+     * type-specific handler. Used by the view as the canonical "stream is
+     * alive" signal so the streaming-timeout check doesn't false-fire during
+     * a long extended-thinking phase or a tool-input being built (both of
+     * those produce content_block_delta events that don't carry visible text
+     * and therefore never reach onStreamingTextAppended).
+     *
+     * @param deltaType  for content_block_delta: one of "text_delta",
+     *                   "input_json_delta", "thinking_delta", "signature_delta", null;
+     *                   for other events ("message_start", "content_block_start",
+     *                   "content_block_stop", "message_delta", "message_stop"): null
+     * @param toolName   when a tool_use content block is being built, the
+     *                   tool's name (e.g. "Write", "Bash"); null otherwise
+     */
+    default void onStreamEvent(String eventType, String deltaType, String toolName) {}
 }
