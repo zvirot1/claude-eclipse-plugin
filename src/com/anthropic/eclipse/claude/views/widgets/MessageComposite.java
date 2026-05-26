@@ -25,6 +25,11 @@ public class MessageComposite extends Composite {
 
     private final MessageBlock messageBlock;
     private Composite contentArea;
+    private Label timestampLabel; // right side of header row; toggled by SHOW_MESSAGE_TIMESTAMPS
+    /** Wall-clock ms when finalizeContent() ran. Used by the assistant
+     *  bubble's "HH:MM:SS · 23s" timestamp so duration reflects when the
+     *  reply ended, not when it began streaming. */
+    private long finishedAtMs = 0L;
     private StreamingTextWidget currentTextWidget;
     private final List<ToolCallComposite> toolCallWidgets = new ArrayList<>();
     private final List<CodeBlockComposite> codeBlockWidgets = new ArrayList<>();
@@ -129,8 +134,19 @@ public class MessageComposite extends Composite {
     private void createRoleHeader() {
         ThemeManager tm = ThemeManager.getInstance();
 
+        // Header row: role label on the left, timestamp on the right.
+        // Wrapping inside a 2-column composite keeps the click-to-fork
+        // behaviour on the role label and lets the timestamp toggle
+        // independently via the SHOW_MESSAGE_TIMESTAMPS preference.
+        Composite headerRow = new Composite(this, SWT.NONE);
+        GridLayout hl = new GridLayout(2, false);
+        hl.marginWidth = 0; hl.marginHeight = 0; hl.horizontalSpacing = 8;
+        headerRow.setLayout(hl);
+        headerRow.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+        headerRow.setBackground(getBackground());
+
         // Role label — click to show Fork menu
-        Label roleLabel = new Label(this, SWT.NONE);
+        Label roleLabel = new Label(headerRow, SWT.NONE);
         String roleText;
         switch (messageBlock.getRole()) {
             case USER:
@@ -151,12 +167,33 @@ public class MessageComposite extends Composite {
         roleLabel.setText(roleText);
         roleLabel.setForeground(roleColor);
         roleLabel.setBackground(getBackground());
-        roleLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        roleLabel.setLayoutData(new GridData(SWT.LEFT, SWT.CENTER, true, false));
         roleLabel.setCursor(getDisplay().getSystemCursor(SWT.CURSOR_HAND));
 
         Font boldFont = new Font(getDisplay(), tm.getUIFontName(), 10, SWT.BOLD);
         roleLabel.setFont(boldFont);
         roleLabel.addDisposeListener(e -> boldFont.dispose());
+
+        // Timestamp label (right-aligned, smaller + dimmer font). Visibility
+        // is governed by the SHOW_MESSAGE_TIMESTAMPS preference and can be
+        // toggled live from ClaudeConversationView via setTimestampVisible.
+        timestampLabel = new Label(headerRow, SWT.NONE);
+        timestampLabel.setBackground(getBackground());
+        org.eclipse.swt.graphics.Color dim = new org.eclipse.swt.graphics.Color(
+                getDisplay(), 130, 130, 135);
+        timestampLabel.setForeground(dim);
+        timestampLabel.addDisposeListener(e -> dim.dispose());
+        Font smallFont = new Font(getDisplay(), tm.getUIFontName(), 9, SWT.NORMAL);
+        timestampLabel.setFont(smallFont);
+        timestampLabel.addDisposeListener(e -> smallFont.dispose());
+        timestampLabel.setLayoutData(new GridData(SWT.RIGHT, SWT.CENTER, false, false));
+        boolean show = true;
+        try {
+            show = com.anthropic.eclipse.claude.Activator.getDefault().getPreferenceStore()
+                    .getBoolean(com.anthropic.eclipse.claude.preferences.PreferenceConstants.SHOW_MESSAGE_TIMESTAMPS);
+        } catch (Throwable ignored) {}
+        refreshTimestampLabel();
+        applyTimestampVisibility(show);
 
         // Click on role label → show Fork popup menu
         roleLabel.addListener(SWT.MouseDown, e -> {
@@ -183,6 +220,86 @@ public class MessageComposite extends Composite {
             popup.setLocation(loc);
             popup.setVisible(true);
         });
+    }
+
+    /**
+     * Format the timestamp label text. USER + SYSTEM + ERROR bubbles show
+     * "HH:MM:SS"; ASSISTANT bubbles append " · 23s" or " · 1m 5s" measuring
+     * the elapsed time from the preceding USER bubble (looked up via the
+     * parent message container's children list). Called on initial render
+     * and re-called whenever the message completes streaming so the
+     * duration text can settle to its final value.
+     */
+    private void refreshTimestampLabel() {
+        if (timestampLabel == null || timestampLabel.isDisposed()) return;
+        long ts = messageBlock.getTimestamp();
+        java.time.LocalTime lt = java.time.Instant.ofEpochMilli(ts)
+                .atZone(java.time.ZoneId.systemDefault()).toLocalTime();
+        String hhmmss = String.format("%02d:%02d:%02d", lt.getHour(), lt.getMinute(), lt.getSecond());
+        String text;
+        if (messageBlock.getRole() == MessageBlock.Role.ASSISTANT) {
+            long durMs = computeAssistantDurationMs();
+            text = (durMs > 0) ? (hhmmss + " · " + formatDuration(durMs)) : hhmmss;
+        } else {
+            text = hhmmss;
+        }
+        timestampLabel.setText(text);
+        if (timestampLabel.getParent() != null && !timestampLabel.getParent().isDisposed()) {
+            timestampLabel.getParent().layout(true, true);
+        }
+    }
+
+    /** Apply visibility from the SHOW_MESSAGE_TIMESTAMPS preference. */
+    private void applyTimestampVisibility(boolean visible) {
+        if (timestampLabel == null || timestampLabel.isDisposed()) return;
+        GridData gd = (GridData) timestampLabel.getLayoutData();
+        if (gd != null) gd.exclude = !visible;
+        timestampLabel.setVisible(visible);
+        if (timestampLabel.getParent() != null && !timestampLabel.getParent().isDisposed()) {
+            timestampLabel.getParent().layout(true, true);
+        }
+    }
+
+    /** Called by ClaudeConversationView when the preference toggles at runtime. */
+    public void setTimestampVisible(boolean visible) {
+        applyTimestampVisibility(visible);
+    }
+
+    /** Recompute timestamp label — used after streaming completes so the duration is final. */
+    public void refreshTimestamp() {
+        refreshTimestampLabel();
+    }
+
+    private long computeAssistantDurationMs() {
+        // We can only compute a stable duration after the assistant turn has
+        // finished streaming (finalizeContent captures finishedAtMs). Before
+        // that, return -1 so the timestamp label shows time-of-arrival only.
+        if (finishedAtMs <= 0) return -1;
+        if (getParent() == null || getParent().isDisposed()) return -1;
+        org.eclipse.swt.widgets.Control[] siblings = getParent().getChildren();
+        int myIdx = -1;
+        for (int i = 0; i < siblings.length; i++) {
+            if (siblings[i] == this) { myIdx = i; break; }
+        }
+        if (myIdx <= 0) return -1;
+        for (int i = myIdx - 1; i >= 0; i--) {
+            if (siblings[i] instanceof MessageComposite) {
+                MessageComposite mc = (MessageComposite) siblings[i];
+                if (mc.messageBlock != null
+                        && mc.messageBlock.getRole() == MessageBlock.Role.USER) {
+                    return finishedAtMs - mc.messageBlock.getTimestamp();
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static String formatDuration(long ms) {
+        long s = ms / 1000L;
+        if (s < 60) return s + "s";
+        long m = s / 60L;
+        long rs = s % 60L;
+        return (rs == 0) ? (m + "m") : (m + "m " + rs + "s");
     }
 
     private void renderExistingContent() {
@@ -415,6 +532,7 @@ public class MessageComposite extends Composite {
     public void finalizeContent() {
         if (finalized) return; // Prevent double finalization
         finalized = true;
+        finishedAtMs = System.currentTimeMillis();
 
         // If streaming was disabled, the text widget may be empty or not exist.
         // Populate it from the MessageBlock's accumulated text.
@@ -437,6 +555,11 @@ public class MessageComposite extends Composite {
         if (currentTextWidget != null && !currentTextWidget.isFinalized()) {
             finalizeAndExtractCodeBlocks(currentTextWidget);
         }
+        // Update the timestamp label so an ASSISTANT bubble's "HH:MM:SS · 23s"
+        // duration reflects the actual end-of-stream — without this it would
+        // still display the duration computed when the bubble was first
+        // created (when the user message ms ≈ assistant ms).
+        refreshTimestampLabel();
         relayoutParent();
     }
 

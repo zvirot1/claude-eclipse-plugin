@@ -182,6 +182,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private volatile String cachedActiveFilePath;
     private volatile long   cachedActiveFileMtime;
     private volatile String cachedActiveFileContent;
+    private org.eclipse.jface.util.IPropertyChangeListener timestampPrefListener;
     // Debounced + follow-mode scroll used by onStreamingTextAppended.
     // The previous behaviour ran scrollToBottom() — a full message-container
     // layout + 2 nested asyncExecs walking every MessageComposite — for every
@@ -934,6 +935,29 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         } catch (Exception ignored) {}
         installActiveEditorListener();
         updateActiveFileChipLabel();
+
+        // Live-toggle per-bubble timestamps when the user flips the preference
+        // — walk every already-rendered MessageComposite and call its
+        // setTimestampVisible(). Without this, the user would only see the
+        // change apply to new messages, which feels broken. The listener
+        // reference is stored in `timestampPrefListener` so dispose() can
+        // unregister it cleanly.
+        try {
+            timestampPrefListener = evt -> {
+                if (!PreferenceConstants.SHOW_MESSAGE_TIMESTAMPS.equals(evt.getProperty())) return;
+                final boolean show = Boolean.parseBoolean(String.valueOf(evt.getNewValue()));
+                asyncExec(() -> {
+                    for (MessageComposite mc : messageWidgetMap.values()) {
+                        if (!mc.isDisposed()) mc.setTimestampVisible(show);
+                    }
+                    if (messageContainer != null && !messageContainer.isDisposed()) {
+                        messageContainer.layout(true, true);
+                    }
+                });
+            };
+            Activator.getDefault().getPreferenceStore()
+                    .addPropertyChangeListener(timestampPrefListener);
+        } catch (Throwable ignored) {}
 
         // Row 1: Text input area (full width)
         inputField = new Text(inputBox, SWT.MULTI | SWT.WRAP | SWT.V_SCROLL);
@@ -4678,6 +4702,15 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (activeFilePartListener != null) {
             try { getSite().getPage().removePartListener(activeFilePartListener); } catch (Exception ignored) {}
             activeFilePartListener = null;
+        }
+        // Unregister the timestamp-preference listener so the global prefs
+        // store doesn't keep a reference to this disposed view.
+        if (timestampPrefListener != null) {
+            try {
+                Activator.getDefault().getPreferenceStore()
+                        .removePropertyChangeListener(timestampPrefListener);
+            } catch (Throwable ignored) {}
+            timestampPrefListener = null;
         }
 
         if (model != null) {

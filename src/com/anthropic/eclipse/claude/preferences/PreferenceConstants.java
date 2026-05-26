@@ -55,4 +55,11 @@ public class PreferenceConstants {
     // The CLI's auto-generated session summary is also picked up on Resume
     // and Session History, regardless of this preference.
     public static final String TAB_TITLE_STRATEGY = "tabTitleStrategy";
+
+    // Per-bubble timestamps — when true, every user and assistant message
+    // shows a small "HH:MM:SS" stamp in its header. Assistant messages also
+    // include a duration relative to the preceding user message (e.g.
+    // "14:30:45 · 23s"). Default true. Toggling the preference live-refreshes
+    // every already-rendered bubble in open Claude tabs.
+    public static final String SHOW_MESSAGE_TIMESTAMPS = "showMessageTimestamps";
 }
