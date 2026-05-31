@@ -1,8 +1,14 @@
-# Claude AI Plugin for Eclipse (Unofficial)
+# Claude Code Eclipse Plug-in (Leumi Internal)
 
-A full-featured Eclipse IDE plugin for working with **Claude Code** directly inside Eclipse — chat, tool execution, MCP servers, file context, image attachments, and more. Built around the Claude CLI's `stream-json` protocol.
+An Eclipse IDE plug-in that wraps the official Claude Code CLI inside Eclipse — chat, tool execution, MCP servers, file context, image attachments, and more. Built around the Claude CLI's `stream-json` protocol.
 
-> **Note:** This is an unofficial community plugin. It uses the official Claude CLI under the hood.
+> **Disclaimer**
+>
+> This is an **internal Bank Leumi plug-in**. It is **not produced by, affiliated with, endorsed by, or supported by Anthropic**. The plug-in invokes the official Claude Code CLI as an external process; the Anthropic CLI is itself unmodified.
+>
+> "**Claude**" and "**Claude Code**" are trademarks of **Anthropic, PBC**, used here only nominatively to describe what the plug-in integrates with. All Anthropic trademarks remain the property of Anthropic.
+>
+> The plug-in is provided **as-is, for internal use** — no warranty, no support contract, no SLA. Vendor field in Eclipse reads "Leumi Internal".
 
 ---
 
@@ -241,15 +247,17 @@ For bug reports, please include:
 
 ---
 
-## 📜 License
+## 📜 License & Trademarks
 
-Provided as-is for personal/community use.
+Internal Bank Leumi build. Provided as-is, for internal use only. No warranty.
 
-The plugin uses the official **Claude Code CLI** by Anthropic, which has its own terms of service.
+The plug-in spawns the official **Claude Code CLI** (`@anthropic-ai/claude-code`) as an external process; that CLI is governed by **Anthropic's** own terms of service.
+
+"**Claude**" and "**Claude Code**" are trademarks of **Anthropic, PBC**. Their use here is nominative — to identify the third-party CLI that the plug-in integrates with — and does **not** imply any affiliation with, endorsement by, or support from Anthropic.
 
 ---
 
 ## 🙏 Credits
 
-Built on top of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) by Anthropic.
-Inspired by VS Code's Claude extension and Amazon Q Developer.
+This plug-in wraps [Claude Code](https://docs.anthropic.com/en/docs/claude-code), a product of Anthropic, PBC — used as an unmodified external CLI.
+UX patterns were inspired by Anthropic's official VS Code extension and Amazon Q Developer; no code from either is reused.

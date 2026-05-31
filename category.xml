@@ -3,7 +3,7 @@
    <feature id="com.anthropic.eclipse.claude.feature" version="0.0.0">
       <category name="claude"/>
    </feature>
-   <category-def name="claude" label="Claude AI">
-      <description>Claude AI plugin for Eclipse</description>
+   <category-def name="claude" label="Claude AI (Leumi Internal)">
+      <description>Internal Bank Leumi Eclipse plug-in that wraps the Claude Code CLI. Not produced by, affiliated with or endorsed by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC.</description>
    </category-def>
 </site>

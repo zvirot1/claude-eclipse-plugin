@@ -82,6 +82,16 @@ public class ConversationModel implements ICliMessageListener {
     private volatile long pendingHookStartNanos;
     private volatile String pendingHookName;
 
+    /**
+     * True when handleAssistantMessage just added a non-stream snapshot
+     * MessageBlock to {@link #messages} and the corresponding stream events
+     * may yet arrive. Consumed by handleMessageStart so it only deletes the
+     * "previous" assistant message when it really is a duplicate of the
+     * incoming stream — and not a legitimate intermediate response from a
+     * prior turn (e.g. "I'll check the memory files" before a Read tool).
+     */
+    private volatile boolean pendingAssistantSnapshot = false;
+
     // ==================== ICliMessageListener Implementation ====================
 
     @Override
@@ -190,6 +200,11 @@ public class ConversationModel implements ICliMessageListener {
         retriedSilentEmpty = false;
         turnSendNanos = System.nanoTime();
         firstTokenLoggedThisTurn = false;
+        // A new user turn starts — any snapshot we might have left "pending"
+        // from the previous turn is now definitely committed (the previous
+        // result event already fired), so clear it to avoid an accidental
+        // dedup of the new turn's intermediate output.
+        pendingAssistantSnapshot = false;
 
         MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
         MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
@@ -383,6 +398,9 @@ public class ConversationModel implements ICliMessageListener {
             synchronized (messages) {
                 messages.add(block);
             }
+            // Flag the just-added snapshot so a stream that arrives next
+            // (containing the same content) can dedup it in handleMessageStart.
+            pendingAssistantSnapshot = true;
             fireAssistantMessageStarted(block);
             fireAssistantMessageCompleted(block);
         }
@@ -473,6 +491,20 @@ public class ConversationModel implements ICliMessageListener {
         String eventType = event.getEventType();
         if (eventType == null) return;
 
+        // Fire the generic listener BEFORE any type-specific dispatch so
+        // listeners see every event — used by the view to keep the
+        // streaming-timeout alive during long thinking / tool-input blocks
+        // that never produce a text_delta.
+        String deltaType = null;
+        String toolName = null;
+        try {
+            CliMessage.Delta d = event.getDelta();
+            if (d != null) deltaType = d.getType();
+            CliMessage.ContentBlock cb = event.getContentBlock();
+            if (cb != null && "tool_use".equals(cb.getType())) toolName = cb.getName();
+        } catch (Throwable ignored) {}
+        fireStreamEvent(eventType, deltaType, toolName);
+
         switch (eventType) {
             case "message_start":
                 handleMessageStart(event);
@@ -497,25 +529,33 @@ public class ConversationModel implements ICliMessageListener {
 
     private void handleMessageStart(CliMessage.StreamEvent event) {
         Activator.logDiag("[DIAG] handleMessageStart: prev usingStreamEvents=" + usingStreamEvents
-                + " currentStreamingBlock=" + (currentStreamingBlock != null));
+                + " currentStreamingBlock=" + (currentStreamingBlock != null)
+                + " pendingAssistantSnapshot=" + pendingAssistantSnapshot);
         // Start a new assistant message — but don't fire onAssistantMessageStarted yet.
         // We defer that until the first content block arrives so we never show an empty bubble.
         usingStreamEvents = true; // stream events are now driving this response
 
-        // Guard: if the CLI already sent a full "assistant" message for this same turn
-        // (before the stream events arrived), remove it to avoid duplicate bubbles.
-        synchronized (messages) {
-            if (!messages.isEmpty()) {
-                MessageBlock lastMsg = messages.get(messages.size() - 1);
-                if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg != currentStreamingBlock) {
-                    String prev = lastMsg.getFullText();
-                    Activator.logDiag("[DIAG] handleMessageStart REMOVED prev assistant block, len="
-                            + (prev != null ? prev.length() : 0));
-                    messages.remove(messages.size() - 1);
-                    fireAssistantMessageRemoved(lastMsg);
+        // Dedup ONLY when handleAssistantMessage just added a snapshot that the
+        // upcoming stream is about to recreate. Without this gate, every
+        // message_start (e.g. the start of the assistant's follow-up reply
+        // after a tool call) was removing the previous assistant bubble —
+        // wiping legitimate intermediate responses like "I'll check the
+        // memory files first" before a Read tool.
+        if (pendingAssistantSnapshot) {
+            synchronized (messages) {
+                if (!messages.isEmpty()) {
+                    MessageBlock lastMsg = messages.get(messages.size() - 1);
+                    if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg != currentStreamingBlock) {
+                        String prev = lastMsg.getFullText();
+                        Activator.logDiag("[DIAG] handleMessageStart REMOVED snapshot, len="
+                                + (prev != null ? prev.length() : 0));
+                        messages.remove(messages.size() - 1);
+                        fireAssistantMessageRemoved(lastMsg);
+                    }
                 }
             }
         }
+        pendingAssistantSnapshot = false;
 
         currentStreamingBlock = new MessageBlock(MessageBlock.Role.ASSISTANT);
         synchronized (messages) {
@@ -851,6 +891,12 @@ public class ConversationModel implements ICliMessageListener {
     private void fireStreamingTextAppended(MessageBlock block, String delta) {
         for (IConversationListener l : listeners) {
             try { l.onStreamingTextAppended(block, delta); } catch (Exception e) { logError(e); }
+        }
+    }
+
+    private void fireStreamEvent(String eventType, String deltaType, String toolName) {
+        for (IConversationListener l : listeners) {
+            try { l.onStreamEvent(eventType, deltaType, toolName); } catch (Exception e) { logError(e); }
         }
     }
 

@@ -75,11 +75,11 @@ rm -rf "$FEATURE_WORK" && mkdir -p "$FEATURE_WORK/META-INF"
 
 cat > "$FEATURE_WORK/feature.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<feature id="${FEATURE_ID}" label="Claude AI Eclipse Plugin"
-         version="${VERSION}" provider-name="Anthropic (Unofficial)">
-   <description url="https://github.com/anthropics/claude-code">Unofficial Claude AI plugin for Eclipse IDE.</description>
-   <copyright>Copyright (c) 2024 Anthropic (Unofficial). All rights reserved.</copyright>
-   <license>This plugin is provided as-is for personal use.</license>
+<feature id="${FEATURE_ID}" label="Claude AI Eclipse Plugin (Leumi Internal)"
+         version="${VERSION}" provider-name="Leumi Internal">
+   <description url="https://vstsleumi.visualstudio.com/AI-helper-extensions/_git/claude-eclipse-plugin">Internal Bank Leumi Eclipse plug-in wrapping the official Claude Code CLI. Not produced by, affiliated with, endorsed by or supported by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC.</description>
+   <copyright>Internal Bank Leumi build. Not an Anthropic product. "Claude" and "Claude Code" are trademarks of Anthropic, PBC.</copyright>
+   <license>For internal Bank Leumi use only. Provided as-is with no warranty.</license>
    <plugin id="${PLUGIN_ID}" download-size="0" install-size="0" version="${VERSION}" unpack="false"/>
 </feature>
 EOF
@@ -112,8 +112,8 @@ cat > "$CATEGORY_FILE" <<EOF
    <feature url="features/${FEATURE_ID}_${VERSION}.jar" id="${FEATURE_ID}" version="${VERSION}">
       <category name="claude"/>
    </feature>
-   <category-def name="claude" label="Claude AI">
-      <description>Claude AI plugin for Eclipse</description>
+   <category-def name="claude" label="Claude AI (Leumi Internal)">
+      <description>Internal Bank Leumi Eclipse plug-in that wraps the Claude Code CLI. Not produced by, affiliated with or endorsed by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC.</description>
    </category-def>
 </site>
 EOF
