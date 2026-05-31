@@ -2455,9 +2455,34 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         asyncExec(() -> {
             costBar.updateSession(info);
-            connectionStatus.setText("\u2713 Connected (" + (info.getModel() != null ? info.getModel() : "claude") + ")");
+            String rawModel = info.getModel() != null ? info.getModel() : "claude";
+            connectionStatus.setText("\u2713 Connected (" + friendlyModelName(rawModel) + ")");
+            // Full ARN / model id available on hover so power-users can still read it.
+            connectionStatus.setToolTipText(rawModel);
             connectionStatus.setForeground(connectedColor);
         });
+    }
+
+    /**
+     * Shorten a model identifier for the connection-status label.
+     * Bedrock inference-profile ARNs look like
+     * "arn:aws:bedrock:eu-west-1:107001693847:application-inference-profile/j9v9aabcd"
+     * and were pushing the label so wide it clipped the toolbar buttons on the
+     * right. We strip everything before the final '/' or ':' and cap the result
+     * at 40 chars. Short plain-name models like "sonnet" / "opus" are unchanged.
+     */
+    private static String friendlyModelName(String raw) {
+        if (raw == null) return "claude";
+        String s = raw.trim();
+        if (s.isEmpty()) return "claude";
+        int slash = s.lastIndexOf('/');
+        if (slash >= 0 && slash < s.length() - 1) s = s.substring(slash + 1);
+        else {
+            int colon = s.lastIndexOf(':');
+            if (colon >= 0 && colon < s.length() - 1) s = s.substring(colon + 1);
+        }
+        if (s.length() > 40) s = s.substring(0, 37) + "...";
+        return s;
     }
 
     @Override
