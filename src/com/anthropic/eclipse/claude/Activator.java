@@ -11,6 +11,7 @@ import org.eclipse.ui.plugin.AbstractUIPlugin;
 import org.osgi.framework.BundleContext;
 
 import com.anthropic.eclipse.claude.cli.ClaudeCliManager;
+import com.anthropic.eclipse.claude.cli.ClaudeCliPidTracker;
 import com.anthropic.eclipse.claude.diff.CheckpointManager;
 import com.anthropic.eclipse.claude.diff.EditDecisionManager;
 import com.anthropic.eclipse.claude.model.ConversationModel;
@@ -27,10 +28,21 @@ public class Activator extends AbstractUIPlugin {
 
     public static final String PLUGIN_ID = "com.anthropic.eclipse.claude";
 
+    /**
+     * Diagnostic logging toggle. When true, calls to {@link #logDiag(String)}
+     * emit messages to the Error Log. When false, they're no-ops.
+     *
+     * Initial value comes from -Dclaude.diag=true (JVM system property).
+     * Updated at runtime by the preference page (DIAGNOSTIC_LOGGING).
+     */
+    public static volatile boolean DIAG_ENABLED = Boolean.getBoolean("claude.diag");
+
     private static Activator plugin;
 
     // Singleton services
-    private ClaudeCliManager cliManager;
+    // NOTE: Each conversation session owns its own ClaudeCliManager — the
+    // plugin no longer maintains a shared CLI process. See the "active CLI
+    // manager" tracking below for status-bar integration.
     private ClaudeSessionManager sessionManager;
     private EditDecisionManager editDecisionManager;
     private CheckpointManager checkpointManager;
@@ -40,6 +52,14 @@ public class Activator extends AbstractUIPlugin {
     private ConversationModel conversationModel;
     private final List<Consumer<ConversationModel>> modelChangeListeners = new CopyOnWriteArrayList<>();
 
+    // Active CLI manager — the CLI of the currently focused conversation view.
+    // The status-bar contribution listens to this so it reflects the active tab.
+    private ClaudeCliManager activeCliManager;
+    private final List<Consumer<ClaudeCliManager>> cliManagerChangeListeners = new CopyOnWriteArrayList<>();
+    // Every CLI manager that has ever been created but not yet disposed — so we
+    // can stop them all on plugin shutdown.
+    private final List<ClaudeCliManager> allCliManagers = new CopyOnWriteArrayList<>();
+
     public Activator() {}
 
     @Override
@@ -47,8 +67,23 @@ public class Activator extends AbstractUIPlugin {
         super.start(context);
         plugin = this;
 
-        // Initialize singleton services
-        cliManager = new ClaudeCliManager();
+        // Reap any Claude CLI processes left running by a previous Eclipse
+        // session that did not shut down cleanly (crash, taskkill, hard
+        // logoff). The tracker writes PIDs at spawn time and removes them on
+        // normal stop; whatever's left here is orphaned and would otherwise
+        // double-charge the corporate AV / Bedrock proxy when the user opens
+        // a new tab.
+        try {
+            int killed = ClaudeCliPidTracker.cleanupOrphans();
+            if (killed > 0) {
+                logInfo("[PidTracker] Reaped " + killed + " orphaned Claude CLI process(es) from previous session");
+            }
+        } catch (Throwable t) {
+            // Never block plug-in start on tracker hygiene.
+            logWarning("[PidTracker] cleanup failed at startup: " + t.getMessage());
+        }
+
+        // Initialize singleton services (no CLI manager here — one per session)
         sessionManager = new ClaudeSessionManager();
         editDecisionManager = new EditDecisionManager();
         checkpointManager = new CheckpointManager();
@@ -56,14 +91,58 @@ public class Activator extends AbstractUIPlugin {
 
         // Migrate API key from plain preference store to encrypted secure storage (one-time)
         SecureApiKeyStore.migrateIfNeeded();
+
+        // Ensure the configured Local skills folder exists. Without this, the
+        // Preferences page's DirectoryFieldEditor for SKILLS_FOLDER refuses to
+        // validate ("Value must be an existing directory") and disables Apply
+        // for the entire Claude AI preference page — locking the user out of
+        // every unrelated setting (model, API key, theme, ...). Idempotent.
+        try {
+            String configured = getPreferenceStore().getString(
+                    com.anthropic.eclipse.claude.preferences.PreferenceConstants.SKILLS_FOLDER);
+            if (configured == null || configured.isBlank()) {
+                configured = java.nio.file.Paths.get(
+                        System.getProperty("user.home"), ".claude", "skills").toString();
+            }
+            java.nio.file.Files.createDirectories(java.nio.file.Paths.get(configured));
+        } catch (Throwable t) {
+            // Best-effort: a permission error here just leaves the user with
+            // the original validation issue, but never breaks plug-in start.
+            logWarning("[Activator] could not create skills folder: " + t.getMessage());
+        }
+
+        // Initialize DIAG_ENABLED from preference (OR'd with the system-property default)
+        try {
+            boolean prefEnabled = getPreferenceStore().getBoolean(
+                com.anthropic.eclipse.claude.preferences.PreferenceConstants.DIAGNOSTIC_LOGGING);
+            DIAG_ENABLED = DIAG_ENABLED || prefEnabled;
+            // React to preference changes at runtime
+            getPreferenceStore().addPropertyChangeListener(evt -> {
+                if (com.anthropic.eclipse.claude.preferences.PreferenceConstants.DIAGNOSTIC_LOGGING
+                        .equals(evt.getProperty())) {
+                    boolean now = Boolean.parseBoolean(String.valueOf(evt.getNewValue()))
+                            || Boolean.getBoolean("claude.diag");
+                    DIAG_ENABLED = now;
+                    logInfo("[DIAG-START] Diagnostic logging " + (now ? "ENABLED" : "DISABLED")
+                            + " via preference at " + System.currentTimeMillis());
+                }
+            });
+            if (DIAG_ENABLED) {
+                logInfo("[DIAG-START] Diagnostic logging ENABLED at startup (sysProp="
+                        + Boolean.getBoolean("claude.diag") + ", pref=" + prefEnabled + ")");
+            }
+        } catch (Throwable t) {
+            // Best-effort; never block startup over diagnostic plumbing
+        }
     }
 
     @Override
     public void stop(BundleContext context) throws Exception {
-        // Shutdown CLI process
-        if (cliManager != null) {
-            cliManager.stop();
+        // Shutdown every CLI process that was ever created
+        for (ClaudeCliManager mgr : allCliManagers) {
+            try { mgr.stop(); } catch (Exception ignored) {}
         }
+        allCliManagers.clear();
         plugin = null;
         super.stop(context);
     }
@@ -73,10 +152,56 @@ public class Activator extends AbstractUIPlugin {
     }
 
     /**
-     * Get the singleton CLI manager.
+     * Create a brand-new CLI manager dedicated to a single conversation view/session.
+     * The caller is responsible for calling {@link ClaudeCliManager#stop()} on dispose.
+     * The manager is automatically tracked so it can be stopped on plugin shutdown.
      */
-    public ClaudeCliManager getCliManager() {
-        return cliManager;
+    public ClaudeCliManager createCliManager() {
+        ClaudeCliManager mgr = new ClaudeCliManager();
+        allCliManagers.add(mgr);
+        return mgr;
+    }
+
+    /**
+     * Unregister a CLI manager when its owning view is disposed.
+     * Does NOT call stop() — caller is expected to have done that already.
+     */
+    public void releaseCliManager(ClaudeCliManager mgr) {
+        if (mgr != null) {
+            allCliManagers.remove(mgr);
+            if (activeCliManager == mgr) {
+                setActiveCliManager(null);
+            }
+        }
+    }
+
+    /**
+     * Get the CLI manager of the currently active conversation view (may be null).
+     * Used by the workbench status bar to display per-tab state.
+     */
+    public ClaudeCliManager getActiveCliManager() {
+        return activeCliManager;
+    }
+
+    /**
+     * Set the active CLI manager (called by a view when it gains focus or is created).
+     */
+    public void setActiveCliManager(ClaudeCliManager mgr) {
+        this.activeCliManager = mgr;
+        for (Consumer<ClaudeCliManager> listener : cliManagerChangeListeners) {
+            try { listener.accept(mgr); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Register a listener that fires whenever the active CLI manager changes.
+     */
+    public void addActiveCliManagerListener(Consumer<ClaudeCliManager> listener) {
+        cliManagerChangeListeners.add(listener);
+    }
+
+    public void removeActiveCliManagerListener(Consumer<ClaudeCliManager> listener) {
+        cliManagerChangeListeners.remove(listener);
     }
 
     /**
@@ -146,6 +271,17 @@ public class Activator extends AbstractUIPlugin {
      */
     public static void logInfo(String message) {
         log(IStatus.INFO, message, null);
+    }
+
+    /**
+     * Diagnostic log — only emitted when DIAG_ENABLED is true.
+     * Cheap when disabled (single volatile read).
+     * Use this for verbose tracing that should NOT appear in normal usage.
+     */
+    public static void logDiag(String message) {
+        if (DIAG_ENABLED) {
+            log(IStatus.INFO, message, null);
+        }
     }
 
     /**

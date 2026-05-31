@@ -26,4 +26,40 @@ public class PreferenceConstants {
     // Input behavior
     public static final String ENTER_TO_SEND = "enterToSend";              // true = Enter sends (default)
     public static final String AUTO_SAVE_BEFORE_TOOLS = "autoSaveBeforeTools"; // save dirty editors before CLI file tools
+
+    // Effort level (persisted across sessions)
+    public static final String EFFORT_LEVEL = "effortLevel";              // "low","medium","high","max", or "" for Auto
+
+    // Diagnostic logging — when true, the plugin emits verbose [DIAG] logs
+    // to the Eclipse Error Log. Useful for investigating bugs without rebuilding.
+    // Can also be enabled at startup via -Dclaude.diag=true on the JVM.
+    public static final String DIAGNOSTIC_LOGGING = "diagnosticLogging";
+
+    // Active-file pinning — when true, the currently focused editor's file is
+    // automatically attached to every outgoing message. UI shows a chip with
+    // the file name; clicking the chip toggles this preference.
+    public static final String ATTACH_ACTIVE_FILE = "attachActiveFile";
+
+    // Local skills folder — directory the Skills dialog scans for custom skills.
+    // Default matches the Claude CLI: ~/.claude/skills/. The user can override
+    // either via the Browse button in the Skills dialog or via this preference
+    // in Window > Preferences > Claude AI. Both paths write to the same key.
+    public static final String SKILLS_FOLDER = "skillsFolder";
+
+    // Tab-title strategy for new conversation tabs. Values:
+    //   "self_generated" (default) — after the first user message, run a
+    //     one-shot `claude -p` in the background to produce a 3-5 word topic
+    //     title and update the tab. Mirrors IntelliJ commit a122d84.
+    //   "first_message" — keep the previous behaviour: truncate the first
+    //     user message and use that.
+    // The CLI's auto-generated session summary is also picked up on Resume
+    // and Session History, regardless of this preference.
+    public static final String TAB_TITLE_STRATEGY = "tabTitleStrategy";
+
+    // Per-bubble timestamps — when true, every user and assistant message
+    // shows a small "HH:MM:SS" stamp in its header. Assistant messages also
+    // include a duration relative to the preceding user message (e.g.
+    // "14:30:45 · 23s"). Default true. Toggling the preference live-refreshes
+    // every already-rendered bubble in open Claude tabs.
+    public static final String SHOW_MESSAGE_TIMESTAMPS = "showMessageTimestamps";
 }

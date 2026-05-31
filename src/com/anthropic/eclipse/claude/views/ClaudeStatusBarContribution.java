@@ -7,6 +7,7 @@ import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.graphics.GC;
 import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
@@ -48,8 +49,13 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
     private volatile boolean streaming = false;
     private volatile String currentModel = null;
 
+    // Tracks which CLI manager we're currently listening to (one per active tab).
+    private ClaudeCliManager attachedCliManager;
+
     // Model-change consumer — kept so we can remove it on dispose
     private final Consumer<ConversationModel> modelChangeConsumer = this::onConversationModelChanged;
+    // Active-CLI change consumer — fires when the focused tab's CLI changes
+    private final Consumer<ClaudeCliManager> cliManagerChangeConsumer = this::onActiveCliManagerChanged;
 
     @Override
     protected Control createControl(Composite parent) {
@@ -60,7 +66,13 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
         container.setLayout(layout);
 
         statusLabel = new Label(container, SWT.NONE);
-        statusLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, false, true));
+        // Measure the longest expected string to set a proper minimum width
+        GC gc = new GC(parent);
+        int minWidth = gc.textExtent("Claude: Thinking\u2026 [claude-sonnet-4-6]").x;
+        gc.dispose();
+        GridData gd = new GridData(SWT.FILL, SWT.CENTER, false, true);
+        gd.widthHint = minWidth;
+        statusLabel.setLayoutData(gd);
         statusLabel.setText("Claude");
 
         // Allocate colors
@@ -79,17 +91,19 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
             if (yellowColor != null) yellowColor.dispose();
         });
 
-        // Register for CLI state changes
-        ClaudeCliManager cliManager = getCliManager();
-        if (cliManager != null) {
-            cliManager.addStateListener(this);
-        }
-
-        // Register for model changes (so we can attach to whichever model the view creates)
+        // Register for active-CLI changes (each conversation view has its own CLI;
+        // we always reflect whichever tab is currently focused).
         Activator activator = Activator.getDefault();
         if (activator != null) {
+            activator.addActiveCliManagerListener(cliManagerChangeConsumer);
+            ClaudeCliManager existingCli = activator.getActiveCliManager();
+            if (existingCli != null) {
+                attachedCliManager = existingCli;
+                existingCli.addStateListener(this);
+            }
+
+            // Register for model changes (so we can attach to whichever model the view creates)
             activator.addConversationModelListener(modelChangeConsumer);
-            // Attach to the model that might already exist
             ConversationModel existing = activator.getConversationModel();
             if (existing != null) {
                 existing.addListener(this);
@@ -102,12 +116,13 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
 
     @Override
     public void dispose() {
-        ClaudeCliManager cliManager = getCliManager();
-        if (cliManager != null) {
-            cliManager.removeStateListener(this);
+        if (attachedCliManager != null) {
+            attachedCliManager.removeStateListener(this);
+            attachedCliManager = null;
         }
         Activator activator = Activator.getDefault();
         if (activator != null) {
+            activator.removeActiveCliManagerListener(cliManagerChangeConsumer);
             activator.removeConversationModelListener(modelChangeConsumer);
             ConversationModel model = activator.getConversationModel();
             if (model != null) {
@@ -117,7 +132,7 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
         super.dispose();
     }
 
-    // ==================== Model lifecycle ====================
+    // ==================== Model & CLI lifecycle ====================
 
     private void onConversationModelChanged(ConversationModel newModel) {
         // Remove listener from old model (we don't have a reference to it here,
@@ -128,6 +143,20 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
         // Reset streaming state when model changes
         streaming = false;
         currentModel = null;
+        updateDisplay();
+    }
+
+    /**
+     * Called when the focused conversation view changes — swap the CLI we listen to.
+     */
+    private void onActiveCliManagerChanged(ClaudeCliManager newCli) {
+        if (attachedCliManager != null) {
+            attachedCliManager.removeStateListener(this);
+        }
+        attachedCliManager = newCli;
+        if (newCli != null) {
+            newCli.addStateListener(this);
+        }
         updateDisplay();
     }
 
@@ -191,7 +220,7 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
         display.asyncExec(() -> {
             if (statusLabel == null || statusLabel.isDisposed()) return;
 
-            ClaudeCliManager cliManager = getCliManager();
+            ClaudeCliManager cliManager = attachedCliManager;
             ClaudeCliManager.ProcessState state = (cliManager != null)
                     ? cliManager.getState()
                     : ClaudeCliManager.ProcessState.NOT_STARTED;
@@ -247,8 +276,4 @@ public class ClaudeStatusBarContribution extends WorkbenchWindowControlContribut
         });
     }
 
-    private ClaudeCliManager getCliManager() {
-        Activator activator = Activator.getDefault();
-        return (activator != null) ? activator.getCliManager() : null;
-    }
 }

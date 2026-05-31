@@ -356,6 +356,13 @@ public class JsonParser {
                 default:
                     if (c < 0x20) {
                         sb.append(String.format("\\u%04x", (int) c));
+                    } else if (c > 0x7F) {
+                        // Pass non-ASCII characters (Hebrew, Arabic, CJK, etc.)
+                        // through as raw UTF-8. The NDJSON stdin pipe is already
+                        // opened with StandardCharsets.UTF_8, so this is safe and
+                        // avoids issues with some CLI/Bedrock versions that don't
+                        // decode backslash-u escapes correctly.
+                        sb.append(c);
                     } else {
                         sb.append(c);
                     }

@@ -118,6 +118,31 @@ public class MessageBlock {
     }
 
     /**
+     * An image segment - raw image bytes (PNG, JPG, etc.) + a display name.
+     * Used for inline image rendering in user message bubbles when the user
+     * pastes/attaches an image. The bytes are sent to the CLI as base64 in
+     * the JSON message; the UI renders a thumbnail from the same bytes.
+     */
+    public static class ImageSegment extends ContentSegment {
+        private final byte[] bytes;
+        private final String name;
+        private final String mediaType;
+
+        public ImageSegment(byte[] bytes, String name, String mediaType) {
+            this.bytes = bytes;
+            this.name = name;
+            this.mediaType = mediaType;
+        }
+
+        @Override
+        public String getSegmentType() { return "image"; }
+
+        public byte[] getBytes() { return bytes; }
+        public String getName() { return name; }
+        public String getMediaType() { return mediaType; }
+    }
+
+    /**
      * A tool call segment - represents Claude using a tool (Read, Edit, Bash, etc.).
      */
     public static class ToolCallSegment extends ContentSegment {

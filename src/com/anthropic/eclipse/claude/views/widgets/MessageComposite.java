@@ -25,10 +25,18 @@ public class MessageComposite extends Composite {
 
     private final MessageBlock messageBlock;
     private Composite contentArea;
+    private Label timestampLabel; // right side of header row; toggled by SHOW_MESSAGE_TIMESTAMPS
+    /** Wall-clock ms when finalizeContent() ran. Used by the assistant
+     *  bubble's "HH:MM:SS · 23s" timestamp so duration reflects when the
+     *  reply ended, not when it began streaming. */
+    private long finishedAtMs = 0L;
     private StreamingTextWidget currentTextWidget;
     private final List<ToolCallComposite> toolCallWidgets = new ArrayList<>();
     private final List<CodeBlockComposite> codeBlockWidgets = new ArrayList<>();
     private boolean hasStreamedText = false; // true if any text was rendered during streaming
+    private boolean fullTextRendered = false; // true ONLY if renderExistingContent wrote the full segment text
+                                              // (used to skip late-arriving deltas in the race-condition case
+                                              // where the widget was created after the block was already complete)
     private boolean finalized = false; // prevent double finalization
 
     /** Callback for fork action from context menu. */
@@ -126,8 +134,19 @@ public class MessageComposite extends Composite {
     private void createRoleHeader() {
         ThemeManager tm = ThemeManager.getInstance();
 
+        // Header row: role label on the left, timestamp on the right.
+        // Wrapping inside a 2-column composite keeps the click-to-fork
+        // behaviour on the role label and lets the timestamp toggle
+        // independently via the SHOW_MESSAGE_TIMESTAMPS preference.
+        Composite headerRow = new Composite(this, SWT.NONE);
+        GridLayout hl = new GridLayout(2, false);
+        hl.marginWidth = 0; hl.marginHeight = 0; hl.horizontalSpacing = 8;
+        headerRow.setLayout(hl);
+        headerRow.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+        headerRow.setBackground(getBackground());
+
         // Role label — click to show Fork menu
-        Label roleLabel = new Label(this, SWT.NONE);
+        Label roleLabel = new Label(headerRow, SWT.NONE);
         String roleText;
         switch (messageBlock.getRole()) {
             case USER:
@@ -148,12 +167,33 @@ public class MessageComposite extends Composite {
         roleLabel.setText(roleText);
         roleLabel.setForeground(roleColor);
         roleLabel.setBackground(getBackground());
-        roleLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        roleLabel.setLayoutData(new GridData(SWT.LEFT, SWT.CENTER, true, false));
         roleLabel.setCursor(getDisplay().getSystemCursor(SWT.CURSOR_HAND));
 
         Font boldFont = new Font(getDisplay(), tm.getUIFontName(), 10, SWT.BOLD);
         roleLabel.setFont(boldFont);
         roleLabel.addDisposeListener(e -> boldFont.dispose());
+
+        // Timestamp label (right-aligned, smaller + dimmer font). Visibility
+        // is governed by the SHOW_MESSAGE_TIMESTAMPS preference and can be
+        // toggled live from ClaudeConversationView via setTimestampVisible.
+        timestampLabel = new Label(headerRow, SWT.NONE);
+        timestampLabel.setBackground(getBackground());
+        org.eclipse.swt.graphics.Color dim = new org.eclipse.swt.graphics.Color(
+                getDisplay(), 130, 130, 135);
+        timestampLabel.setForeground(dim);
+        timestampLabel.addDisposeListener(e -> dim.dispose());
+        Font smallFont = new Font(getDisplay(), tm.getUIFontName(), 9, SWT.NORMAL);
+        timestampLabel.setFont(smallFont);
+        timestampLabel.addDisposeListener(e -> smallFont.dispose());
+        timestampLabel.setLayoutData(new GridData(SWT.RIGHT, SWT.CENTER, false, false));
+        boolean show = true;
+        try {
+            show = com.anthropic.eclipse.claude.Activator.getDefault().getPreferenceStore()
+                    .getBoolean(com.anthropic.eclipse.claude.preferences.PreferenceConstants.SHOW_MESSAGE_TIMESTAMPS);
+        } catch (Throwable ignored) {}
+        refreshTimestampLabel();
+        applyTimestampVisibility(show);
 
         // Click on role label → show Fork popup menu
         roleLabel.addListener(SWT.MouseDown, e -> {
@@ -182,6 +222,86 @@ public class MessageComposite extends Composite {
         });
     }
 
+    /**
+     * Format the timestamp label text. USER + SYSTEM + ERROR bubbles show
+     * "HH:MM:SS"; ASSISTANT bubbles append " · 23s" or " · 1m 5s" measuring
+     * the elapsed time from the preceding USER bubble (looked up via the
+     * parent message container's children list). Called on initial render
+     * and re-called whenever the message completes streaming so the
+     * duration text can settle to its final value.
+     */
+    private void refreshTimestampLabel() {
+        if (timestampLabel == null || timestampLabel.isDisposed()) return;
+        long ts = messageBlock.getTimestamp();
+        java.time.LocalTime lt = java.time.Instant.ofEpochMilli(ts)
+                .atZone(java.time.ZoneId.systemDefault()).toLocalTime();
+        String hhmmss = String.format("%02d:%02d:%02d", lt.getHour(), lt.getMinute(), lt.getSecond());
+        String text;
+        if (messageBlock.getRole() == MessageBlock.Role.ASSISTANT) {
+            long durMs = computeAssistantDurationMs();
+            text = (durMs > 0) ? (hhmmss + " · " + formatDuration(durMs)) : hhmmss;
+        } else {
+            text = hhmmss;
+        }
+        timestampLabel.setText(text);
+        if (timestampLabel.getParent() != null && !timestampLabel.getParent().isDisposed()) {
+            timestampLabel.getParent().layout(true, true);
+        }
+    }
+
+    /** Apply visibility from the SHOW_MESSAGE_TIMESTAMPS preference. */
+    private void applyTimestampVisibility(boolean visible) {
+        if (timestampLabel == null || timestampLabel.isDisposed()) return;
+        GridData gd = (GridData) timestampLabel.getLayoutData();
+        if (gd != null) gd.exclude = !visible;
+        timestampLabel.setVisible(visible);
+        if (timestampLabel.getParent() != null && !timestampLabel.getParent().isDisposed()) {
+            timestampLabel.getParent().layout(true, true);
+        }
+    }
+
+    /** Called by ClaudeConversationView when the preference toggles at runtime. */
+    public void setTimestampVisible(boolean visible) {
+        applyTimestampVisibility(visible);
+    }
+
+    /** Recompute timestamp label — used after streaming completes so the duration is final. */
+    public void refreshTimestamp() {
+        refreshTimestampLabel();
+    }
+
+    private long computeAssistantDurationMs() {
+        // We can only compute a stable duration after the assistant turn has
+        // finished streaming (finalizeContent captures finishedAtMs). Before
+        // that, return -1 so the timestamp label shows time-of-arrival only.
+        if (finishedAtMs <= 0) return -1;
+        if (getParent() == null || getParent().isDisposed()) return -1;
+        org.eclipse.swt.widgets.Control[] siblings = getParent().getChildren();
+        int myIdx = -1;
+        for (int i = 0; i < siblings.length; i++) {
+            if (siblings[i] == this) { myIdx = i; break; }
+        }
+        if (myIdx <= 0) return -1;
+        for (int i = myIdx - 1; i >= 0; i--) {
+            if (siblings[i] instanceof MessageComposite) {
+                MessageComposite mc = (MessageComposite) siblings[i];
+                if (mc.messageBlock != null
+                        && mc.messageBlock.getRole() == MessageBlock.Role.USER) {
+                    return finishedAtMs - mc.messageBlock.getTimestamp();
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static String formatDuration(long ms) {
+        long s = ms / 1000L;
+        if (s < 60) return s + "s";
+        long m = s / 60L;
+        long rs = s % 60L;
+        return (rs == 0) ? (m + "m") : (m + "m " + rs + "s");
+    }
+
     private void renderExistingContent() {
         for (MessageBlock.ContentSegment seg : messageBlock.getSegments()) {
             if (seg instanceof MessageBlock.TextSegment) {
@@ -190,7 +310,10 @@ public class MessageComposite extends Composite {
                     ensureTextWidget();
                     currentTextWidget.appendText(textSeg.getText());
                     hasStreamedText = true; // Prevent finalizeContent() from re-adding this text
+                    fullTextRendered = true; // Block late streaming deltas from duplicating this content
                 }
+            } else if (seg instanceof MessageBlock.ImageSegment) {
+                addImageWidget((MessageBlock.ImageSegment) seg);
             } else if (seg instanceof MessageBlock.ToolCallSegment) {
                 addToolCallWidget((MessageBlock.ToolCallSegment) seg);
             }
@@ -202,9 +325,129 @@ public class MessageComposite extends Composite {
      */
     public void appendStreamingText(String delta) {
         if (isDisposed() || finalized) return;
+        // Race fix: if the MessageComposite was created AFTER the underlying
+        // MessageBlock was already complete, renderExistingContent() in the
+        // constructor already wrote the full text. Late-arriving streaming
+        // deltas (from buffered asyncExecs) would duplicate it. Skip them.
+        //
+        // IMPORTANT: only check the dedicated fullTextRendered flag — checking
+        // messageBlock.isComplete() would over-trigger and drop legitimate
+        // late deltas in the normal streaming case (content_block_stop fires
+        // before all queued asyncExecs are processed on a busy UI thread).
+        if (fullTextRendered) return;
         ensureTextWidget();
         currentTextWidget.appendText(delta);
         hasStreamedText = true;
+    }
+
+    /**
+     * Render an attached image inline as a thumbnail (max ~200px) under the
+     * current text. Click opens the full-size image in Eclipse's default
+     * image viewer (via a temp file).
+     */
+    public void addImageWidget(MessageBlock.ImageSegment imageSeg) {
+        if (isDisposed() || imageSeg.getBytes() == null) return;
+        // Close current text widget so the image renders below
+        if (currentTextWidget != null && !currentTextWidget.isFinalized()) {
+            finalizeAndExtractCodeBlocks(currentTextWidget);
+            currentTextWidget = null;
+        }
+        try {
+            org.eclipse.swt.graphics.ImageData full = new org.eclipse.swt.graphics.ImageData(
+                    new java.io.ByteArrayInputStream(imageSeg.getBytes()));
+            // Scale to max 200x200 keeping aspect ratio
+            int maxDim = 200;
+            int w = full.width, h = full.height;
+            if (w > maxDim || h > maxDim) {
+                if (w >= h) { h = (int) ((double) h * maxDim / w); w = maxDim; }
+                else        { w = (int) ((double) w * maxDim / h); h = maxDim; }
+            }
+            final org.eclipse.swt.graphics.Image thumb =
+                    new org.eclipse.swt.graphics.Image(getDisplay(), full.scaledTo(w, h));
+
+            org.eclipse.swt.widgets.Composite wrap = new org.eclipse.swt.widgets.Composite(contentArea, SWT.NONE);
+            GridLayout wl = new GridLayout(1, false);
+            wl.marginWidth = 0; wl.marginHeight = 4; wl.verticalSpacing = 2;
+            wrap.setLayout(wl);
+            wrap.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            wrap.setBackground(getBackground());
+
+            Label imgLabel = new Label(wrap, SWT.NONE);
+            imgLabel.setImage(thumb);
+            imgLabel.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            imgLabel.setToolTipText("Click to open " + imageSeg.getName() + " (" + full.width + "×" + full.height + ")");
+            imgLabel.setBackground(getBackground());
+            imgLabel.setCursor(getDisplay().getSystemCursor(SWT.CURSOR_HAND));
+            imgLabel.addDisposeListener(e -> { if (!thumb.isDisposed()) thumb.dispose(); });
+            imgLabel.addListener(SWT.MouseDown, e -> openImageInExternalViewer(imageSeg));
+
+            Label nameLabel = new Label(wrap, SWT.NONE);
+            nameLabel.setText(imageSeg.getName() + "  (" + full.width + "×" + full.height + ")");
+            nameLabel.setLayoutData(new GridData(SWT.LEFT, SWT.TOP, false, false));
+            nameLabel.setBackground(getBackground());
+            org.eclipse.swt.graphics.Color fg = getForeground();
+            if (fg != null) nameLabel.setForeground(fg);
+
+            relayoutParent();
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logWarning(
+                    "[MessageComposite] Failed to render image '" + imageSeg.getName() + "': " + ex.getMessage());
+        }
+    }
+
+    private void openImageInExternalViewer(MessageBlock.ImageSegment imageSeg) {
+        java.nio.file.Path tmp = null;
+        try {
+            String safeName = imageSeg.getName().replaceAll("[^A-Za-z0-9._-]", "_");
+            if (!safeName.toLowerCase().endsWith(".png") && !safeName.toLowerCase().endsWith(".jpg")
+                    && !safeName.toLowerCase().endsWith(".jpeg") && !safeName.toLowerCase().endsWith(".gif")) {
+                safeName += ".png";
+            }
+            tmp = java.nio.file.Files.createTempFile("claude-img-", "-" + safeName);
+            java.nio.file.Files.write(tmp, imageSeg.getBytes());
+            String absPath = tmp.toAbsolutePath().toString();
+
+            // 1. Try SWT's Program.launch (preferred — uses OS file association)
+            boolean launched = org.eclipse.swt.program.Program.launch(absPath);
+            if (launched) {
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via Program.launch: " + absPath);
+                return;
+            }
+
+            // 2. Fallback: rundll32 url.dll on Windows (always works on Windows
+            //    even if no file association is registered for SWT)
+            String os = System.getProperty("os.name", "").toLowerCase();
+            if (os.contains("win")) {
+                new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", absPath)
+                        .inheritIO().start();
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via rundll32: " + absPath);
+                return;
+            }
+
+            // 3. Fallback: AWT Desktop (last resort, may fail in headless / SWT)
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(tmp.toFile());
+                com.anthropic.eclipse.claude.Activator.logInfo(
+                        "[MessageComposite] Opened image via Desktop: " + absPath);
+                return;
+            }
+
+            com.anthropic.eclipse.claude.Activator.logWarning(
+                    "[MessageComposite] No way to open image. Saved at: " + absPath);
+            // Show user where the file was saved so they can open manually
+            org.eclipse.jface.dialogs.MessageDialog.openInformation(getShell(),
+                    "Image saved",
+                    "Could not open the image automatically.\n\nThe image was saved at:\n" + absPath);
+        } catch (Exception ex) {
+            com.anthropic.eclipse.claude.Activator.logError(
+                    "[MessageComposite] Failed to open image: " + ex.getMessage(), ex);
+            String pathInfo = tmp != null ? "\n\nThe image was saved at:\n" + tmp.toAbsolutePath() : "";
+            org.eclipse.jface.dialogs.MessageDialog.openError(getShell(),
+                    "Could not open image",
+                    "Failed to open the image: " + ex.getMessage() + pathInfo);
+        }
     }
 
     /**
@@ -289,6 +532,7 @@ public class MessageComposite extends Composite {
     public void finalizeContent() {
         if (finalized) return; // Prevent double finalization
         finalized = true;
+        finishedAtMs = System.currentTimeMillis();
 
         // If streaming was disabled, the text widget may be empty or not exist.
         // Populate it from the MessageBlock's accumulated text.
@@ -311,6 +555,11 @@ public class MessageComposite extends Composite {
         if (currentTextWidget != null && !currentTextWidget.isFinalized()) {
             finalizeAndExtractCodeBlocks(currentTextWidget);
         }
+        // Update the timestamp label so an ASSISTANT bubble's "HH:MM:SS · 23s"
+        // duration reflects the actual end-of-stream — without this it would
+        // still display the duration computed when the bubble was first
+        // created (when the user message ms ≈ assistant ms).
+        refreshTimestampLabel();
         relayoutParent();
     }
 

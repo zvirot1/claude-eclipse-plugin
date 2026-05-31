@@ -76,6 +76,38 @@ public class ClaudeSettingsReader {
     }
 
     /**
+     * Read the user's default effort level from {@code ~/.claude/settings.json}.
+     * Returns null if unset or the value is invalid (callers should treat null
+     * as "Auto" — no {@code --effort} flag passed).
+     */
+    public String getUserEffortLevel() {
+        String value = getUserSetting("effortLevel", null);
+        if (value == null) return null;
+        switch (value) {
+            case "low": case "medium": case "high": case "max":
+                return value;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Read the user's default permission mode from {@code ~/.claude/settings.json}.
+     * Checks {@code permissions.defaultMode} (new layout) then falls back to
+     * {@code permissionMode} (legacy key).
+     */
+    @SuppressWarnings("unchecked")
+    public String getUserPermissionMode() {
+        Map<String, Object> settings = loadUserSettings();
+        Object perms = settings.get("permissions");
+        if (perms instanceof Map) {
+            Object def = ((Map<String, Object>) perms).get("defaultMode");
+            if (def instanceof String) return (String) def;
+        }
+        return JsonParser.getString(settings, "permissionMode");
+    }
+
+    /**
      * Get a boolean value from the user settings file.
      */
     public boolean getUserSettingBoolean(String key, boolean fallback) {
@@ -88,18 +120,44 @@ public class ClaudeSettingsReader {
 
     // ==================== Internal ====================
 
+    // Retry parameters for the case where another process (typically a running
+    // Claude CLI — each conversation view now owns its own) is mid-write to
+    // the same file and we briefly see truncated / invalid JSON.
+    private static final int    MAX_READ_ATTEMPTS   = 4;
+    private static final long[] BACKOFF_DELAYS_MS   = { 25L, 75L, 200L };
+
     @SuppressWarnings("unchecked")
     private void mergeFile(Path path, Map<String, Object> target) {
         if (!Files.exists(path)) return;
-        try {
-            String content = Files.readString(path, StandardCharsets.UTF_8).trim();
-            if (content.isEmpty()) return;
-            Map<String, Object> parsed = JsonParser.parseObject(content);
-            target.putAll(parsed);
-        } catch (IOException e) {
-            Activator.logWarning("[ClaudeSettingsReader] Could not read " + path + ": " + e.getMessage());
-        } catch (Exception e) {
-            Activator.logWarning("[ClaudeSettingsReader] Could not parse " + path + ": " + e.getMessage());
+
+        Exception lastError = null;
+        for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt++) {
+            try {
+                String content = Files.readString(path, StandardCharsets.UTF_8).trim();
+                if (content.isEmpty()) return;
+                Map<String, Object> parsed = JsonParser.parseObject(content);
+                target.putAll(parsed);
+                return; // success
+            } catch (IOException | RuntimeException e) {
+                // IOException: file locked / disappeared mid-read
+                // RuntimeException (from JsonParser): truncated / invalid JSON
+                lastError = e;
+                if (attempt < BACKOFF_DELAYS_MS.length) {
+                    try {
+                        Thread.sleep(BACKOFF_DELAYS_MS[attempt]);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
         }
+
+        // Exhausted retries — log and move on. A missing read just means the
+        // caller gets defaults from lower-precedence sources.
+        String kind = (lastError instanceof IOException) ? "read" : "parse";
+        Activator.logWarning("[ClaudeSettingsReader] Could not " + kind + " " + path
+                + " after " + MAX_READ_ATTEMPTS + " attempts: "
+                + (lastError != null ? lastError.getMessage() : "unknown"));
     }
 }

@@ -101,6 +101,12 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
         ));
 
         addField(new BooleanFieldEditor(
+            PreferenceConstants.SHOW_MESSAGE_TIMESTAMPS,
+            "Show timestamps on each message (HH:MM:SS + reply duration)",
+            getFieldEditorParent()
+        ));
+
+        addField(new BooleanFieldEditor(
             PreferenceConstants.USE_CLI_MODE,
             "Use Claude CLI (recommended; disable for direct API mode)",
             getFieldEditorParent()
@@ -118,6 +124,33 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
         addField(new IntegerFieldEditor(
             PreferenceConstants.SESSION_HISTORY_LIMIT,
             "Max Stored Sessions:",
+            getFieldEditorParent()
+        ));
+
+        // Local skills folder — used by the Skills & Plugins dialog.
+        // Default is ~/.claude/skills/ (matches Claude CLI).
+        addField(new DirectoryFieldEditor(
+            PreferenceConstants.SKILLS_FOLDER,
+            "Local skills folder:",
+            getFieldEditorParent()
+        ));
+
+        // Tab-title strategy
+        addField(new ComboFieldEditor(
+            PreferenceConstants.TAB_TITLE_STRATEGY,
+            "Tab title strategy:",
+            new String[][] {
+                {"Self-generated topic (LLM-written, 3-5 words)", "self_generated"},
+                {"First user message (truncated to 30 chars)",     "first_message"},
+            },
+            getFieldEditorParent()
+        ));
+
+        // Diagnostic logging — only enable when investigating bugs.
+        // Emits verbose [DIAG] entries to the Error Log.
+        addField(new BooleanFieldEditor(
+            PreferenceConstants.DIAGNOSTIC_LOGGING,
+            "Enable diagnostic logging (verbose [DIAG] entries in Error Log)",
             getFieldEditorParent()
         ));
     }

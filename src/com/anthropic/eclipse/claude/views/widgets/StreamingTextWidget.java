@@ -75,6 +75,9 @@ public class StreamingTextWidget extends Composite {
             boolean wasEmpty = rawMarkdown.length() == 0;
             pendingText.append(delta);
             rawMarkdown.append(delta);
+            com.anthropic.eclipse.claude.Activator.logDiag(
+                "[DIAG] StreamingTextWidget.appendText deltaLen=" + delta.length()
+                + " rawTotalLen=" + rawMarkdown.length());
             if (wasEmpty) {
                 Display.getDefault().asyncExec(() -> applyRtlIfNeeded(rawMarkdown.toString()));
             }
@@ -93,12 +96,30 @@ public class StreamingTextWidget extends Composite {
         if (finalized) return;
         finalized = true;
 
+        long t0 = System.currentTimeMillis();
+
         // Flush any remaining text first
         flushPendingText();
 
         // Apply markdown rendering and RTL
         if (!styledText.isDisposed()) {
             String text = rawMarkdown.toString();
+            // === DIAGNOSTIC LOGGING ===
+            int len = text.length();
+            String head = text.substring(0, Math.min(120, len)).replace("\n", "\\n");
+            String tail = len > 120 ? text.substring(Math.max(0, len - 120)).replace("\n", "\\n") : "";
+            boolean exactHalfDup = false;
+            if (len >= 20 && len % 2 == 0) {
+                String firstHalf = text.substring(0, len / 2);
+                String secondHalf = text.substring(len / 2);
+                exactHalfDup = firstHalf.equals(secondHalf);
+            }
+            com.anthropic.eclipse.claude.Activator.logDiag(
+                "[DIAG] StreamingTextWidget.finalizeContent rawLen=" + len
+                + " exactHalfDup=" + exactHalfDup
+                + " head='" + head + "'"
+                + " tail='" + tail + "'");
+            // === END DIAGNOSTIC ===
             // Duplication guard: if rawMarkdown somehow has doubled content, take only first half
             // This can happen on Windows due to CLI sending redundant assistant snapshots
             int orientation = detectOrientation(text);
@@ -123,6 +144,10 @@ public class StreamingTextWidget extends Composite {
             // Only set RTL on the StyledText itself — do NOT propagate to parent
             // composites, as that flips the entire layout (tool calls, buttons, headers)
             updateHeight();
+            com.anthropic.eclipse.claude.Activator.logDiag(
+                    "[DIAG-PERF] StreamingTextWidget.finalizeContent elapsed="
+                            + (System.currentTimeMillis() - t0) + "ms textLen="
+                            + rawMarkdown.length());
         }
     }
 
@@ -145,10 +170,17 @@ public class StreamingTextWidget extends Composite {
 
     public static int detectOrientation(String text) {
         if (text == null) return SWT.LEFT_TO_RIGHT;
-        // Skip leading punctuation/whitespace to find the first real directional character
+        // Skip leading punctuation, whitespace, markdown formatting, and non-letter
+        // symbols to find the first real alphabetic character whose directionality
+        // determines the text orientation.  Previously, markdown chars like '#', '*',
+        // '-', '>' were treated as LTR, causing Hebrew text with headings/lists to
+        // render left-to-right.
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
-            if (Character.isWhitespace(c) || "?!.,;:\"'()[]{}".indexOf(c) >= 0) continue;
+            // Skip whitespace, common punctuation, markdown formatting, and any
+            // character that is not a Unicode letter — we only care about the first
+            // real letter to determine direction.
+            if (!Character.isLetter(c)) continue;
             byte dir = Character.getDirectionality(c);
             if (dir == Character.DIRECTIONALITY_RIGHT_TO_LEFT
                     || dir == Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC

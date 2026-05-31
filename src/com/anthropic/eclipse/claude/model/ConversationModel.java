@@ -40,12 +40,77 @@ public class ConversationModel implements ICliMessageListener {
      */
     private volatile boolean usingStreamEvents = false;
 
+    /**
+     * True if the current turn produced any visible text (assistant text segments
+     * via stream events). Reset on each new user input. Used by handleResult to
+     * detect "empty result" cases (CLI returned without producing any output —
+     * e.g. AWS SSO token expired in a SessionStart hook).
+     */
+    private volatile boolean hadTextInCurrentTurn = false;
+
+    /**
+     * Last hook-related notification with an error indicator (e.g. "Token has
+     * expired"). Cleared on each new user input. Surfaced via onError() if the
+     * subsequent result is empty.
+     */
+    private volatile CliMessage.SystemNotification lastErrorNotification;
+
+    /**
+     * The exact text of the last user prompt sent to the CLI for the current
+     * turn. Used to drive a one-shot auto-retry on silent-empty results
+     * (the AIM hook is non-deterministic and a second attempt often passes).
+     */
+    private volatile String lastUserPrompt;
+
+    /**
+     * True once we've already auto-retried this turn. Prevents an infinite
+     * retry loop if the prompt is genuinely blocked.
+     */
+    private volatile boolean retriedSilentEmpty;
+
+    /**
+     * Wall-clock nanos when the current turn's addUserMessage() ran, so the
+     * first streamed text delta can log T1.5 (time-to-first-token).
+     */
+    private volatile long turnSendNanos;
+    private volatile boolean firstTokenLoggedThisTurn;
+
+    /**
+     * Hook timing — populated on hook_started, consumed on hook_response.
+     * Lets us measure how long the corporate AIM hook actually took.
+     */
+    private volatile long pendingHookStartNanos;
+    private volatile String pendingHookName;
+
+    /**
+     * True when handleAssistantMessage just added a non-stream snapshot
+     * MessageBlock to {@link #messages} and the corresponding stream events
+     * may yet arrive. Consumed by handleMessageStart so it only deletes the
+     * "previous" assistant message when it really is a duplicate of the
+     * incoming stream — and not a legitimate intermediate response from a
+     * prior turn (e.g. "I'll check the memory files" before a Read tool).
+     */
+    private volatile boolean pendingAssistantSnapshot = false;
+
     // ==================== ICliMessageListener Implementation ====================
 
     @Override
     public void onMessage(CliMessage message) {
+        String type = message != null ? message.getClass().getSimpleName() : "null";
+        String extra = "";
+        if (message instanceof CliMessage.StreamEvent) {
+            extra = " eventType=" + ((CliMessage.StreamEvent) message).getEventType()
+                  + " idx=" + ((CliMessage.StreamEvent) message).getIndex();
+        } else if (message instanceof CliMessage.ResultMessage) {
+            CliMessage.ResultMessage r = (CliMessage.ResultMessage) message;
+            extra = " subtype=" + r.getSubtype() + " isError=" + r.isError();
+        }
+        Activator.logDiag("[DIAG-MSG] model=" + System.identityHashCode(this)
+                + " recv=" + type + extra);
         if (message instanceof CliMessage.SystemInit) {
             handleSystemInit((CliMessage.SystemInit) message);
+        } else if (message instanceof CliMessage.SystemNotification) {
+            handleSystemNotification((CliMessage.SystemNotification) message);
         } else if (message instanceof CliMessage.AssistantMessage) {
             handleAssistantMessage((CliMessage.AssistantMessage) message);
         } else if (message instanceof CliMessage.UserMessage) {
@@ -56,6 +121,8 @@ public class ConversationModel implements ICliMessageListener {
             handleResult((CliMessage.ResultMessage) message);
         } else if (message instanceof CliMessage.PermissionRequest) {
             handlePermissionRequest((CliMessage.PermissionRequest) message);
+        } else if (message instanceof CliMessage.RateLimitEvent) {
+            handleRateLimitEvent((CliMessage.RateLimitEvent) message);
         }
     }
 
@@ -113,10 +180,47 @@ public class ConversationModel implements ICliMessageListener {
      * Add a user message to the conversation (before sending to CLI).
      */
     public void addUserMessage(String content) {
+        addUserMessage(content, null, null);
+    }
+
+    /**
+     * Add a user message including attached images. Images are stored as
+     * ImageSegments after the text so the UI can render thumbnails inline.
+     *
+     * @param content   the visible text the user typed
+     * @param images    raw image bytes per attachment (may be null/empty)
+     * @param imageNames matching display names for each image (may be null/empty)
+     */
+    public void addUserMessage(String content, java.util.List<byte[]> images,
+                               java.util.List<String> imageNames) {
+        // Reset per-turn diagnostic state so handleResult can detect empty turns.
+        hadTextInCurrentTurn = false;
+        lastErrorNotification = null;
+        lastUserPrompt = content;
+        retriedSilentEmpty = false;
+        turnSendNanos = System.nanoTime();
+        firstTokenLoggedThisTurn = false;
+        // A new user turn starts — any snapshot we might have left "pending"
+        // from the previous turn is now definitely committed (the previous
+        // result event already fired), so clear it to avoid an accidental
+        // dedup of the new turn's intermediate output.
+        pendingAssistantSnapshot = false;
+
         MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
         MessageBlock.TextSegment textSeg = new MessageBlock.TextSegment();
         textSeg.appendText(content);
         block.addSegment(textSeg);
+
+        if (images != null && !images.isEmpty()) {
+            for (int i = 0; i < images.size(); i++) {
+                byte[] bytes = images.get(i);
+                if (bytes == null || bytes.length == 0) continue;
+                String name = (imageNames != null && i < imageNames.size())
+                        ? imageNames.get(i) : ("Image " + (i + 1));
+                block.addSegment(new MessageBlock.ImageSegment(bytes, name, "image/png"));
+            }
+        }
+
         synchronized (messages) {
             messages.add(block);
         }
@@ -226,25 +330,53 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void handleAssistantMessage(CliMessage.AssistantMessage msg) {
+        String preview = "";
+        try {
+            String t = extractTextFromContent(msg.getContent());
+            if (t != null) preview = t.substring(0, Math.min(40, t.length())).replace("\n", "\\n");
+        } catch (Throwable ignored) {}
+        Activator.logDiag("[DIAG] handleAssistantMessage: usingStreamEvents=" + usingStreamEvents
+                + " currentStreamingBlock=" + (currentStreamingBlock != null)
+                + " preview='" + preview + "'");
         // When stream events are active, ignore ALL assistant messages. The stream events
         // (message_start/content_block_*/message_stop) are authoritative and already drive the UI.
         if (usingStreamEvents) {
+            Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: usingStreamEvents=true");
+            return;
+        }
+        // Also skip if there's an active streaming block
+        if (currentStreamingBlock != null) {
+            Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: currentStreamingBlock != null");
             return;
         }
         // Also ignore if the last message is already ASSISTANT (complete or still streaming).
         // The CLI sends redundant assistant snapshots mid-stream and after result.
+        // Additionally, check content-based dedup: on some backends (e.g. Bedrock),
+        // the CLI may send the same content via both 'assistant' and stream events,
+        // or send multiple 'assistant' snapshots with identical text.
         synchronized (messages) {
             if (!messages.isEmpty()) {
                 MessageBlock lastMsg = messages.get(messages.size() - 1);
                 if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT) {
+                    Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: last msg is ASSISTANT");
                     return; // Already have an assistant message — skip duplicate
                 }
             }
+            // Content-based dedup: if ANY recent assistant message has identical text,
+            // skip this one. Catches duplicates regardless of message ordering.
+            String incomingText = extractTextFromContent(msg.getContent());
+            if (incomingText != null && !incomingText.isEmpty()) {
+                for (int i = messages.size() - 1; i >= Math.max(0, messages.size() - 5); i--) {
+                    MessageBlock existing = messages.get(i);
+                    if (existing.getRole() == MessageBlock.Role.ASSISTANT
+                            && incomingText.equals(existing.getFullText())) {
+                        Activator.logDiag("[DIAG] handleAssistantMessage SKIPPED: content duplicate");
+                        return; // Content duplicate — skip
+                    }
+                }
+            }
         }
-        // Also skip if there's an active streaming block
-        if (currentStreamingBlock != null) {
-            return;
-        }
+        Activator.logDiag("[DIAG] handleAssistantMessage PROCESSING (snapshot mode): creating new block");
 
         // If we received a full message directly (non-streaming), create a block for it
         if (msg.getContent() != null && !msg.getContent().isEmpty()) {
@@ -266,8 +398,81 @@ public class ConversationModel implements ICliMessageListener {
             synchronized (messages) {
                 messages.add(block);
             }
+            // Flag the just-added snapshot so a stream that arrives next
+            // (containing the same content) can dedup it in handleMessageStart.
+            pendingAssistantSnapshot = true;
             fireAssistantMessageStarted(block);
             fireAssistantMessageCompleted(block);
+        }
+    }
+
+    /**
+     * Surface hook-related system notifications to the user when they carry an
+     * error indicator. Common case: enterprise SessionStart hooks that talk to
+     * AWS SSO and emit "Token has expired" on stderr while still reporting
+     * outcome:"success" — without this handler the failure is invisible.
+     */
+    private void handleSystemNotification(CliMessage.SystemNotification n) {
+        Activator.logDiag("[DIAG] SystemNotification subtype=" + n.getSubtype()
+                + " hook=" + n.getHookName()
+                + " hasError=" + n.hasErrorIndicator());
+
+        // Track hook latency so we can isolate AIM-proxy / corporate-environment
+        // cost from the "send → first token" budget.
+        if ("hook_started".equals(n.getSubtype())) {
+            pendingHookStartNanos = System.nanoTime();
+            pendingHookName = n.getHookName();
+            Activator.logDiag("[DIAG-PERF] hook_started name=" + pendingHookName);
+            return;
+        }
+
+        // Only act on hook_response (the final outcome of a hook) to avoid spamming.
+        if (!"hook_response".equals(n.getSubtype())) {
+            return;
+        }
+
+        // hook_response → log elapsed since matching hook_started (best-effort).
+        if (pendingHookStartNanos > 0) {
+            long elapsedMs = (System.nanoTime() - pendingHookStartNanos) / 1_000_000L;
+            Activator.logDiag("[DIAG-PERF] hook_response name="
+                    + (n.getHookName() != null ? n.getHookName() : pendingHookName)
+                    + " elapsed=" + elapsedMs + "ms hasError=" + n.hasErrorIndicator());
+            pendingHookStartNanos = 0;
+            pendingHookName = null;
+        } else {
+            Activator.logDiag("[DIAG-PERF] hook_response name="
+                    + n.getHookName() + " (no matching start) hasError=" + n.hasErrorIndicator());
+        }
+
+        if (n.hasErrorIndicator()) {
+            // Cache so handleResult can correlate an empty result with this error.
+            lastErrorNotification = n;
+
+            // Build a friendly message
+            String hook = n.getHookName() != null ? n.getHookName() : "hook";
+            String detail = n.getStderr();
+            if (detail == null || detail.isBlank()) detail = n.getStdout();
+            if (detail == null) detail = "";
+            detail = detail.trim();
+            // Trim CR/LF noise but keep readable
+            if (detail.length() > 400) detail = detail.substring(0, 400) + " …";
+
+            String hint = "";
+            String low = detail.toLowerCase();
+            if (low.contains("token has expired") || low.contains("sso")) {
+                hint = "\nFix: refresh your AWS SSO token (run `aws sso login`) and reopen this Claude tab.";
+            } else if (low.contains("unauthorized") || low.contains("authentication failed")) {
+                hint = "\nFix: re-authenticate (check your API key / SSO session) and reopen this Claude tab.";
+            }
+
+            fireError("⚠ Hook '" + hook + "' reported an error:\n" + detail + hint);
+        }
+    }
+
+    private void handleRateLimitEvent(CliMessage.RateLimitEvent event) {
+        if (event.isRejected()) {
+            fireError("⚠ Rate limit reached — your request may be delayed or rejected. "
+                    + "Please wait a moment before sending another message.");
         }
     }
 
@@ -285,6 +490,20 @@ public class ConversationModel implements ICliMessageListener {
     private void handleStreamEvent(CliMessage.StreamEvent event) {
         String eventType = event.getEventType();
         if (eventType == null) return;
+
+        // Fire the generic listener BEFORE any type-specific dispatch so
+        // listeners see every event — used by the view to keep the
+        // streaming-timeout alive during long thinking / tool-input blocks
+        // that never produce a text_delta.
+        String deltaType = null;
+        String toolName = null;
+        try {
+            CliMessage.Delta d = event.getDelta();
+            if (d != null) deltaType = d.getType();
+            CliMessage.ContentBlock cb = event.getContentBlock();
+            if (cb != null && "tool_use".equals(cb.getType())) toolName = cb.getName();
+        } catch (Throwable ignored) {}
+        fireStreamEvent(eventType, deltaType, toolName);
 
         switch (eventType) {
             case "message_start":
@@ -309,21 +528,34 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void handleMessageStart(CliMessage.StreamEvent event) {
+        Activator.logDiag("[DIAG] handleMessageStart: prev usingStreamEvents=" + usingStreamEvents
+                + " currentStreamingBlock=" + (currentStreamingBlock != null)
+                + " pendingAssistantSnapshot=" + pendingAssistantSnapshot);
         // Start a new assistant message — but don't fire onAssistantMessageStarted yet.
         // We defer that until the first content block arrives so we never show an empty bubble.
         usingStreamEvents = true; // stream events are now driving this response
 
-        // Guard: if the CLI already sent a full "assistant" message for this same turn
-        // (before the stream events arrived), remove it to avoid duplicate bubbles.
-        synchronized (messages) {
-            if (!messages.isEmpty()) {
-                MessageBlock lastMsg = messages.get(messages.size() - 1);
-                if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg != currentStreamingBlock) {
-                    messages.remove(messages.size() - 1);
-                    fireAssistantMessageRemoved(lastMsg);
+        // Dedup ONLY when handleAssistantMessage just added a snapshot that the
+        // upcoming stream is about to recreate. Without this gate, every
+        // message_start (e.g. the start of the assistant's follow-up reply
+        // after a tool call) was removing the previous assistant bubble —
+        // wiping legitimate intermediate responses like "I'll check the
+        // memory files first" before a Read tool.
+        if (pendingAssistantSnapshot) {
+            synchronized (messages) {
+                if (!messages.isEmpty()) {
+                    MessageBlock lastMsg = messages.get(messages.size() - 1);
+                    if (lastMsg.getRole() == MessageBlock.Role.ASSISTANT && lastMsg != currentStreamingBlock) {
+                        String prev = lastMsg.getFullText();
+                        Activator.logDiag("[DIAG] handleMessageStart REMOVED snapshot, len="
+                                + (prev != null ? prev.length() : 0));
+                        messages.remove(messages.size() - 1);
+                        fireAssistantMessageRemoved(lastMsg);
+                    }
                 }
             }
         }
+        pendingAssistantSnapshot = false;
 
         currentStreamingBlock = new MessageBlock(MessageBlock.Role.ASSISTANT);
         synchronized (messages) {
@@ -333,6 +565,10 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void handleContentBlockStart(CliMessage.StreamEvent event) {
+        CliMessage.ContentBlock cb0 = event.getContentBlock();
+        Activator.logDiag("[DIAG] handleContentBlockStart: index=" + event.getIndex()
+                + " type=" + (cb0 != null ? cb0.getType() : "null")
+                + " currentStreamingBlock=" + (currentStreamingBlock != null));
         boolean fireStarted = false;
         if (currentStreamingBlock == null) {
             // Auto-create streaming block if we missed message_start
@@ -384,10 +620,23 @@ public class ConversationModel implements ICliMessageListener {
         if (delta == null) return;
 
         if ("text_delta".equals(delta.getType()) && delta.getText() != null) {
+            String dt = delta.getText();
+            String snip = dt.substring(0, Math.min(30, dt.length())).replace("\n", "\\n");
+            Activator.logDiag("[DIAG] text_delta idx=" + event.getIndex()
+                    + " len=" + dt.length() + " snip='" + snip + "'");
+            // T1.5 — first text token of the current turn. The gap between
+            // turnSendNanos and now isolates "send → model first byte" from
+            // the rest of the streaming latency.
+            if (!firstTokenLoggedThisTurn && turnSendNanos > 0) {
+                firstTokenLoggedThisTurn = true;
+                long elapsedMs = (System.nanoTime() - turnSendNanos) / 1_000_000L;
+                Activator.logDiag("[DIAG-TIMING] T1.5 firstToken elapsed=" + elapsedMs + "ms");
+            }
+            hadTextInCurrentTurn = true; // any text delta proves the model produced output
             // Append text to the current text segment
             MessageBlock.TextSegment textSeg = currentStreamingBlock.getOrCreateLastTextSegment();
-            textSeg.appendText(delta.getText());
-            fireStreamingTextAppended(currentStreamingBlock, delta.getText());
+            textSeg.appendText(dt);
+            fireStreamingTextAppended(currentStreamingBlock, dt);
 
         } else if ("input_json_delta".equals(delta.getType())) {
             // Append to tool input
@@ -425,16 +674,109 @@ public class ConversationModel implements ICliMessageListener {
     private void handleMessageStop(CliMessage.StreamEvent event) {
         // Message is complete
         if (currentStreamingBlock != null) {
+            // Content-based dedup: if an earlier assistant message has identical text
+            // (e.g. from a non-stream 'assistant' event that arrived first), remove
+            // the OLD one and keep this streaming version.
+            String streamedText = currentStreamingBlock.getFullText();
+            if (streamedText != null && !streamedText.isEmpty()) {
+                synchronized (messages) {
+                    for (int i = messages.size() - 1; i >= 0; i--) {
+                        MessageBlock existing = messages.get(i);
+                        if (existing == currentStreamingBlock) continue;
+                        if (existing.getRole() == MessageBlock.Role.ASSISTANT
+                                && streamedText.equals(existing.getFullText())) {
+                            messages.remove(i);
+                            fireAssistantMessageRemoved(existing);
+                            break;
+                        }
+                    }
+                }
+            }
             fireAssistantMessageCompleted(currentStreamingBlock);
             currentStreamingBlock = null;
         }
     }
 
     private void handleResult(CliMessage.ResultMessage result) {
+        String resultText = result.getResult();
+        String resultPreview = resultText != null
+                ? resultText.substring(0, Math.min(120, resultText.length())).replace("\n", "\\n")
+                : "null";
+        Activator.logDiag("[DIAG] handleResult: subtype=" + result.getSubtype()
+                + " isError=" + result.isError()
+                + " cost=" + result.getCostUsd()
+                + " duration=" + result.getDurationMs() + "ms"
+                + " turns=" + result.getNumTurns()
+                + " resultLen=" + (resultText != null ? resultText.length() : 0)
+                + " resultPreview='" + resultPreview + "'"
+                + " sessionId=" + result.getSessionId());
         // NOTE: Do NOT reset usingStreamEvents here. The CLI sends a redundant
         // assistant snapshot AFTER the result message. If we reset the flag,
         // handleAssistantMessage would process that snapshot and duplicate the text.
         // The flag is reset in handleMessageStart when a new streaming turn begins.
+
+        // Detect "silent failure": result arrived but no text was streamed in this
+        // turn. Common cause: SessionStart hook (AWS SSO) blocked or auth failed.
+        boolean silentEmpty = !hadTextInCurrentTurn
+                && (resultText == null || resultText.isEmpty())
+                && result.getOutputTokens() == 0;
+        if (silentEmpty) {
+            // First-attempt auto-retry: the AIM/UserPromptSubmit hook is
+            // non-deterministic — same prompt sometimes blocks, sometimes
+            // passes. A single retry is cheap and frequently succeeds.
+            if (!retriedSilentEmpty && lastUserPrompt != null && !lastUserPrompt.isEmpty()
+                    && lastErrorNotification == null) {
+                retriedSilentEmpty = true;          // keep TRUE — prevents infinite loop
+                hadTextInCurrentTurn = false;       // reset for the retry attempt
+                lastErrorNotification = null;       // reset for the retry attempt
+                Activator.logDiag("[DIAG] silentEmpty result — auto-retrying once");
+                fireSilentEmptyShouldRetry(lastUserPrompt);
+                return;
+            }
+
+            String msg;
+            if (lastErrorNotification != null) {
+                // We already surfaced a richer error from the hook — don't double-report.
+                Activator.logDiag("[DIAG] silentEmpty result, but lastErrorNotification already fired");
+            } else if (result.isError() || (result.getSubtype() != null && !"success".equals(result.getSubtype()))) {
+                msg = "⚠ CLI returned an error: subtype=" + result.getSubtype()
+                    + (resultText != null && !resultText.isEmpty() ? "\n" + resultText : "");
+                fireError(msg);
+            } else {
+                // Signature of a UserPromptSubmit hook block: empty result, success
+                // subtype, no error flag, but num_turns>=1 and zero tokens used.
+                // The CLI does NOT surface the hook's block message to stream-json,
+                // BUT with --debug enabled it writes the full block reason (including
+                // "obfuscation attack detected", "Original prompt: ..." etc.) to
+                // ~/.claude/debug/<session-id>.txt — we mine that file here.
+                String hookBlock = readHookBlockFromDebugLog(result.getSessionId());
+                if (hookBlock != null && !hookBlock.isBlank()) {
+                    msg = "⚠ Your prompt was blocked by a hook:\n\n"
+                        + hookBlock + "\n\n"
+                        + "Workarounds: rephrase the prompt, or contact your IT/AWS "
+                        + "admin to relax the hook rule.";
+                } else {
+                    String retried = retriedSilentEmpty ? "after one auto-retry " : "";
+                    msg = "⚠ Your prompt was blocked " + retried + "by a hook.\n\n"
+                        + "The CLI returned an empty response with 0 tokens used "
+                        + "(duration=" + result.getDurationMs() + "ms, turns=" + result.getNumTurns() + "). "
+                        + "This is the typical signature of a UserPromptSubmit hook "
+                        + "(e.g. corporate \"obfuscation attack\" detector flagging "
+                        + "Hebrew/RTL text). The hook can be non-deterministic — "
+                        + (retriedSilentEmpty
+                            ? "we already retried automatically and it was blocked again, "
+                              + "so this prompt is consistently rejected."
+                            : "this attempt was rejected.")
+                        + "\n\n"
+                        + "To see the exact reason, run in cmd:\n"
+                        + "   claude --debug\n"
+                        + "   <your prompt>\n\n"
+                        + "Workarounds: rephrase in English, try again later, or ask your "
+                        + "IT/AWS admin to relax the hook rule.";
+                }
+                fireError(msg);
+            }
+        }
 
         // Update usage
         cumulativeUsage.addUsage(
@@ -516,6 +858,18 @@ public class ConversationModel implements ICliMessageListener {
         }
     }
 
+    /** Extract plain text from CLI content blocks for dedup comparison. */
+    private String extractTextFromContent(java.util.List<CliMessage.ContentBlock> content) {
+        if (content == null) return null;
+        StringBuilder sb = new StringBuilder();
+        for (CliMessage.ContentBlock block : content) {
+            if ("text".equals(block.getType()) && block.getText() != null) {
+                sb.append(block.getText());
+            }
+        }
+        return sb.length() > 0 ? sb.toString().trim() : null;
+    }
+
     private void fireUserMessageAdded(MessageBlock block) {
         for (IConversationListener l : listeners) {
             try { l.onUserMessageAdded(block); } catch (Exception e) { logError(e); }
@@ -537,6 +891,12 @@ public class ConversationModel implements ICliMessageListener {
     private void fireStreamingTextAppended(MessageBlock block, String delta) {
         for (IConversationListener l : listeners) {
             try { l.onStreamingTextAppended(block, delta); } catch (Exception e) { logError(e); }
+        }
+    }
+
+    private void fireStreamEvent(String eventType, String deltaType, String toolName) {
+        for (IConversationListener l : listeners) {
+            try { l.onStreamEvent(eventType, deltaType, toolName); } catch (Exception e) { logError(e); }
         }
     }
 
@@ -593,6 +953,87 @@ public class ConversationModel implements ICliMessageListener {
     private void fireExtendedThinkingEnded() {
         for (IConversationListener l : listeners) {
             try { l.onExtendedThinkingEnded(); } catch (Exception e) { logError(e); }
+        }
+    }
+
+    /**
+     * Read the per-session debug log file written by `claude --debug` and
+     * extract the hook-block reason if present.
+     *
+     * The file lives at {@code ~/.claude/debug/<session-id>.txt}. When a
+     * UserPromptSubmit hook blocks a prompt, the CLI writes lines like:
+     * <pre>
+     *   ● UserPromptSubmit operation blocked by hook:   obfuscation attack detected
+     *     Original prompt: יה
+     * </pre>
+     * The block reason is NOT emitted via stream-json — this is the only way
+     * to obtain it programmatically.
+     *
+     * Returns null if the file is missing, unreadable, or contains no block.
+     */
+    private String readHookBlockFromDebugLog(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return null;
+        try {
+            String home = System.getProperty("user.home");
+            java.nio.file.Path file = java.nio.file.Paths.get(home, ".claude", "debug", sessionId + ".txt");
+            if (!java.nio.file.Files.exists(file)) {
+                Activator.logDiag("[DIAG] debug log not found: " + file);
+                return null;
+            }
+            // Read the whole file (typically small — a few KB per session).
+            String content = new String(java.nio.file.Files.readAllBytes(file),
+                    java.nio.charset.StandardCharsets.UTF_8);
+
+            // Look for the canonical block marker. Capture the line(s) that
+            // describe the block AND the "Original prompt" line if present.
+            //
+            // We do a simple scan rather than a regex — the output is
+            // human-formatted and the patterns are stable.
+            String[] lines = content.split("\\r?\\n");
+            StringBuilder out = new StringBuilder();
+            boolean inBlock = false;
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i];
+                String low = line.toLowerCase();
+                if (low.contains("operation blocked by hook")
+                        || low.contains("blocked by hook:")) {
+                    out.append(line.trim()).append("\n");
+                    inBlock = true;
+                    // Capture the next 1-3 indented lines (e.g. "Original prompt: ..."
+                    // or extra reason text the hook emitted).
+                    for (int j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+                        String next = lines[j];
+                        if (next.isBlank()) break;
+                        // Hook continuation lines are typically indented
+                        if (next.startsWith(" ") || next.startsWith("\t")
+                                || next.toLowerCase().contains("original prompt")) {
+                            out.append(next.trim()).append("\n");
+                        } else {
+                            break;
+                        }
+                    }
+                    break; // first match is enough
+                }
+            }
+            String result = out.toString().trim();
+            if (result.isEmpty()) {
+                Activator.logDiag("[DIAG] debug log present but no hook-block marker found");
+                return null;
+            }
+            // Trim a leading bullet character if present (e.g. "● ")
+            if (result.startsWith("●") || result.startsWith("•")) {
+                result = result.substring(1).trim();
+            }
+            return result;
+        } catch (Exception e) {
+            Activator.logDiag("[DIAG] readHookBlockFromDebugLog failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void fireSilentEmptyShouldRetry(String prompt) {
+        for (IConversationListener l : listeners) {
+            try { l.onSilentEmptyShouldRetry(prompt); } catch (Exception e) { logError(e); }
         }
     }
 

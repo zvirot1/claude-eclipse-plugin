@@ -185,8 +185,59 @@ public class SessionHistoryDialog extends TitleAreaDialog {
     // ==================== Load Sessions ====================
 
     private void loadSessions() {
-        allSessions = sessionManager.listSessions();
+        long t0 = System.currentTimeMillis();
+        // Phase 1 (fast, on UI thread): enumerate .jsonl filenames + mtimes.
+        // No file CONTENT is read — that was the >30s hang on a 1.5GB store.
+        allSessions = com.anthropic.eclipse.claude.session.JsonlSessionScanner
+                .listSessionsFast(null);
         populateTable(allSessions);
+        com.anthropic.eclipse.claude.Activator.logDiag(
+                "[DIAG-PERF] SessionHistoryDialog.loadSessions phase1 elapsed="
+                        + (System.currentTimeMillis() - t0) + "ms count=" + allSessions.size());
+        // Phase 2 (background): fill summary/model/messageCount for each row.
+        previewText.setText(allSessions.isEmpty()
+                ? "(no sessions found)" : "Select a session to preview its content.");
+        final org.eclipse.swt.widgets.Display display = sessionsTable.getDisplay();
+        Thread t = new Thread(() -> {
+            // Fill details (summary/model/count) one row at a time, updating
+            // the table as each completes. The user can already scroll, search
+            // by date, click a row to load the preview — they don't have to
+            // wait for this background pass to finish.
+            long fillT0 = System.currentTimeMillis();
+            int filled = 0;
+            for (final SessionInfo info : new java.util.ArrayList<>(allSessions)) {
+                try {
+                    com.anthropic.eclipse.claude.session.JsonlSessionScanner
+                            .fillSessionDetails(info);
+                    filled++;
+                } catch (Throwable ignored) {}
+                display.asyncExec(() -> {
+                    if (sessionsTable.isDisposed()) return;
+                    refreshRowFor(info);
+                });
+            }
+            com.anthropic.eclipse.claude.Activator.logDiag(
+                    "[DIAG-PERF] SessionHistoryDialog.loadSessions phase2 elapsed="
+                            + (System.currentTimeMillis() - fillT0) + "ms filled=" + filled);
+        }, "claude-session-list");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Refresh a single row whose SessionInfo was just filled-in. */
+    private void refreshRowFor(SessionInfo info) {
+        if (sessionsTable.isDisposed() || info == null) return;
+        for (TableItem item : sessionsTable.getItems()) {
+            if (info.getSessionId().equals(item.getData("sessionId"))) {
+                if (info.getSummary() != null) item.setText(1, info.getSummary());
+                if (info.getModel() != null)   item.setText(2, info.getModel());
+                if (info.getMessageCount() > 0) item.setText(3, String.valueOf(info.getMessageCount()));
+                if (info.getStartTime() > 0) {
+                    item.setText(0, DATE_FORMAT.format(new Date(info.getStartTime())));
+                }
+                break;
+            }
+        }
     }
 
     private void populateTable(List<SessionInfo> sessions) {
@@ -241,31 +292,58 @@ public class SessionHistoryDialog extends TitleAreaDialog {
 
     // ==================== Preview ====================
 
+    private volatile String pendingPreviewSessionId;
+
     private void showPreview(String sessionId) {
         if (sessionId == null) {
             previewText.setText("No session selected.");
             return;
         }
+        previewText.setText("Loading...");
+        pendingPreviewSessionId = sessionId;
+        final String requested = sessionId;
+        final org.eclipse.swt.widgets.Display display = previewText.getDisplay();
+        Thread t = new Thread(() -> {
+            String result = buildPreview(requested);
+            display.asyncExec(() -> {
+                if (previewText.isDisposed()) return;
+                if (!requested.equals(pendingPreviewSessionId)) return;
+                previewText.setText(result);
+            });
+        }, "claude-session-preview");
+        t.setDaemon(true);
+        t.start();
+    }
 
-        // Try to read the JSONL file from ~/.claude/projects/{encoded-path}/{sessionId}.jsonl
-        String encodedPath = projectDir.replace("/", "-");
-        Path jsonlPath = Paths.get(
-            System.getProperty("user.home"), ".claude", "projects",
-            encodedPath, sessionId + ".jsonl");
+    private String buildPreview(String sessionId) {
+        Path jsonlPath = null;
+        try {
+            Path projectsRoot = Paths.get(
+                System.getProperty("user.home"), ".claude", "projects");
+            if (Files.isDirectory(projectsRoot)) {
+                try (java.util.stream.Stream<Path> dirs = Files.list(projectsRoot)) {
+                    java.util.Iterator<Path> it = dirs.iterator();
+                    while (it.hasNext()) {
+                        Path candidate = it.next().resolve(sessionId + ".jsonl");
+                        if (Files.exists(candidate)) {
+                            jsonlPath = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            // fall through — jsonlPath stays null
+        }
 
-        if (!Files.exists(jsonlPath)) {
-            // Try without encoded path - some sessions may be stored differently
-            previewText.setText("Session: " + sessionId + "\n\n"
-                + "(Session JSONL file not found at:\n" + jsonlPath + "\n\n"
-                + "The session metadata is available but the conversation\n"
-                + "content may have been cleaned up.)");
-            return;
+        if (jsonlPath == null) {
+            return "Session: " + sessionId + "\n\n"
+                + "(Session JSONL file not found in ~/.claude/projects/.)";
         }
 
         try {
             StringBuilder preview = new StringBuilder();
             int lineCount = 0;
-
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(Files.newInputStream(jsonlPath), StandardCharsets.UTF_8))) {
                 String line;
@@ -273,9 +351,8 @@ public class SessionHistoryDialog extends TitleAreaDialog {
                     try {
                         Map<String, Object> json = JsonParser.parseObject(line);
                         String type = JsonParser.getString(json, "type");
-
                         if ("user".equals(type)) {
-                            String text = extractMessageText(json);
+                            String text = stripContextBlocks(extractMessageText(json));
                             if (!text.isEmpty()) {
                                 preview.append("\u25B6 User: ").append(truncate(text, 200)).append("\n\n");
                                 lineCount++;
@@ -287,21 +364,21 @@ public class SessionHistoryDialog extends TitleAreaDialog {
                                 lineCount++;
                             }
                         }
-                    } catch (Exception ignored) {
-                        // Skip unparseable lines
-                    }
+                    } catch (Exception ignored) {}
                 }
             }
-
-            if (preview.length() == 0) {
-                preview.append("(No message content found in session file)");
-            }
-
-            previewText.setText(preview.toString());
-
+            if (preview.length() == 0) preview.append("(No message content found in session file)");
+            return preview.toString();
         } catch (Exception e) {
-            previewText.setText("Error reading session: " + e.getMessage());
+            return "Error reading session: " + e.getMessage();
         }
+    }
+
+    private String stripContextBlocks(String s) {
+        if (s == null) return "";
+        s = s.replaceAll("(?is)^\\s*\\[Active editor context:[^\\]]*\\]\\s*", "");
+        s = s.replaceAll("(?is)^(?:\\s*<file\\s+path=\"[^\"]*\"[^>]*>.*?</file>\\s*)+", "");
+        return s;
     }
 
     @SuppressWarnings("unchecked")

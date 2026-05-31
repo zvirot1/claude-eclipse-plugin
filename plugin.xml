@@ -222,13 +222,14 @@
          </toolbar>
       </menuContribution>
 
-      <!-- Status Bar contribution -->
-      <menuContribution locationURI="toolbar:org.eclipse.ui.trim.status">
-         <control
-            class="com.anthropic.eclipse.claude.views.ClaudeStatusBarContribution"
-            id="com.anthropic.eclipse.claude.statusbar">
-         </control>
-      </menuContribution>
+      <!-- Status Bar: installed programmatically by StatusBarInstaller
+           because menuContribution → toolbar:org.eclipse.ui.trim.status
+           is silently dropped by the Eclipse 4.x e4 compatibility layer. -->
+   </extension>
+
+   <!-- ========== Early Startup (status bar installer) ========== -->
+   <extension point="org.eclipse.ui.startup">
+      <startup class="com.anthropic.eclipse.claude.StatusBarInstaller"/>
    </extension>
 
    <!-- ========== Preferences ========== -->

@@ -253,19 +253,39 @@ public class McpServersDialog extends TitleAreaDialog {
         try {
             String json = new String(Files.readAllBytes(globalClaudePath), StandardCharsets.UTF_8);
             Map<String, Object> root = JsonParser.parseObject(json);
+
+            // User-scope servers (added via `claude mcp add --scope user`) live at
+            // the ROOT level of ~/.claude.json under "mcpServers". The CLI also
+            // mirrors them per-project under projects[dir].mcpServers but the
+            // root level is the authoritative location for global/user-scope.
+            Map<String, Object> rootServers = JsonParser.getMap(root, "mcpServers");
+            if (rootServers != null) {
+                for (Map.Entry<String, Object> entry : rootServers.entrySet()) {
+                    if (entry.getValue() instanceof Map) {
+                        addServerToTable(globalServersTable, entry.getKey(),
+                            (Map<String, Object>) entry.getValue());
+                    }
+                }
+            }
+
+            // Also include any per-project mcpServers stored in the same file
+            // (legacy / project-local additions) — these are still global in the
+            // sense that they live in the user's home file.
             Map<String, Object> projects = JsonParser.getMap(root, "projects");
-            if (projects == null) return;
-
-            Map<String, Object> project = JsonParser.getMap(projects, projectDir);
-            if (project == null) return;
-
-            Map<String, Object> servers = JsonParser.getMap(project, "mcpServers");
-            if (servers == null) return;
-
-            for (Map.Entry<String, Object> entry : servers.entrySet()) {
-                if (entry.getValue() instanceof Map) {
-                    addServerToTable(globalServersTable, entry.getKey(),
-                        (Map<String, Object>) entry.getValue());
+            if (projects != null) {
+                Map<String, Object> project = JsonParser.getMap(projects, projectDir);
+                if (project != null) {
+                    Map<String, Object> projServers = JsonParser.getMap(project, "mcpServers");
+                    if (projServers != null) {
+                        for (Map.Entry<String, Object> entry : projServers.entrySet()) {
+                            // Avoid duplicating root-level entries with the same name
+                            if (rootServers != null && rootServers.containsKey(entry.getKey())) continue;
+                            if (entry.getValue() instanceof Map) {
+                                addServerToTable(globalServersTable, entry.getKey(),
+                                    (Map<String, Object>) entry.getValue());
+                            }
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
@@ -359,31 +379,36 @@ public class McpServersDialog extends TitleAreaDialog {
 
             Map<String, Object> servers = buildServersMap(globalServersTable);
 
-            // Navigate to projects[projectDir]
-            Map<String, Object> projects = JsonParser.getMap(root, "projects");
-            if (projects == null) {
-                projects = new LinkedHashMap<>();
-                root.put("projects", projects);
-            }
-
-            Map<String, Object> project = JsonParser.getMap(projects, projectDir);
-            if (project == null) {
-                project = new LinkedHashMap<>();
-                projects.put(projectDir, project);
-            }
-
+            // Save to ROOT-level mcpServers (matches `claude mcp add --scope user`).
+            // The CLI also reads this location for global/user-scope servers.
             if (servers.isEmpty()) {
-                project.remove("mcpServers");
+                root.remove("mcpServers");
             } else {
-                project.put("mcpServers", servers);
+                root.put("mcpServers", servers);
             }
 
-            // Clean up empty project entry
-            if (project.isEmpty()) {
-                projects.remove(projectDir);
-            }
-            if (projects.isEmpty()) {
-                root.remove("projects");
+            // Also clean up any legacy project-scoped duplicates of these names
+            // so the same server isn't listed twice in different scopes.
+            Map<String, Object> projects = JsonParser.getMap(root, "projects");
+            if (projects != null) {
+                Map<String, Object> project = JsonParser.getMap(projects, projectDir);
+                if (project != null) {
+                    Map<String, Object> projServers = JsonParser.getMap(project, "mcpServers");
+                    if (projServers != null) {
+                        for (String name : servers.keySet()) {
+                            projServers.remove(name);
+                        }
+                        if (projServers.isEmpty()) {
+                            project.remove("mcpServers");
+                        }
+                    }
+                    if (project.isEmpty()) {
+                        projects.remove(projectDir);
+                    }
+                }
+                if (projects.isEmpty()) {
+                    root.remove("projects");
+                }
             }
 
             if (root.isEmpty() && !Files.exists(globalClaudePath)) {
@@ -592,6 +617,39 @@ public class McpServersDialog extends TitleAreaDialog {
                 item.setText(1, e.getValue());
             }
 
+            // Inline editing: double-click any cell to edit it in place.
+            // ENTER commits the value; ESC cancels. Empty key after edit removes
+            // the row to avoid orphan blank entries.
+            final org.eclipse.swt.custom.TableEditor cellEditor = new org.eclipse.swt.custom.TableEditor(envTable);
+            cellEditor.horizontalAlignment = SWT.LEFT;
+            cellEditor.grabHorizontal = true;
+            envTable.addListener(SWT.MouseDoubleClick, evt -> {
+                org.eclipse.swt.graphics.Point pt = new org.eclipse.swt.graphics.Point(evt.x, evt.y);
+                TableItem item = envTable.getItem(pt);
+                if (item == null) return;
+                int colIdx = -1;
+                for (int i = 0; i < envTable.getColumnCount(); i++) {
+                    if (item.getBounds(i).contains(pt)) { colIdx = i; break; }
+                }
+                if (colIdx < 0) return;
+                final int col = colIdx;
+                final TableItem ti = item;
+                final Text editor = new Text(envTable, SWT.NONE);
+                editor.setText(ti.getText(col));
+                editor.selectAll();
+                editor.setFocus();
+                editor.addListener(SWT.FocusOut, e -> commitInlineEdit(envTable, cellEditor, ti, col, editor));
+                editor.addListener(SWT.Traverse, e -> {
+                    if (e.detail == SWT.TRAVERSE_RETURN) {
+                        commitInlineEdit(envTable, cellEditor, ti, col, editor);
+                    } else if (e.detail == SWT.TRAVERSE_ESCAPE) {
+                        editor.dispose();
+                        e.doit = false;
+                    }
+                });
+                cellEditor.setEditor(editor, ti, col);
+            });
+
             // Env add/remove buttons
             Composite envBtns = new Composite(envPanel, SWT.NONE);
             envBtns.setLayout(new GridLayout(4, false));
@@ -629,7 +687,27 @@ public class McpServersDialog extends TitleAreaDialog {
                 if (indices.length > 0) envTable.remove(indices);
             });
 
+            // Subtle hint so users discover inline editing
+            Label envHint = new Label(envPanel, SWT.NONE);
+            envHint.setText("Tip: double-click a cell to edit. Press Enter to save, Esc to cancel.");
+            envHint.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+
             return area;
+        }
+
+        private void commitInlineEdit(Table table, org.eclipse.swt.custom.TableEditor cellEditor,
+                                       TableItem item, int col, Text editor) {
+            if (editor.isDisposed()) return;
+            String newText = editor.getText();
+            if (!item.isDisposed()) {
+                item.setText(col, newText);
+                // If KEY column is now empty, drop the row to avoid orphan entries
+                if (col == 0 && newText.trim().isEmpty()) {
+                    int idx = table.indexOf(item);
+                    if (idx >= 0) table.remove(idx);
+                }
+            }
+            editor.dispose();
         }
 
         @Override
