@@ -101,6 +101,12 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
         ));
 
         addField(new BooleanFieldEditor(
+            PreferenceConstants.SHOW_MESSAGE_TIMESTAMPS,
+            "Show timestamps on each message (HH:MM:SS + reply duration)",
+            getFieldEditorParent()
+        ));
+
+        addField(new BooleanFieldEditor(
             PreferenceConstants.USE_CLI_MODE,
             "Use Claude CLI (recommended; disable for direct API mode)",
             getFieldEditorParent()
