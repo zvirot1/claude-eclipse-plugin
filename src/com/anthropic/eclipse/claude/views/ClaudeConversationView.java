@@ -2810,7 +2810,19 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // This is a safety net: the asyncExec from onToolCallCompleted should have
             // already updated each widget, but input-delta asyncExec items may have
             // re-set the status to RUNNING. This sweep ensures everything is correct.
-            syncAllToolCallStatuses();
+            //
+            // CRITICAL: skip this during history replay. During replay, this method
+            // is fired N times (once per historical assistant block). Each call
+            // iterates over EVERY MessageComposite (also growing N) and calls
+            // setText on every tool-call StyledText — Win32 text layout is the
+            // dominant cost. That's O(N²) tool-call updates, and on the user's
+            // 388-bubble session it pinned the UI thread for MINUTES (thread
+            // dump caught it in ScriptGetLogicalWidths → calculateClientArea).
+            // Restored bubbles already have their final status set at construction
+            // time, so the safety-net sweep is unnecessary.
+            if (!replayingHistory) {
+                syncAllToolCallStatuses();
+            }
             scrollToBottom();
         });
     }
