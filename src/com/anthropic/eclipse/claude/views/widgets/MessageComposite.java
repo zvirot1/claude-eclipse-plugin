@@ -55,6 +55,15 @@ public class MessageComposite extends Composite {
     public MessageComposite(Composite parent, MessageBlock block) {
         super(parent, SWT.NONE);
         this.messageBlock = block;
+        // For historical bubbles (replayed from JSONL), the "finished" time
+        // IS the block's timestamp — by the time the entry was written to
+        // disk, the message was complete. Without this, finalizeContent
+        // would later stamp finishedAtMs = System.currentTimeMillis() and
+        // duration would read as "NOW − historicalUserTime" = many hours
+        // (the "357m" the user reported on restored bubbles).
+        if (block != null && block.isRestoredFromHistory()) {
+            this.finishedAtMs = block.getTimestamp();
+        }
         initColors();
         createUI();
     }
@@ -532,7 +541,14 @@ public class MessageComposite extends Composite {
     public void finalizeContent() {
         if (finalized) return; // Prevent double finalization
         finalized = true;
-        finishedAtMs = System.currentTimeMillis();
+        // Stamp completion time — but only if we don't already have a
+        // historical value from the restore-path (set in the constructor for
+        // blocks created via MessageBlock(Role, long)). Without this guard,
+        // duration on historical assistant bubbles read "357m" (now minus
+        // the original user-message wall-clock).
+        if (finishedAtMs == 0L) {
+            finishedAtMs = System.currentTimeMillis();
+        }
 
         // If streaming was disabled, the text widget may be empty or not exist.
         // Populate it from the MessageBlock's accumulated text.

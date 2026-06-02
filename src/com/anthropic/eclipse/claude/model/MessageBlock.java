@@ -29,6 +29,7 @@ public class MessageBlock {
     public MessageBlock(Role role) {
         this.role = role;
         this.timestamp = System.currentTimeMillis();
+        this.restoredFromHistory = false;
     }
 
     /**
@@ -40,12 +41,20 @@ public class MessageBlock {
     public MessageBlock(Role role, long timestamp) {
         this.role = role;
         this.timestamp = (timestamp > 0) ? timestamp : System.currentTimeMillis();
+        this.restoredFromHistory = true;
     }
 
     private volatile boolean complete = false;
+    /** True for blocks created via the (Role, long) constructor — i.e.
+     *  replayed from a JSONL session file rather than received live. The
+     *  view uses this flag so it doesn't stamp finishedAtMs with the current
+     *  wall-clock on restore (which made historical "23s" durations show up
+     *  as "357m" — the gap from the original user message to "now"). */
+    private final boolean restoredFromHistory;
 
     public Role getRole() { return role; }
     public long getTimestamp() { return timestamp; }
+    public boolean isRestoredFromHistory() { return restoredFromHistory; }
     public List<ContentSegment> getSegments() { return segments; }
     public boolean isComplete() { return complete; }
     public void setComplete(boolean complete) { this.complete = complete; }
