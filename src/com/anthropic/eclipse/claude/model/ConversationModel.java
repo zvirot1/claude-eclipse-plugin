@@ -290,14 +290,32 @@ public class ConversationModel implements ICliMessageListener {
         synchronized (messages) {
             messages.addAll(historicalBlocks);
         }
+        int idx = 0;
+        int failed = 0;
         for (MessageBlock block : historicalBlocks) {
-            if (block.getRole() == MessageBlock.Role.USER) {
-                fireUserMessageAdded(block);
-            } else if (block.getRole() == MessageBlock.Role.ASSISTANT) {
-                fireAssistantMessageStarted(block);
-                fireAssistantMessageCompleted(block);
+            try {
+                if (block.getRole() == MessageBlock.Role.USER) {
+                    fireUserMessageAdded(block);
+                } else if (block.getRole() == MessageBlock.Role.ASSISTANT) {
+                    fireAssistantMessageStarted(block);
+                    fireAssistantMessageCompleted(block);
+                }
+            } catch (Throwable t) {
+                // A single bad block must NOT block the rest of the replay.
+                // The previous behaviour left the view's replayingHistory +
+                // MessageComposite.SUPPRESS_PARENT_LAYOUT stuck at true,
+                // making every later bubble invisible — and crucially also
+                // making any new live user/assistant message invisible
+                // because relayoutParent's parent.layout was being skipped.
+                failed++;
+                Activator.logWarning("[loadHistory] block #" + idx + " (role="
+                        + block.getRole() + ") replay failed — skipping. "
+                        + t.getClass().getSimpleName() + ": " + t.getMessage());
             }
+            idx++;
         }
+        Activator.logDiag("[DIAG-PERF] loadHistory replayed=" + (historicalBlocks.size() - failed)
+                + " failed=" + failed + " total=" + historicalBlocks.size());
     }
 
     /**
