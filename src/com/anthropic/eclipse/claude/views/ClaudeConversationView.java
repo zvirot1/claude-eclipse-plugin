@@ -2634,17 +2634,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onToolCallInputDelta(MessageBlock block, MessageBlock.ToolCallSegment toolCall, String delta) {
-        // Tool input is streaming - update the tool call widget to show live input.
-        // Skip if the tool already completed (bg thread may have set COMPLETED/FAILED
-        // while these asyncExec items were queued — don't overwrite with stale RUNNING).
-        if (toolCall.getStatus() != MessageBlock.ToolStatus.RUNNING) return;
-        asyncExec(() -> {
-            if (toolCall.getStatus() != MessageBlock.ToolStatus.RUNNING) return;
-            MessageComposite widget = messageWidgetMap.get(block);
-            if (widget != null && !widget.isDisposed()) {
-                widget.updateToolCall(toolCall);
-            }
-        });
+        // Intentional no-op.
+        //
+        // Previously this called widget.updateToolCall(toolCall) on every
+        // input_json_delta event. The widget only renders the tool's STATUS
+        // (RUNNING/COMPLETED/FAILED) and OUTPUT — neither changes during
+        // input streaming. But the call triggered relayoutParent() which
+        // does a full-tree layout walk of every bubble in the conversation.
+        // Thread-dump from the corporate machine showed main thread spending
+        // 64% of CPU here, called ~50-100 times per second while Claude was
+        // building a long Write/MultiEdit input. Removing the call eliminates
+        // a huge UI-thread storm with no visible effect (the "Running..."
+        // status was already set by onToolCallStarted).
+        //
+        // The per-turn activity classification ("Building <tool>…" in the
+        // thinking indicator) is fed from onStreamEvent, NOT from this
+        // method, so the UX feedback during tool-input streaming is
+        // preserved.
     }
 
     @Override
