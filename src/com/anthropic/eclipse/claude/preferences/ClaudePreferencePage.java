@@ -107,6 +107,12 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
         ));
 
         addField(new BooleanFieldEditor(
+            PreferenceConstants.AUTO_REFRESH_WORKSPACE,
+            "Auto-refresh workspace after Claude file edits (narrow, background)",
+            getFieldEditorParent()
+        ));
+
+        addField(new BooleanFieldEditor(
             PreferenceConstants.USE_CLI_MODE,
             "Use Claude CLI (recommended; disable for direct API mode)",
             getFieldEditorParent()

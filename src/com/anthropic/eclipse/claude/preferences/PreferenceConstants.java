@@ -62,4 +62,14 @@ public class PreferenceConstants {
     // "14:30:45 · 23s"). Default true. Toggling the preference live-refreshes
     // every already-rendered bubble in open Claude tabs.
     public static final String SHOW_MESSAGE_TIMESTAMPS = "showMessageTimestamps";
+
+    // Auto-refresh workspace after Claude tool calls — when true, files that
+    // Claude wrote/edited via Write / Edit / MultiEdit are refreshed in the
+    // Eclipse workspace so they appear (or update) in Package Explorer with
+    // no manual F5. The refresh runs in a background WorkspaceJob and is
+    // narrowed to the specific paths touched — never a deep DEPTH_INFINITE
+    // sweep, because on corporate / IDZ-attached filesystems that scan locks
+    // the UI for minutes. Disable if the auto-refresh still misbehaves on a
+    // pathological filesystem; users can always press F5 manually.
+    public static final String AUTO_REFRESH_WORKSPACE = "autoRefreshWorkspace";
 }
