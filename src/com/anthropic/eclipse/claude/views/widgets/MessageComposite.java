@@ -649,9 +649,22 @@ public class MessageComposite extends Composite {
         }
     }
 
+    /**
+     * When set true (typically by ClaudeConversationView during history
+     * replay), {@link #relayoutParent()} skips the final {@code
+     * parent.layout(true, true)} hop. That hop walks every sibling bubble
+     * in the messageContainer — fine for one live message but O(N²) when
+     * the replay finalises 155 bubbles in a row. The view does a single
+     * full-tree layout at the end via finishHistoryReplay() so no
+     * correctness regression. Local-only contentArea + self layout still
+     * runs so each bubble's own content is sized correctly.
+     */
+    public static volatile boolean SUPPRESS_PARENT_LAYOUT = false;
+
     private void relayoutParent() {
         contentArea.layout(true, true);
         layout(true, true);
+        if (SUPPRESS_PARENT_LAYOUT) return;
         // Request parent to re-layout too (ScrolledComposite)
         Composite parent = getParent();
         if (parent != null && !parent.isDisposed()) {
