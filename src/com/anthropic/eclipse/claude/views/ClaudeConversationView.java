@@ -208,8 +208,19 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private static final int SCROLL_FOLLOW_TOLERANCE_PX = 100;
     private final Runnable scrollDebounceTick = () -> {
         if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
-        if (isNearBottom()) scrollToBottom();
+        // Skip the debounce-on-the-debounce: streaming-text caller already
+        // waited SCROLL_DEBOUNCE_MS to get here, so go straight to impl.
+        if (isNearBottom()) scrollToBottomImpl();
     };
+    /**
+     * Coalesce window for synchronous scrollToBottom callers. On the 396-
+     * bubble session that triggered this fix, ONE scrollToBottom call took
+     * 2904ms (computeSize on the full tree). Per turn, ~10 events all called
+     * scrollToBottom directly — 29s of UI freeze per send. With this window,
+     * 10 calls within 100ms collapse to ONE scrollToBottomImpl (~3s once).
+     */
+    private static final int SCROLL_COALESCE_MS = 100;
+    private final Runnable scrollToBottomCoalesced = this::scrollToBottomImpl;
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -4539,7 +4550,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             replayingHistory = false;
             MessageComposite.SUPPRESS_PARENT_LAYOUT = false;
             if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
-            scrollToBottom();
+            // Run the actual scroll synchronously here — we just finished the
+            // replay and want to land at the bottom immediately, not 100ms
+            // later. Skip the coalesce window.
+            scrollToBottomImpl();
         } catch (Throwable t) {
             Activator.logError("[finishHistoryReplay] scroll failed: " + t.getMessage(), t);
         } finally {
@@ -4551,7 +4565,29 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
     }
 
+    /**
+     * Public entry — coalesces synchronous callers. On a 396-bubble session
+     * one scrollToBottomImpl call costs ~2.9s (computeSize walks the full
+     * tree). Before this coalesce, a single send triggered 10+ scrollToBottom
+     * calls (user-message-added, assistant-message-started, first text-delta,
+     * tool-call-added, tool-result, message-completed, …) — 29+ seconds of UI
+     * freeze per send. timerExec with the same Runnable replaces any prior
+     * pending fire, so 10 callers within SCROLL_COALESCE_MS collapse to 1
+     * actual run.
+     */
     private void scrollToBottom() {
+        if (replayingHistory) return;
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        Display.getDefault().timerExec(SCROLL_COALESCE_MS, scrollToBottomCoalesced);
+    }
+
+    /**
+     * Actual scroll work. Called from {@link #scrollToBottom()} via timerExec
+     * after coalesce window, OR directly from {@link #scrollDebounceTick}
+     * (which has already waited SCROLL_DEBOUNCE_MS), OR from
+     * {@link #finishHistoryReplay()}.
+     */
+    private void scrollToBottomImpl() {
         // Replay path short-circuit: 155 saved messages used to trigger 155
         // full-tree layouts of a growing widget set (O(N²)) — minutes on the
         // corporate IDZ machine. During replay, finishHistoryReplay() runs
