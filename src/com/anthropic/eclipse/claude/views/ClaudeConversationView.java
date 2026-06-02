@@ -2166,9 +2166,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     }
                     // Mark replay in progress — scrollToBottom() short-circuits
                     // and the per-bubble debounced scroll is suppressed too.
+                    // ALSO suppress MessageComposite.relayoutParent's parent
+                    // layout hop, which was previously the dominant O(N²)
+                    // cost (each finalizeContent walked all sibling bubbles).
                     // finishHistoryReplay() runs after the last bubble lands
                     // and does exactly one full layout + scroll.
                     replayingHistory = true;
+                    MessageComposite.SUPPRESS_PARENT_LAYOUT = true;
                 });
                 // loadHistory fires events → listeners do asyncExec → queued after the clear above
                 modelRef.loadHistory(history);
@@ -4512,6 +4516,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      */
     private void finishHistoryReplay() {
         replayingHistory = false;
+        MessageComposite.SUPPRESS_PARENT_LAYOUT = false;
         if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
         long t0 = System.currentTimeMillis();
         try {
