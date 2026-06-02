@@ -190,6 +190,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      *  UI thread for minutes on networked z/OS-attached filesystems). */
     private final java.util.Set<String> touchedFilePathsThisTurn =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    /** Set true while loadHistory() is replaying restored messages into the
+     *  UI. scrollToBottom() short-circuits while this is true so we do
+     *  exactly one full-tree layout + scroll at the END of the replay,
+     *  not one per restored bubble (which was O(N²) on the corporate
+     *  IDZ machine and turned a 155-message restore into 8 minutes). */
+    private volatile boolean replayingHistory = false;
     // Debounced + follow-mode scroll used by onStreamingTextAppended.
     // The previous behaviour ran scrollToBottom() — a full message-container
     // layout + 2 nested asyncExecs walking every MessageComposite — for every
@@ -2158,9 +2164,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                             }
                         }
                     }
+                    // Mark replay in progress — scrollToBottom() short-circuits
+                    // and the per-bubble debounced scroll is suppressed too.
+                    // finishHistoryReplay() runs after the last bubble lands
+                    // and does exactly one full layout + scroll.
+                    replayingHistory = true;
                 });
                 // loadHistory fires events → listeners do asyncExec → queued after the clear above
                 modelRef.loadHistory(history);
+                // Final tail asyncExec — runs after every per-block listener
+                // asyncExec the replay queued, since SWT processes runnables FIFO.
+                Display.getDefault().asyncExec(this::finishHistoryReplay);
             }
         }, "Claude-History-Loader").start();
     }
@@ -2330,6 +2344,19 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     // doesn't silently drop every assistant message.
                     if (type == null && role != null) type = role;
 
+                    // Original wall-clock when the CLI wrote this entry — used
+                    // by the MessageBlock(Role,long) ctor so the per-bubble
+                    // timestamp shows when the message was actually sent /
+                    // received, not when Eclipse replayed it. ISO-8601 like
+                    // "2026-05-17T08:41:38.252Z".
+                    long entryTimestamp = 0L;
+                    String tsStr = JsonParser.getString(obj, "timestamp");
+                    if (tsStr != null) {
+                        try {
+                            entryTimestamp = java.time.Instant.parse(tsStr).toEpochMilli();
+                        } catch (Exception ignored) {}
+                    }
+
                     if ("user".equals(type) && "user".equals(role)) {
                         // User turn: skip tool_result arrays, keep plain text
                         Object content = msg.get("content");
@@ -2365,7 +2392,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                         // the user's bubble.
                         text = stripPrependedFileBlocks(text);
                         if (text != null && !text.trim().isEmpty()) {
-                            MessageBlock block = new MessageBlock(MessageBlock.Role.USER);
+                            MessageBlock block = new MessageBlock(MessageBlock.Role.USER, entryTimestamp);
                             MessageBlock.TextSegment seg = new MessageBlock.TextSegment();
                             seg.appendText(text);
                             block.addSegment(seg);
@@ -2381,7 +2408,7 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                         if (!(content instanceof List)) continue;
                         List<Object> contentList = (List<Object>) content;
 
-                        MessageBlock block = new MessageBlock(MessageBlock.Role.ASSISTANT);
+                        MessageBlock block = new MessageBlock(MessageBlock.Role.ASSISTANT, entryTimestamp);
                         for (Object item : contentList) {
                             if (!(item instanceof Map)) continue;
                             Map<String, Object> itemMap = (Map<String, Object>) item;
@@ -4435,6 +4462,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      */
     private void scheduleScrollToBottomIfFollowing() {
         if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        // While replaying a saved session, suppress per-bubble scrolls so we
+        // don't pay an O(N²) layout cost. The replay path does ONE final
+        // scroll-to-bottom at the end via finishHistoryReplay().
+        if (replayingHistory) return;
         // Display.timerExec with the same Runnable replaces any prior schedule,
         // so the debounce is automatic.
         Display.getDefault().timerExec(SCROLL_DEBOUNCE_MS, scrollDebounceTick);
@@ -4458,7 +4489,32 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         }
     }
 
+    /**
+     * Called once at the end of a history replay (after the last restored
+     * bubble's asyncExec has run). Clears the {@link #replayingHistory}
+     * flag, then runs a single full-tree layout + scrollToBottom so the
+     * user lands at the most recent message. Without this, each of the N
+     * restored bubbles would have caused its own full-tree layout — O(N²)
+     * on the IDZ machine, which turned a 155-message restore into 8 min.
+     */
+    private void finishHistoryReplay() {
+        replayingHistory = false;
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        long t0 = System.currentTimeMillis();
+        try {
+            scrollToBottom();
+        } finally {
+            Activator.logDiag("[DIAG-PERF] finishHistoryReplay layout+scroll elapsed="
+                    + (System.currentTimeMillis() - t0) + "ms");
+        }
+    }
+
     private void scrollToBottom() {
+        // Replay path short-circuit: 155 saved messages used to trigger 155
+        // full-tree layouts of a growing widget set (O(N²)) — minutes on the
+        // corporate IDZ machine. During replay, finishHistoryReplay() runs
+        // exactly one scrollToBottom() at the very end.
+        if (replayingHistory) return;
         messageContainer.layout(true, true);
         int cw = scrolledMessages.getClientArea().width;
         scrolledMessages.setMinSize(messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT));
