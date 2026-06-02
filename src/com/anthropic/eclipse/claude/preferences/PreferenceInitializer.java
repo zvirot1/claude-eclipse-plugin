@@ -60,5 +60,12 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
         // the user bubble and "HH:MM:SS · Ns" (or " · Nm Ss") for the
         // assistant bubble, showing how long the reply took.
         store.setDefault(PreferenceConstants.SHOW_MESSAGE_TIMESTAMPS, true);
+
+        // Auto-refresh workspace after Claude file tools — ON by default.
+        // The previous behaviour was a synchronous DEPTH_INFINITE refresh on
+        // the UI thread which froze Eclipse for minutes on corporate / z-OS
+        // / IDZ-attached filesystems. The new behaviour refreshes only the
+        // specific files Claude touched, in a background WorkspaceJob.
+        store.setDefault(PreferenceConstants.AUTO_REFRESH_WORKSPACE, true);
     }
 }
