@@ -221,6 +221,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      */
     private static final int SCROLL_COALESCE_MS = 100;
     private final Runnable scrollToBottomCoalesced = this::scrollToBottomImpl;
+    // Cache used by scrollToBottomImpl to decide whether to pass changed=true
+    // (full re-layout, ~3000ms on 396-bubble sessions) or changed=false (use
+    // SWT cached preferred-sizes, ~50ms). Updated at the end of every
+    // scrollToBottomImpl run. See scrollToBottomImpl for the rationale.
+    private volatile int cachedChildrenCount = -1;
+    private volatile Object cachedLastBubbleIdentity = null;
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -4596,33 +4602,50 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (messageContainer == null || messageContainer.isDisposed()) return;
         if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
         long t0 = System.currentTimeMillis();
-        // CRITICAL perf fix for long sessions:
-        // The previous version passed changed=true to layout(...) and
-        // computeSize(...). With changed=true SWT discards the cached
-        // preferred-size of EVERY descendant and re-walks the entire tree —
-        // on a 396-bubble session that was ~3000ms per call (corporate IDZ,
-        // confirmed in LLRRR.LOG). The vast majority of bubbles haven't
-        // changed since the last layout; their cached preferred-size is
-        // still correct.
+        // SWT layout-cache strategy. Determines whether SWT can use cached
+        // preferred-sizes ('changed=false', cheap) or must re-walk the
+        // entire descendant tree ('changed=true', expensive).
         //
-        // With changed=false SWT uses cached preferred-sizes for any child
-        // that is NOT marked dirty. SWT itself marks a widget dirty when
-        // its content/text/font changed, so a newly-added bubble or a
-        // streaming-text bubble whose StyledText just grew DOES get a
-        // fresh computeSize, while the 395 unchanged bubbles are skipped.
-        // Net effect: typical scroll drops from ~3000ms to ~50ms on this
-        // user's saved session.
-        messageContainer.layout(false, true);
+        // Heuristic: pass changed=true ONLY when a structural change is
+        // detected — a new bubble was added, the last bubble was replaced,
+        // or this is the first scroll after the view came up. Otherwise
+        // (streaming text into the existing last bubble, or no content
+        // change at all) pass changed=false.
+        //
+        // Why this matters: with changed=true on every call, scrollToBottom
+        // costs ~3000ms on the user's 396-bubble session (LLRRR.LOG) —
+        // SWT discards cached preferred-size of EVERY descendant and
+        // re-walks. With changed=false on a no-structural-change scroll,
+        // SWT uses cached sizes for unchanged children → drops to ~50ms.
+        //
+        // Safety: we MUST pass true when a new bubble is added — otherwise
+        // SWT may render the new child at size 0 (it has no cached size and
+        // changed=false might skip computing one). That would manifest as
+        // 'I send a message but the bubble doesn't appear' — exactly the
+        // symptom reported by the user. The structural-change detection
+        // below guarantees correctness in that case.
+        Control[] kids = messageContainer.getChildren();
+        int currentCount = kids.length;
+        Object currentLastIdentity = currentCount > 0 ? kids[currentCount - 1] : null;
+        boolean structuralChange =
+                (currentCount != cachedChildrenCount)
+                || (currentLastIdentity != cachedLastBubbleIdentity);
+
+        messageContainer.layout(structuralChange, true);
         int cw = scrolledMessages.getClientArea().width;
         org.eclipse.swt.graphics.Point sz =
-                messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT, false);
+                messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT, structuralChange);
         scrolledMessages.setMinSize(sz);
         // Lay out the scroll pane itself (single widget — O(1), not O(N)
         // like messageContainer). Without this, the ScrolledComposite's
         // scrollbar range was updated but the new child content wasn't
         // always visible — that's the regression where users reported
         // "I sent a message but I don't see it".
-        scrolledMessages.layout(false, true);
+        scrolledMessages.layout(structuralChange, true);
+
+        // Update cache for next call.
+        cachedChildrenCount = currentCount;
+        cachedLastBubbleIdentity = currentLastIdentity;
         final int targetY = sz.y;
         // Defer just the scroll origin + focus restore — no layout work here.
         Display.getDefault().asyncExec(() -> {
