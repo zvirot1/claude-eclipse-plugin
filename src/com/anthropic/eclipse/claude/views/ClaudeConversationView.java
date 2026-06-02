@@ -2531,7 +2531,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             MessageComposite widget = new MessageComposite(messageContainer, block);
             widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
-            scrollToBottom();
+            // Defer the scroll to the NEXT event-loop tick so the widget
+            // paints first and the user sees their bubble immediately.
+            // Putting scrollToBottom in the same runnable as widget creation
+            // delayed visible appearance until after a full-tree layout
+            // (hundreds of ms on long histories) — users reported "I sent
+            // a message and it took time to even see it".
+            Display.getDefault().asyncExec(this::scrollToBottom);
         });
     }
 
@@ -4515,43 +4521,40 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // corporate IDZ machine. During replay, finishHistoryReplay() runs
         // exactly one scrollToBottom() at the very end.
         if (replayingHistory) return;
+        if (messageContainer == null || messageContainer.isDisposed()) return;
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        long t0 = System.currentTimeMillis();
+        // Single layout + computeSize pass. The previous "double asyncExec"
+        // pattern fired FOUR full-tree layouts per call (layout + computeSize
+        // outer, layout + computeSize inner); thread dump from the corporate
+        // IDZ machine showed main thread spending 86% of elapsed time inside
+        // Label.computeSize → SWT SendMessage native, called from this very
+        // method. The extra passes were originally meant to let SWT "settle"
+        // the layout before setting scroll origin, but a single async
+        // setOrigin (no extra layout/computeSize) achieves the same effect
+        // for ~25% of the cost.
         messageContainer.layout(true, true);
         int cw = scrolledMessages.getClientArea().width;
-        scrolledMessages.setMinSize(messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT));
-        scrolledMessages.layout(true, true);
-
-        // Double asyncExec: first pass allows SWT to finish layout painting,
-        // second pass sets the origin after the new size is fully reflected.
+        org.eclipse.swt.graphics.Point sz =
+                messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT);
+        scrolledMessages.setMinSize(sz);
+        final int targetY = sz.y;
+        // Defer just the scroll origin + focus restore — no layout work here.
         Display.getDefault().asyncExec(() -> {
             if (scrolledMessages.isDisposed()) return;
-            messageContainer.layout(true, true);
-            int cw2 = scrolledMessages.getClientArea().width;
-            scrolledMessages.setMinSize(messageContainer.computeSize(cw2 > 0 ? cw2 : SWT.DEFAULT, SWT.DEFAULT));
-            Display.getDefault().asyncExec(() -> {
-                if (!scrolledMessages.isDisposed()) {
-                    scrolledMessages.setOrigin(0, messageContainer.getSize().y);
+            scrolledMessages.setOrigin(0, targetY);
+            if (inputField != null && !inputField.isDisposed()) {
+                inputField.setFocus();
+                if (pendingRestoreHkl != 0 && SWT.getPlatform().equals("win32")) {
+                    final long hkl = pendingRestoreHkl;
+                    try {
+                        org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(hkl, 0);
+                    } catch (Throwable ignored) {}
                 }
-                // Restore focus to input field after all layout operations.
-                if (inputField != null && !inputField.isDisposed()) {
-                    inputField.setFocus();
-                    // Restore keyboard layout (Hebrew/Arabic) after setFocus.
-                    // On Windows, layout/focus cycling resets the keyboard to English.
-                    if (pendingRestoreHkl != 0 && SWT.getPlatform().equals("win32")) {
-                        final long hkl = pendingRestoreHkl;
-                        try {
-                            org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(hkl, 0);
-                        } catch (Throwable ignored) {}
-                        // Also schedule another restore in case Windows processes
-                        // further messages that reset it after this point.
-                        Display.getDefault().asyncExec(() -> {
-                            try {
-                                org.eclipse.swt.internal.win32.OS.ActivateKeyboardLayout(hkl, 0);
-                            } catch (Throwable ignored) {}
-                        });
-                    }
-                }
-            });
+            }
         });
+        Activator.logDiag("[DIAG-PERF] scrollToBottom elapsed="
+                + (System.currentTimeMillis() - t0) + "ms contentHeight=" + sz.y);
     }
 
     /**
