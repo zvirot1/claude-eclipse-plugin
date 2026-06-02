@@ -104,12 +104,31 @@ public class CodeBlockComposite extends Composite {
         codeText.setCaret(null);
         codeText.setWordWrap(false);
 
-        // Apply syntax highlighting
+        // Apply syntax highlighting.
+        // setStyleRanges() throws IllegalArgumentException ("Argument not
+        // valid") when ANY range is malformed — overlapping with the prior
+        // range, negative offset/length, or extending past the end of the
+        // text. SyntaxHighlighter has been observed producing such ranges on
+        // edge-case CLI output, and the resulting exception was bubbling out
+        // of finalizeContent — killing the asyncExec mid-render so the
+        // assistant bubble never visually appeared. This was a major
+        // contributor to the "I send a message and don't see the reply"
+        // symptom reported by corporate users. Sanitize the ranges and wrap
+        // the call so a single bad highlight only loses the syntax color, not
+        // the entire bubble.
         if (code != null && !code.isEmpty() && language != null && !language.isEmpty()) {
-            org.eclipse.swt.custom.StyleRange[] styles =
-                SyntaxHighlighter.highlight(code, language, ThemeManager.getInstance(), codeText);
-            if (styles.length > 0) {
-                codeText.setStyleRanges(styles);
+            try {
+                org.eclipse.swt.custom.StyleRange[] styles =
+                    SyntaxHighlighter.highlight(code, language, ThemeManager.getInstance(), codeText);
+                org.eclipse.swt.custom.StyleRange[] safe = sanitizeStyleRanges(styles, code.length());
+                if (safe != null && safe.length > 0) {
+                    codeText.setStyleRanges(safe);
+                }
+            } catch (Throwable t) {
+                // Never let a syntax-highlight bug take down the bubble.
+                com.anthropic.eclipse.claude.Activator.logWarning(
+                        "[CodeBlockComposite] setStyleRanges failed for lang=" + language
+                                + " codeLen=" + code.length() + " — rendering without highlights. " + t);
             }
         }
 
@@ -127,6 +146,53 @@ public class CodeBlockComposite extends Composite {
             langColor.dispose();
             monoFont.dispose();
         });
+    }
+
+    /**
+     * Filter/repair a StyleRange[] so SWT's
+     * {@code StyledText.setStyleRanges} cannot throw
+     * IllegalArgumentException ("Argument not valid"). SWT requires:
+     * <ul>
+     *   <li>start &gt;= 0 and start &lt; textLength</li>
+     *   <li>start + length &lt;= textLength (length is clamped if it would
+     *       extend past the end)</li>
+     *   <li>ranges must be sorted by start AND must not overlap — the next
+     *       range's start must be &gt;= prev.start + prev.length</li>
+     * </ul>
+     * SyntaxHighlighter has been observed producing overlapping ranges on
+     * edge-case code blocks (e.g. nested string literals in the language
+     * grammar), and the resulting setStyleRanges throw killed the entire
+     * bubble's render — leaving "no message visible" for the user. This
+     * helper makes a best-effort repair: clamp lengths, drop overlaps.
+     */
+    private static org.eclipse.swt.custom.StyleRange[] sanitizeStyleRanges(
+            org.eclipse.swt.custom.StyleRange[] input, int textLength) {
+        if (input == null || input.length == 0 || textLength <= 0) return input;
+        java.util.List<org.eclipse.swt.custom.StyleRange> out =
+                new java.util.ArrayList<>(input.length);
+        int lastEnd = 0;
+        for (org.eclipse.swt.custom.StyleRange r : input) {
+            if (r == null) continue;
+            int start = r.start;
+            int length = r.length;
+            // Drop ranges that are entirely out of bounds.
+            if (start < 0 || length <= 0 || start >= textLength) continue;
+            // Clamp lengths that extend past the end of the text.
+            if (start + length > textLength) length = textLength - start;
+            // Drop overlap with previous range — bump start forward.
+            if (start < lastEnd) {
+                int shift = lastEnd - start;
+                start = lastEnd;
+                length -= shift;
+                if (length <= 0) continue;
+            }
+            org.eclipse.swt.custom.StyleRange copy = (org.eclipse.swt.custom.StyleRange) r.clone();
+            copy.start = start;
+            copy.length = length;
+            out.add(copy);
+            lastEnd = start + length;
+        }
+        return out.toArray(new org.eclipse.swt.custom.StyleRange[0]);
     }
 
     /**
