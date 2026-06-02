@@ -2531,13 +2531,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             MessageComposite widget = new MessageComposite(messageContainer, block);
             widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
-            // Defer the scroll to the NEXT event-loop tick so the widget
-            // paints first and the user sees their bubble immediately.
-            // Putting scrollToBottom in the same runnable as widget creation
-            // delayed visible appearance until after a full-tree layout
-            // (hundreds of ms on long histories) — users reported "I sent
-            // a message and it took time to even see it".
-            Display.getDefault().asyncExec(this::scrollToBottom);
+            // Synchronous scroll — calling layout in this same asyncExec
+            // means the new bubble is laid out and visible before the
+            // runnable returns. The earlier "defer to next tick" attempt
+            // raced against a flood of onStreamEvent → updateThinkingLabel
+            // asyncExecs and left bubbles invisible. scrollToBottom itself
+            // is already only 1 layout pass (was 4) so the immediate call
+            // is fast enough.
+            scrollToBottom();
         });
     }
 
@@ -4544,6 +4545,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         org.eclipse.swt.graphics.Point sz =
                 messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT);
         scrolledMessages.setMinSize(sz);
+        // Lay out the scroll pane itself (single widget — O(1), not O(N)
+        // like messageContainer). Without this, the ScrolledComposite's
+        // scrollbar range was updated but the new child content wasn't
+        // always visible — that's the regression where users reported
+        // "I sent a message but I don't see it".
+        scrolledMessages.layout(true, true);
         final int targetY = sz.y;
         // Defer just the scroll origin + focus restore — no layout work here.
         Display.getDefault().asyncExec(() -> {
