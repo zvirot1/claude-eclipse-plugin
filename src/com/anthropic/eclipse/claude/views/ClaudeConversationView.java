@@ -221,12 +221,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      */
     private static final int SCROLL_COALESCE_MS = 100;
     private final Runnable scrollToBottomCoalesced = this::scrollToBottomImpl;
-    // Cache used by scrollToBottomImpl to decide whether to pass changed=true
-    // (full re-layout, ~3000ms on 396-bubble sessions) or changed=false (use
-    // SWT cached preferred-sizes, ~50ms). Updated at the end of every
+    // Cache used by scrollToBottomImpl. Updated at the end of every
     // scrollToBottomImpl run. See scrollToBottomImpl for the rationale.
     private volatile int cachedChildrenCount = -1;
     private volatile Object cachedLastBubbleIdentity = null;
+    private volatile int cachedContentHeight = 0;
+    private volatile int cachedLastBubbleHeight = 0;
     private AttachmentManager attachmentManager;
 
     // Cached Colors (avoid SWT resource leak)
@@ -4602,50 +4602,86 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (messageContainer == null || messageContainer.isDisposed()) return;
         if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
         long t0 = System.currentTimeMillis();
-        // SWT layout-cache strategy. Determines whether SWT can use cached
-        // preferred-sizes ('changed=false', cheap) or must re-walk the
-        // entire descendant tree ('changed=true', expensive).
+        // Three-mode layout strategy. The naive approach (always pass
+        // changed=true) costs ~3000ms per scroll on this user's 396-bubble
+        // session because SWT re-walks every descendant. The previous fix
+        // (changed=false on cache hit) was fast but broke streaming: the
+        // last bubble's StyledText grew, but computeSize returned the
+        // CACHED messageContainer size — so setMinSize used the stale
+        // height, setOrigin clamped to it, and the new streaming text was
+        // below the viewport (invisible). User reported "Streaming…" in
+        // the status bar but no visible response in the chat.
         //
-        // Heuristic: pass changed=true ONLY when a structural change is
-        // detected — a new bubble was added, the last bubble was replaced,
-        // or this is the first scroll after the view came up. Otherwise
-        // (streaming text into the existing last bubble, or no content
-        // change at all) pass changed=false.
-        //
-        // Why this matters: with changed=true on every call, scrollToBottom
-        // costs ~3000ms on the user's 396-bubble session (LLRRR.LOG) —
-        // SWT discards cached preferred-size of EVERY descendant and
-        // re-walks. With changed=false on a no-structural-change scroll,
-        // SWT uses cached sizes for unchanged children → drops to ~50ms.
-        //
-        // Safety: we MUST pass true when a new bubble is added — otherwise
-        // SWT may render the new child at size 0 (it has no cached size and
-        // changed=false might skip computing one). That would manifest as
-        // 'I send a message but the bubble doesn't appear' — exactly the
-        // symptom reported by the user. The structural-change detection
-        // below guarantees correctness in that case.
+        // New strategy:
+        //   • Structural change (new bubble, last bubble replaced, first
+        //     call): full re-layout. Expensive but rare — once per turn.
+        //   • Incremental (no structural change, e.g. streaming text):
+        //     recompute ONLY the last bubble's preferred size. That's ONE
+        //     widget tree (~5-20ms), not 400. Add the delta to the cached
+        //     content height. setMinSize uses the up-to-date height, so
+        //     setOrigin scrolls to the actual bottom — the streaming
+        //     content is visible.
         Control[] kids = messageContainer.getChildren();
         int currentCount = kids.length;
         Object currentLastIdentity = currentCount > 0 ? kids[currentCount - 1] : null;
         boolean structuralChange =
                 (currentCount != cachedChildrenCount)
-                || (currentLastIdentity != cachedLastBubbleIdentity);
+                || (currentLastIdentity != cachedLastBubbleIdentity)
+                || cachedContentHeight <= 0;
 
-        messageContainer.layout(structuralChange, true);
         int cw = scrolledMessages.getClientArea().width;
-        org.eclipse.swt.graphics.Point sz =
-                messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT, structuralChange);
-        scrolledMessages.setMinSize(sz);
-        // Lay out the scroll pane itself (single widget — O(1), not O(N)
-        // like messageContainer). Without this, the ScrolledComposite's
-        // scrollbar range was updated but the new child content wasn't
-        // always visible — that's the regression where users reported
-        // "I sent a message but I don't see it".
-        scrolledMessages.layout(structuralChange, true);
+        int widthHint = cw > 0 ? cw : SWT.DEFAULT;
+        int contentHeight;
+        int lastBubbleHeight;
+
+        if (structuralChange) {
+            // Full layout: discards SWT's cached preferred-sizes, re-walks
+            // the entire tree. ~3000ms on 396 bubbles. Necessary when a
+            // new bubble was added or the structure changed in any way.
+            messageContainer.layout(true, true);
+            org.eclipse.swt.graphics.Point sz =
+                    messageContainer.computeSize(widthHint, SWT.DEFAULT, true);
+            scrolledMessages.setMinSize(sz);
+            scrolledMessages.layout(true, true);
+            contentHeight = sz.y;
+            if (currentLastIdentity instanceof Control && !((Control) currentLastIdentity).isDisposed()) {
+                lastBubbleHeight = ((Control) currentLastIdentity).computeSize(widthHint, SWT.DEFAULT, false).y;
+            } else {
+                lastBubbleHeight = 0;
+            }
+        } else {
+            // Incremental: only the last bubble could have changed (e.g.
+            // streaming text appended). Recompute JUST that bubble's
+            // preferred size and update the cache. SKIPS the O(N) walk
+            // over the other 395 unchanged bubbles.
+            int newLastBubbleHeight = lastBubbleHeight = cachedLastBubbleHeight;
+            if (currentLastIdentity instanceof Control && !((Control) currentLastIdentity).isDisposed()) {
+                Control lastBubble = (Control) currentLastIdentity;
+                if (lastBubble instanceof Composite) {
+                    // Force just this bubble to re-layout so its own children
+                    // (StyledText etc.) re-position around the new text.
+                    ((Composite) lastBubble).layout(true, true);
+                }
+                newLastBubbleHeight = lastBubble.computeSize(widthHint, SWT.DEFAULT, true).y;
+            }
+            int delta = newLastBubbleHeight - cachedLastBubbleHeight;
+            contentHeight = cachedContentHeight + delta;
+            lastBubbleHeight = newLastBubbleHeight;
+            // setMinSize with the updated height — scrollbar range reflects
+            // the growing content; setOrigin can reach the new bottom.
+            scrolledMessages.setMinSize(widthHint, contentHeight);
+            // Do NOT call messageContainer.layout(...) on this path — the
+            // last bubble layout was just done above; siblings are untouched.
+            scrolledMessages.layout(false, false);
+        }
 
         // Update cache for next call.
         cachedChildrenCount = currentCount;
         cachedLastBubbleIdentity = currentLastIdentity;
+        cachedContentHeight = contentHeight;
+        cachedLastBubbleHeight = lastBubbleHeight;
+        org.eclipse.swt.graphics.Point sz =
+                new org.eclipse.swt.graphics.Point(widthHint > 0 ? widthHint : 0, contentHeight);
         final int targetY = sz.y;
         // Defer just the scroll origin + focus restore — no layout work here.
         Display.getDefault().asyncExec(() -> {
@@ -4662,7 +4698,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             }
         });
         Activator.logDiag("[DIAG-PERF] scrollToBottom elapsed="
-                + (System.currentTimeMillis() - t0) + "ms contentHeight=" + sz.y);
+                + (System.currentTimeMillis() - t0) + "ms contentHeight=" + sz.y
+                + " path=" + (structuralChange ? "FULL" : "INCR"));
     }
 
     /**
