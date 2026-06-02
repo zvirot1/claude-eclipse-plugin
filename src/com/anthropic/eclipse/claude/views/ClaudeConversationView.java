@@ -183,6 +183,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     private volatile long   cachedActiveFileMtime;
     private volatile String cachedActiveFileContent;
     private org.eclipse.jface.util.IPropertyChangeListener timestampPrefListener;
+    /** Files Claude wrote/edited via Write/Edit/MultiEdit during the current
+     *  user turn. Cleared on every new user message; consumed at end-of-turn
+     *  by a background WorkspaceJob that refreshes only these specific paths
+     *  rather than the entire workspace (the wide refresh used to lock the
+     *  UI thread for minutes on networked z/OS-attached filesystems). */
+    private final java.util.Set<String> touchedFilePathsThisTurn =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
     // Debounced + follow-mode scroll used by onStreamingTextAppended.
     // The previous behaviour ran scrollToBottom() — a full message-container
     // layout + 2 nested asyncExecs walking every MessageComposite — for every
@@ -2487,6 +2494,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onUserMessageAdded(MessageBlock block) {
+        // New user turn starts — wipe the per-turn touched-file set so the
+        // refresh job at end-of-turn doesn't carry over paths from previous
+        // turns.
+        touchedFilePathsThisTurn.clear();
         asyncExec(() -> {
             // Hide welcome message on first real interaction
             dismissWelcomeMessage();
@@ -2629,9 +2640,18 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             updateToolCallWidget(toolCall, completedStatus, completedOutput, 0);
             showThinkingIndicator();
             costBar.setStatus("Processing...");
-            if ("Edit".equals(toolCall.getToolName()) || "Write".equals(toolCall.getToolName())) {
+            String tn = toolCall.getToolName();
+            if ("Edit".equals(tn) || "Write".equals(tn) || "MultiEdit".equals(tn)) {
                 handleEditToolCompleted(toolCall);
-                refreshWorkspace();
+                // Narrow background refresh — only the file that was edited.
+                // The previous wide refreshWorkspace() walked the entire
+                // workspace on the UI thread; on corporate / z-OS-attached
+                // filesystems that froze Eclipse for minutes.
+                String path = extractFilePath(toolCall.getInput());
+                if (path != null) {
+                    touchedFilePathsThisTurn.add(path);
+                    refreshSingleFileAsync(path);
+                }
             }
             scrollToBottom();
         });
@@ -2751,8 +2771,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // Save session state
             saveCurrentSession();
 
-            // Refresh workspace to show any files created/modified during this turn
-            refreshWorkspace();
+            // Per-tool refreshes (in onToolCallCompleted) already covered each
+            // Edit/Write/MultiEdit. Here we just kick a narrow background
+            // refresh for the full set in case anything was missed; we no
+            // longer do a DEPTH_INFINITE workspace sweep, which on networked
+            // / z-OS-attached filesystems used to freeze the UI for minutes.
+            if (!touchedFilePathsThisTurn.isEmpty()) {
+                refreshWorkspaceAsync(touchedFilePathsThisTurn);
+            }
         });
     }
 
@@ -3015,7 +3041,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         revertBtn.setToolTipText("Restore the file to its pre-edit state");
         revertBtn.addListener(SWT.Selection, e -> {
             Activator.getDefault().getCheckpointManager().revert(filePath);
-            refreshWorkspace();
+            // Narrow async refresh \u2014 only the reverted file, off the UI thread.
+            refreshSingleFileAsync(filePath);
             revertBtn.setEnabled(false);
             revertBtn.setText("\u21A9 Reverted");
             info.setText("\u21A9 Reverted: " + fileName);
@@ -4106,20 +4133,85 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * Refresh the Eclipse workspace so newly created/modified files appear
      * in the Package Explorer without manual refresh.
      */
-    private void refreshWorkspace() {
+    /**
+     * Background, narrow workspace refresh.
+     *
+     * <p>Refreshes only the file paths Claude actually touched this turn (via
+     * Write / Edit / MultiEdit tools). Runs as an Eclipse {@code WorkspaceJob}
+     * — i.e. NOT on the SWT UI thread — so a slow filesystem (corporate
+     * z/OS-attached drives via IDZ are the well-known case) can never freeze
+     * the Claude chat view again.
+     *
+     * <p>Two thread-dumps showed this method's predecessor (a synchronous
+     * DEPTH_INFINITE refresh of every open project on the UI thread) burning
+     * minutes of CPU inside Win32 {@code FindFirstFileW} while Eclipse
+     * displayed a blank "Not Responding" window for tens of minutes.
+     *
+     * <p>Gated by {@link PreferenceConstants#AUTO_REFRESH_WORKSPACE} — set to
+     * false to disable the auto-refresh entirely (user can still F5 manually).
+     *
+     * @param osPaths absolute OS file paths (e.g. {@code C:\dev\foo\Bar.java});
+     *                may be empty or null — in which case the call is a no-op.
+     */
+    private void refreshWorkspaceAsync(java.util.Set<String> osPaths) {
+        if (osPaths == null || osPaths.isEmpty()) return;
         try {
-            IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
-            for (IProject project : projects) {
-                if (project.isOpen()) {
-                    project.refreshLocal(
-                        org.eclipse.core.resources.IResource.DEPTH_INFINITE,
-                        null  // no progress monitor
-                    );
-                }
+            if (!Activator.getDefault().getPreferenceStore()
+                    .getBoolean(PreferenceConstants.AUTO_REFRESH_WORKSPACE)) {
+                return;
             }
-        } catch (Exception e) {
-            Activator.logError("[ConversationView] Workspace refresh failed: " + e.getMessage(), e);
-        }
+        } catch (Throwable ignored) {}
+        final java.util.Set<String> snapshot = new java.util.HashSet<>(osPaths);
+        org.eclipse.core.resources.WorkspaceJob job =
+            new org.eclipse.core.resources.WorkspaceJob("Claude: refresh edited files") {
+                @Override
+                public org.eclipse.core.runtime.IStatus runInWorkspace(
+                        org.eclipse.core.runtime.IProgressMonitor monitor) {
+                    org.eclipse.core.resources.IWorkspaceRoot root =
+                            ResourcesPlugin.getWorkspace().getRoot();
+                    for (String osPath : snapshot) {
+                        if (osPath == null || osPath.isEmpty()) continue;
+                        try {
+                            org.eclipse.core.runtime.IPath p =
+                                    new org.eclipse.core.runtime.Path(osPath);
+                            // Try direct file refresh first (most common case).
+                            IFile f = root.getFileForLocation(p);
+                            if (f != null && f.exists()) {
+                                f.refreshLocal(
+                                        org.eclipse.core.resources.IResource.DEPTH_ZERO,
+                                        monitor);
+                                continue;
+                            }
+                            // Fall back to a one-level refresh of the parent
+                            // folder so that brand-new files (Write tool on a
+                            // non-existing path) are picked up.
+                            org.eclipse.core.resources.IContainer parent =
+                                    root.getContainerForLocation(p.removeLastSegments(1));
+                            if (parent != null && parent.exists()) {
+                                parent.refreshLocal(
+                                        org.eclipse.core.resources.IResource.DEPTH_ONE,
+                                        monitor);
+                            }
+                        } catch (Throwable inner) {
+                            // best-effort per-path — never let one bad path
+                            // doom the whole batch
+                            Activator.logDiag("[DIAG] refreshWorkspaceAsync path="
+                                    + osPath + " failed: " + inner.getMessage());
+                        }
+                    }
+                    return org.eclipse.core.runtime.Status.OK_STATUS;
+                }
+            };
+        job.setSystem(true);   // hide from Progress view
+        job.setUser(false);
+        job.setPriority(org.eclipse.core.runtime.jobs.Job.SHORT);
+        job.schedule();
+    }
+
+    /** Convenience wrapper for refreshing a single OS path. */
+    private void refreshSingleFileAsync(String osPath) {
+        if (osPath == null || osPath.isEmpty()) return;
+        refreshWorkspaceAsync(java.util.Collections.singleton(osPath));
     }
 
     private void showInfoMessage(String info) {
