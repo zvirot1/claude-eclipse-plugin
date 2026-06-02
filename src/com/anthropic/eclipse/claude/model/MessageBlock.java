@@ -31,6 +31,17 @@ public class MessageBlock {
         this.timestamp = System.currentTimeMillis();
     }
 
+    /**
+     * Constructor used when replaying historical messages from a JSONL session
+     * file — {@code timestamp} comes from the original CLI entry's
+     * {@code timestamp} field so the per-bubble label shows when the message
+     * was actually sent / received, not the moment Eclipse restored it.
+     */
+    public MessageBlock(Role role, long timestamp) {
+        this.role = role;
+        this.timestamp = (timestamp > 0) ? timestamp : System.currentTimeMillis();
+    }
+
     private volatile boolean complete = false;
 
     public Role getRole() { return role; }
