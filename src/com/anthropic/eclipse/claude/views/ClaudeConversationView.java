@@ -2174,11 +2174,23 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     replayingHistory = true;
                     MessageComposite.SUPPRESS_PARENT_LAYOUT = true;
                 });
-                // loadHistory fires events → listeners do asyncExec → queued after the clear above
-                modelRef.loadHistory(history);
-                // Final tail asyncExec — runs after every per-block listener
-                // asyncExec the replay queued, since SWT processes runnables FIFO.
-                Display.getDefault().asyncExec(this::finishHistoryReplay);
+                // Defensive try/finally: even if loadHistory itself throws
+                // (e.g., listener exception that the per-block catch missed),
+                // queue the cleanup so the flags reset and the conversation
+                // doesn't stay invisible for the rest of the Eclipse session.
+                try {
+                    modelRef.loadHistory(history);
+                } catch (Throwable t) {
+                    Activator.logError("[Resume] loadHistory crashed: "
+                            + t.getMessage(), t);
+                } finally {
+                    // Final tail asyncExec — runs after every per-block
+                    // asyncExec the replay queued, since SWT processes
+                    // runnables FIFO. finishHistoryReplay clears both flags
+                    // in its own try/finally so visibility is restored even
+                    // if the scroll-to-bottom step throws.
+                    Display.getDefault().asyncExec(this::finishHistoryReplay);
+                }
             }
         }, "Claude-History-Loader").start();
     }
@@ -4515,14 +4527,26 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      * on the IDZ machine, which turned a 155-message restore into 8 min.
      */
     private void finishHistoryReplay() {
-        replayingHistory = false;
-        MessageComposite.SUPPRESS_PARENT_LAYOUT = false;
-        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
         long t0 = System.currentTimeMillis();
+        // Clear flags FIRST inside a try/finally so they're guaranteed to
+        // reset even if the subsequent scrollToBottom throws. Without this,
+        // a single bad replay would leave replayingHistory + the static
+        // SUPPRESS_PARENT_LAYOUT stuck at true — making every later live
+        // bubble (user message AND assistant reply) invisible until Eclipse
+        // is restarted. That's exactly the symptom the user hit on one
+        // particular saved session.
         try {
+            replayingHistory = false;
+            MessageComposite.SUPPRESS_PARENT_LAYOUT = false;
+            if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
             scrollToBottom();
+        } catch (Throwable t) {
+            Activator.logError("[finishHistoryReplay] scroll failed: " + t.getMessage(), t);
         } finally {
-            Activator.logDiag("[DIAG-PERF] finishHistoryReplay layout+scroll elapsed="
+            // Belt-and-suspenders: in case something above re-set a flag.
+            replayingHistory = false;
+            MessageComposite.SUPPRESS_PARENT_LAYOUT = false;
+            Activator.logDiag("[DIAG-PERF] finishHistoryReplay elapsed="
                     + (System.currentTimeMillis() - t0) + "ms");
         }
     }
