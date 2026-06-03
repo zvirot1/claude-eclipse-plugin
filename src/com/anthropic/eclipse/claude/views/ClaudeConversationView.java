@@ -4677,24 +4677,19 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         if (structuralChange) {
             // Full layout: discards SWT's cached preferred-sizes, re-walks
-            // the entire tree. ~3000ms on 396 bubbles. Necessary when a
-            // new bubble was added or the structure changed in any way.
+            // the entire tree. With the 200-bubble truncation cap that's
+            // ~3s. Necessary when a new bubble was added or the structure
+            // changed in any way.
+            //
+            // (Earlier builds force-called messageContainer.setSize here
+            // as a workaround for the SWT 32767px child-Y clamp; now
+            // bypassed by ConversationModel.loadHistory truncating to 200
+            // displayed bubbles. setMinSize alone is sufficient.)
             messageContainer.layout(true, true);
             org.eclipse.swt.graphics.Point sz =
                     messageContainer.computeSize(widthHint, SWT.DEFAULT, true);
             scrolledMessages.setMinSize(sz);
             scrolledMessages.layout(true, true);
-            // CRITICAL: ScrolledComposite.setMinSize alone does not always
-            // resize the content widget. On the user's 388-bubble session
-            // we observed messageContainer's actual bounds staying at the
-            // pre-send size while computeSize correctly reported the new
-            // (larger) size — the just-added bubble was at a Y position
-            // outside messageContainer's bounds and got clipped, so the
-            // user saw their send "disappear". Force the content widget
-            // to take the computed size so its children are inside its
-            // bounds and visible.
-            int forcedWidth = (cw > 0 ? cw : Math.max(sz.x, messageContainer.getSize().x));
-            messageContainer.setSize(forcedWidth, sz.y);
             contentHeight = sz.y;
             if (currentLastIdentity instanceof Control && !((Control) currentLastIdentity).isDisposed()) {
                 lastBubbleHeight = ((Control) currentLastIdentity).computeSize(widthHint, SWT.DEFAULT, false).y;
@@ -4722,14 +4717,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // setMinSize with the updated height — scrollbar range reflects
             // the growing content; setOrigin can reach the new bottom.
             scrolledMessages.setMinSize(widthHint, contentHeight);
-            // Force the content widget to grow to the new height. Same
-            // bug as the FULL path: setMinSize alone leaves messageContainer
-            // at its previous height in many SWT versions, clipping the
-            // streaming text inside the last bubble.
-            int forcedWidth = (cw > 0 ? cw : messageContainer.getSize().x);
-            messageContainer.setSize(forcedWidth, contentHeight);
             // Do NOT call messageContainer.layout(...) on this path — the
             // last bubble layout was just done above; siblings are untouched.
+            // (The earlier explicit messageContainer.setSize was a workaround
+            // for the SWT 32767 limit; no longer needed after truncation.)
             scrolledMessages.layout(false, false);
         }
 
