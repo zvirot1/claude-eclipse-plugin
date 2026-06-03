@@ -13,6 +13,20 @@ public interface IConversationListener {
     default void onSessionInitialized(SessionInfo info) {}
 
     /**
+     * Called once at the start of {@code loadHistory} when the chat view is
+     * about to receive FEWER bubble events than the session actually has — the
+     * oldest blocks are being skipped to stay under the SWT/Win32 32767px
+     * child-coordinate limit. The view should render a banner at the top of
+     * the chat: "X earlier messages hidden". The trimmed messages are still
+     * in the model, in the JSONL on disk, and in the CLI's context.
+     *
+     * @param total      number of blocks in the historical conversation
+     * @param displayed  how many will actually get fireXxx events
+     * @param hidden     {@code total - displayed} (passed for convenience)
+     */
+    default void onHistoryTruncated(int total, int displayed, int hidden) {}
+
+    /**
      * Called when a user message is added to the conversation.
      */
     default void onUserMessageAdded(MessageBlock block) {}
