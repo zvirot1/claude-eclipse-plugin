@@ -13,6 +13,14 @@ public interface IConversationListener {
     default void onSessionInitialized(SessionInfo info) {}
 
     /**
+     * Called once at the start of {@code loadHistory} when the chat view is
+     * about to receive FEWER bubble events than the session actually has —
+     * the oldest blocks are being skipped to stay under the SWT/Win32 32767px
+     * child-coordinate limit. The view should render a banner at the top.
+     */
+    default void onHistoryTruncated(int total, int displayed, int hidden) {}
+
+    /**
      * Called when a user message is added to the conversation.
      */
     default void onUserMessageAdded(MessageBlock block) {}
