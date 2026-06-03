@@ -290,9 +290,28 @@ public class ConversationModel implements ICliMessageListener {
         synchronized (messages) {
             messages.addAll(historicalBlocks);
         }
+
+        // Hard cap on widgets rendered. SWT/Win32 clamps child Y coordinates
+        // at Short.MAX_VALUE (32767px); past that, late bubbles overlap.
+        int displayLimit = 200;
+        int total = historicalBlocks.size();
+        int skip = Math.max(0, total - displayLimit);
+        int displayed = total - skip;
+
+        if (skip > 0) {
+            try { fireHistoryTruncated(total, displayed, skip); } catch (Throwable ignored) {}
+            Activator.logDiag("[DIAG-PERF] loadHistory TRUNCATED total=" + total
+                    + " displayed=" + displayed + " hidden=" + skip);
+        }
+
         int idx = 0;
         int failed = 0;
+        int rendered = 0;
         for (MessageBlock block : historicalBlocks) {
+            if (idx < skip) {
+                idx++;
+                continue;
+            }
             try {
                 if (block.getRole() == MessageBlock.Role.USER) {
                     fireUserMessageAdded(block);
@@ -300,13 +319,8 @@ public class ConversationModel implements ICliMessageListener {
                     fireAssistantMessageStarted(block);
                     fireAssistantMessageCompleted(block);
                 }
+                rendered++;
             } catch (Throwable t) {
-                // A single bad block must NOT block the rest of the replay.
-                // The previous behaviour left the view's replayingHistory +
-                // MessageComposite.SUPPRESS_PARENT_LAYOUT stuck at true,
-                // making every later bubble invisible — and crucially also
-                // making any new live user/assistant message invisible
-                // because relayoutParent's parent.layout was being skipped.
                 failed++;
                 Activator.logWarning("[loadHistory] block #" + idx + " (role="
                         + block.getRole() + ") replay failed — skipping. "
@@ -314,8 +328,15 @@ public class ConversationModel implements ICliMessageListener {
             }
             idx++;
         }
-        Activator.logDiag("[DIAG-PERF] loadHistory replayed=" + (historicalBlocks.size() - failed)
-                + " failed=" + failed + " total=" + historicalBlocks.size());
+        Activator.logDiag("[DIAG-PERF] loadHistory replayed=" + rendered
+                + " failed=" + failed + " skipped=" + skip + " total=" + total);
+    }
+
+    private void fireHistoryTruncated(int total, int displayed, int hidden) {
+        for (IConversationListener l : listeners) {
+            try { l.onHistoryTruncated(total, displayed, hidden); }
+            catch (Throwable t) { Activator.logError("listener.onHistoryTruncated failed", t); }
+        }
     }
 
     /**
