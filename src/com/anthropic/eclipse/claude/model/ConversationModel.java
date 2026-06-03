@@ -24,6 +24,24 @@ import com.anthropic.eclipse.claude.cli.ICliMessageListener;
 public class ConversationModel implements ICliMessageListener {
 
     private final List<MessageBlock> messages = new ArrayList<>();
+
+    // Sliding window into `messages` describing which blocks are currently
+    // RENDERED in the chat view. SWT/Win32 clamps child Y coordinates at
+    // 32767px (Short.MAX_VALUE) — past that, late bubbles overlap and
+    // become invisible. We keep at most WINDOW_SIZE bubbles in the UI at
+    // any time; the model still holds all blocks (so the CLI's context
+    // and the JSONL on disk are unaffected). The view scrolls within the
+    // window; when the user scrolls past the top/bottom trigger zones,
+    // the view asks the model to shift the window left/right.
+    public static final int WINDOW_SIZE = 200;
+    private volatile int windowStart = 0;          // inclusive, into `messages`
+    private volatile int windowEnd = 0;            // exclusive
+    private volatile long lastShiftAtMs = 0;       // debounce timestamp
+    // True while loadHistory is replaying. During replay the per-block
+    // fireXxx methods are called from inside the loop with messages already
+    // populated, so the live "is this block at the tail of new arrivals?"
+    // gate would never match. Skip the gate during replay.
+    private volatile boolean inReplay = false;
     private final List<IConversationListener> listeners = new CopyOnWriteArrayList<>();
     private volatile SessionInfo sessionInfo;
     private final UsageInfo cumulativeUsage = new UsageInfo();
@@ -228,6 +246,66 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     /**
+     * Decide whether a just-added block should enter the displayed window
+     * (advancing the tail) or be held off (user is reading older history).
+     * Called from the fire methods AFTER {@code messages.add(block)} has
+     * happened — so {@code messages.size() - 1} is this block's index.
+     *
+     * @return true if the view should render a bubble for this block
+     *         (window now contains it); false if the view should NOT
+     *         render and should show "new messages available" toast.
+     */
+    private boolean shouldRenderNewBlock(MessageBlock block) {
+        // Re-fire detection: if the block is ALREADY in the current window
+        // (streaming paths sometimes re-fire fireAssistantMessageStarted for
+        // an already-displayed block), just let the listener pass.
+        synchronized (messages) {
+            int n = messages.size();
+            int blockIdx = (n > 0 && messages.get(n - 1) == block) ? n - 1 : messages.indexOf(block);
+            if (blockIdx >= windowStart && blockIdx < windowEnd) {
+                return true;
+            }
+        }
+
+        boolean wasAtTail;
+        MessageBlock evicted = null;
+        int total;
+        synchronized (messages) {
+            total = messages.size();
+            // After messages.add(block), the new block is at index size-1.
+            // wasAtTail = "window covered everything BEFORE this add" =
+            // (windowEnd == size - 1).
+            wasAtTail = (windowEnd == total - 1);
+            if (wasAtTail) {
+                windowEnd = total;
+                if (windowEnd - windowStart > WINDOW_SIZE) {
+                    evicted = messages.get(windowStart);
+                    windowStart++;
+                }
+            }
+        }
+        if (!wasAtTail) {
+            // User is scrolled back reading older history. Fire the
+            // new-messages toast so they can jump back to latest if they
+            // want. Don't render the bubble.
+            int waiting;
+            synchronized (messages) { waiting = messages.size() - windowEnd; }
+            fireNewMessagesAvailable(waiting);
+            return false;
+        }
+        // Window advanced; if we kicked out the oldest displayed bubble,
+        // tell the view to dispose it.
+        if (evicted != null) {
+            fireHistoryWindowShifted(
+                    java.util.Collections.emptyList(),
+                    java.util.Collections.singletonList(evicted),
+                    ShiftDirection.FORWARD,
+                    windowStart, windowEnd, total);
+        }
+        return true;
+    }
+
+    /**
      * Get all messages in the conversation (snapshot copy for thread safety).
      */
     public List<MessageBlock> getMessages() {
@@ -288,45 +366,84 @@ public class ConversationModel implements ICliMessageListener {
      */
     public void loadHistory(List<MessageBlock> historicalBlocks) {
         synchronized (messages) {
+            // Keep ALL blocks in the model — the CLI's --resume needs the full
+            // JSONL transcript on disk (unaffected by us), and the SessionInfo
+            // / token counts should reflect the true conversation length.
             messages.addAll(historicalBlocks);
         }
 
-        // Hard cap on widgets rendered. SWT/Win32 clamps child Y coordinates
-        // at Short.MAX_VALUE (32767px); past that, late bubbles overlap.
+        // Hard cap on widgets rendered into the chat view. SWT/Win32 clamps
+        // child Y coordinates at Short.MAX_VALUE (32767px); past that, all
+        // late bubbles overlap at Y=32767 and become invisible. On the user's
+        // 388-bubble session the cumulative height was 45,179px so roughly
+        // the last 76% of bubbles got clamped (the user reported "I send a
+        // message and don't see it"). The fix: render only the LAST N
+        // bubbles. The trimmed older bubbles are still in the model and
+        // still in the JSONL file — CLI resume sees them, context is
+        // preserved. The user just doesn't see them in the chat view.
+        //
+        // 200 was chosen because 200 × ~120px (typical bubble height) ≈
+        // 24,000px — comfortably below the 32,767 limit even for sessions
+        // with longer-than-average bubbles. If the user wants a higher cap
+        // they can override via the HISTORY_DISPLAY_LIMIT preference.
         int displayLimit = 200;
         int total = historicalBlocks.size();
         int skip = Math.max(0, total - displayLimit);
         int displayed = total - skip;
 
+        // Initialize the sliding window to cover the LATEST `displayLimit`
+        // blocks. The view starts scrolled to the bottom; user can scroll
+        // up past the top trigger zone to load older blocks via
+        // shiftWindowBackward.
+        synchronized (messages) {
+            windowEnd = messages.size();
+            windowStart = Math.max(0, windowEnd - displayLimit);
+        }
+
         if (skip > 0) {
+            // Fire ONE event to let the view show a banner at the top of
+            // the chat: "Showing 188-388 of 388". The banner updates on
+            // every window shift via onHistoryWindowState.
             try { fireHistoryTruncated(total, displayed, skip); } catch (Throwable ignored) {}
             Activator.logDiag("[DIAG-PERF] loadHistory TRUNCATED total=" + total
-                    + " displayed=" + displayed + " hidden=" + skip);
+                    + " displayed=" + displayed + " hidden=" + skip
+                    + " (Win32 32767 limit workaround)");
         }
 
         int idx = 0;
         int failed = 0;
         int rendered = 0;
-        for (MessageBlock block : historicalBlocks) {
-            if (idx < skip) {
-                idx++;
-                continue;
-            }
-            try {
-                if (block.getRole() == MessageBlock.Role.USER) {
-                    fireUserMessageAdded(block);
-                } else if (block.getRole() == MessageBlock.Role.ASSISTANT) {
-                    fireAssistantMessageStarted(block);
-                    fireAssistantMessageCompleted(block);
+        inReplay = true;
+        try {
+            for (MessageBlock block : historicalBlocks) {
+                if (idx < skip) {
+                    idx++;
+                    continue;  // Skip the OLDEST blocks; render only the last `displayLimit`.
                 }
-                rendered++;
-            } catch (Throwable t) {
-                failed++;
-                Activator.logWarning("[loadHistory] block #" + idx + " (role="
-                        + block.getRole() + ") replay failed — skipping. "
-                        + t.getClass().getSimpleName() + ": " + t.getMessage());
+                try {
+                    if (block.getRole() == MessageBlock.Role.USER) {
+                        fireUserMessageAdded(block);
+                    } else if (block.getRole() == MessageBlock.Role.ASSISTANT) {
+                        fireAssistantMessageStarted(block);
+                        fireAssistantMessageCompleted(block);
+                    }
+                    rendered++;
+                } catch (Throwable t) {
+                    // A single bad block must NOT block the rest of the replay.
+                    // The previous behaviour left the view's replayingHistory +
+                    // MessageComposite.SUPPRESS_PARENT_LAYOUT stuck at true,
+                    // making every later bubble invisible — and crucially also
+                    // making any new live user/assistant message invisible
+                    // because relayoutParent's parent.layout was being skipped.
+                    failed++;
+                    Activator.logWarning("[loadHistory] block #" + idx + " (role="
+                            + block.getRole() + ") replay failed — skipping. "
+                            + t.getClass().getSimpleName() + ": " + t.getMessage());
+                }
+                idx++;
             }
-            idx++;
+        } finally {
+            inReplay = false;
         }
         Activator.logDiag("[DIAG-PERF] loadHistory replayed=" + rendered
                 + " failed=" + failed + " skipped=" + skip + " total=" + total);
@@ -336,6 +453,124 @@ public class ConversationModel implements ICliMessageListener {
         for (IConversationListener l : listeners) {
             try { l.onHistoryTruncated(total, displayed, hidden); }
             catch (Throwable t) { Activator.logError("listener.onHistoryTruncated failed", t); }
+        }
+    }
+
+    /**
+     * Direction of a {@link #shiftWindowBackward} / {@link #shiftWindowForward}
+     * operation, so the view can decide whether to prepend (BACKWARD) or
+     * append (FORWARD) the new bubbles in messageContainer.
+     */
+    public enum ShiftDirection { BACKWARD, FORWARD }
+
+    public int getWindowStart() { return windowStart; }
+    public int getWindowEnd() { return windowEnd; }
+    public int getTotalMessageCount() { synchronized (messages) { return messages.size(); } }
+
+    /** True if there are blocks in {@code messages} older than the current window. */
+    public boolean hasOlder() { return windowStart > 0; }
+
+    /** True if there are blocks in {@code messages} newer than the current window. */
+    public boolean hasNewer() { synchronized (messages) { return windowEnd < messages.size(); } }
+
+    /** Debounce helper for the view's scroll listener. */
+    public boolean hasShiftedRecently(int withinMs) {
+        return (System.currentTimeMillis() - lastShiftAtMs) < withinMs;
+    }
+
+    /**
+     * Slide the window {@code step} blocks BACKWARD (older). The new window
+     * still has {@code WINDOW_SIZE} blocks (unless we're hitting the start
+     * of the conversation). Fires {@link IConversationListener#onHistoryWindowShifted}
+     * with the blocks to prepend (added) and the blocks to dispose (removed).
+     * No-op if already at the start.
+     */
+    public void shiftWindowBackward(int step) {
+        if (step <= 0) return;
+        List<MessageBlock> snap;
+        synchronized (messages) { snap = new ArrayList<>(messages); }
+        if (windowStart <= 0) return;
+        int newStart = Math.max(0, windowStart - step);
+        int newEnd   = Math.min(snap.size(), newStart + WINDOW_SIZE);
+        // The actual shift size may be smaller than `step` if we hit the start.
+        if (newStart == windowStart && newEnd == windowEnd) return;
+        List<MessageBlock> added   = new ArrayList<>(snap.subList(newStart, windowStart));
+        List<MessageBlock> removed = new ArrayList<>(snap.subList(newEnd, windowEnd));
+        windowStart = newStart;
+        windowEnd = newEnd;
+        lastShiftAtMs = System.currentTimeMillis();
+        Activator.logDiag("[DIAG-PERF] historyWindowShifted dir=BACKWARD added="
+                + added.size() + " removed=" + removed.size()
+                + " newStart=" + newStart + " newEnd=" + newEnd);
+        fireHistoryWindowShifted(added, removed, ShiftDirection.BACKWARD, newStart, newEnd, snap.size());
+    }
+
+    /**
+     * Slide the window {@code step} blocks FORWARD (newer). Fires
+     * {@link IConversationListener#onHistoryWindowShifted} with the blocks
+     * to append (added) and the blocks to dispose (removed). No-op if
+     * already at the latest.
+     */
+    public void shiftWindowForward(int step) {
+        if (step <= 0) return;
+        List<MessageBlock> snap;
+        synchronized (messages) { snap = new ArrayList<>(messages); }
+        if (windowEnd >= snap.size()) return;
+        int newEnd   = Math.min(snap.size(), windowEnd + step);
+        int newStart = Math.max(0, newEnd - WINDOW_SIZE);
+        if (newStart == windowStart && newEnd == windowEnd) return;
+        List<MessageBlock> added   = new ArrayList<>(snap.subList(windowEnd, newEnd));
+        List<MessageBlock> removed = new ArrayList<>(snap.subList(windowStart, newStart));
+        windowStart = newStart;
+        windowEnd = newEnd;
+        lastShiftAtMs = System.currentTimeMillis();
+        Activator.logDiag("[DIAG-PERF] historyWindowShifted dir=FORWARD added="
+                + added.size() + " removed=" + removed.size()
+                + " newStart=" + newStart + " newEnd=" + newEnd);
+        fireHistoryWindowShifted(added, removed, ShiftDirection.FORWARD, newStart, newEnd, snap.size());
+    }
+
+    /**
+     * Convenience: jump the window to cover the LATEST blocks. Used by the
+     * "new messages available" toast click handler.
+     */
+    public void shiftWindowToLatest() {
+        List<MessageBlock> snap;
+        synchronized (messages) { snap = new ArrayList<>(messages); }
+        int newEnd = snap.size();
+        int newStart = Math.max(0, newEnd - WINDOW_SIZE);
+        if (newStart == windowStart && newEnd == windowEnd) return;
+        // Compute diff for the event.
+        List<MessageBlock> added, removed;
+        if (newStart >= windowEnd) {
+            // Jumped past the current window completely — everything is new.
+            added = new ArrayList<>(snap.subList(newStart, newEnd));
+            removed = new ArrayList<>(snap.subList(windowStart, windowEnd));
+        } else {
+            added = new ArrayList<>(snap.subList(windowEnd, newEnd));
+            removed = new ArrayList<>(snap.subList(windowStart, newStart));
+        }
+        windowStart = newStart;
+        windowEnd = newEnd;
+        lastShiftAtMs = System.currentTimeMillis();
+        Activator.logDiag("[DIAG-PERF] historyWindowShifted dir=JUMP_LATEST added="
+                + added.size() + " removed=" + removed.size()
+                + " newStart=" + newStart + " newEnd=" + newEnd);
+        fireHistoryWindowShifted(added, removed, ShiftDirection.FORWARD, newStart, newEnd, snap.size());
+    }
+
+    private void fireHistoryWindowShifted(List<MessageBlock> added, List<MessageBlock> removed,
+                                          ShiftDirection direction, int newStart, int newEnd, int total) {
+        for (IConversationListener l : listeners) {
+            try { l.onHistoryWindowShifted(added, removed, direction, newStart, newEnd, total); }
+            catch (Throwable t) { Activator.logError("listener.onHistoryWindowShifted failed", t); }
+        }
+    }
+
+    private void fireNewMessagesAvailable(int countWaiting) {
+        for (IConversationListener l : listeners) {
+            try { l.onNewMessagesAvailable(countWaiting); }
+            catch (Throwable t) { Activator.logError("listener.onNewMessagesAvailable failed", t); }
         }
     }
 
@@ -910,12 +1145,17 @@ public class ConversationModel implements ICliMessageListener {
     }
 
     private void fireUserMessageAdded(MessageBlock block) {
+        // Sliding-window gate (skipped during loadHistory replay — see
+        // inReplay flag): if user is reading older history, don't render —
+        // show a "new messages available" toast instead.
+        if (!inReplay && !shouldRenderNewBlock(block)) return;
         for (IConversationListener l : listeners) {
             try { l.onUserMessageAdded(block); } catch (Exception e) { logError(e); }
         }
     }
 
     private void fireAssistantMessageStarted(MessageBlock block) {
+        if (!inReplay && !shouldRenderNewBlock(block)) return;
         for (IConversationListener l : listeners) {
             try { l.onAssistantMessageStarted(block); } catch (Exception e) { logError(e); }
         }
