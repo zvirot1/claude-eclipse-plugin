@@ -288,11 +288,49 @@ public class ConversationModel implements ICliMessageListener {
      */
     public void loadHistory(List<MessageBlock> historicalBlocks) {
         synchronized (messages) {
+            // Keep ALL blocks in the model — the CLI's --resume needs the full
+            // JSONL transcript on disk (unaffected by us), and the SessionInfo
+            // / token counts should reflect the true conversation length.
             messages.addAll(historicalBlocks);
         }
+
+        // Hard cap on widgets rendered into the chat view. SWT/Win32 clamps
+        // child Y coordinates at Short.MAX_VALUE (32767px); past that, all
+        // late bubbles overlap at Y=32767 and become invisible. On the user's
+        // 388-bubble session the cumulative height was 45,179px so roughly
+        // the last 76% of bubbles got clamped (the user reported "I send a
+        // message and don't see it"). The fix: render only the LAST N
+        // bubbles. The trimmed older bubbles are still in the model and
+        // still in the JSONL file — CLI resume sees them, context is
+        // preserved. The user just doesn't see them in the chat view.
+        //
+        // 200 was chosen because 200 × ~120px (typical bubble height) ≈
+        // 24,000px — comfortably below the 32,767 limit even for sessions
+        // with longer-than-average bubbles. If the user wants a higher cap
+        // they can override via the HISTORY_DISPLAY_LIMIT preference.
+        int displayLimit = 200;
+        int total = historicalBlocks.size();
+        int skip = Math.max(0, total - displayLimit);
+        int displayed = total - skip;
+
+        if (skip > 0) {
+            // Fire ONE event to let the view show a "X earlier messages
+            // hidden" banner at the top of the chat. The view can then
+            // render that as a non-bubble Composite at the very top.
+            try { fireHistoryTruncated(total, displayed, skip); } catch (Throwable ignored) {}
+            Activator.logDiag("[DIAG-PERF] loadHistory TRUNCATED total=" + total
+                    + " displayed=" + displayed + " hidden=" + skip
+                    + " (Win32 32767 limit workaround)");
+        }
+
         int idx = 0;
         int failed = 0;
+        int rendered = 0;
         for (MessageBlock block : historicalBlocks) {
+            if (idx < skip) {
+                idx++;
+                continue;  // Skip the OLDEST blocks; render only the last `displayLimit`.
+            }
             try {
                 if (block.getRole() == MessageBlock.Role.USER) {
                     fireUserMessageAdded(block);
@@ -300,6 +338,7 @@ public class ConversationModel implements ICliMessageListener {
                     fireAssistantMessageStarted(block);
                     fireAssistantMessageCompleted(block);
                 }
+                rendered++;
             } catch (Throwable t) {
                 // A single bad block must NOT block the rest of the replay.
                 // The previous behaviour left the view's replayingHistory +
@@ -314,8 +353,15 @@ public class ConversationModel implements ICliMessageListener {
             }
             idx++;
         }
-        Activator.logDiag("[DIAG-PERF] loadHistory replayed=" + (historicalBlocks.size() - failed)
-                + " failed=" + failed + " total=" + historicalBlocks.size());
+        Activator.logDiag("[DIAG-PERF] loadHistory replayed=" + rendered
+                + " failed=" + failed + " skipped=" + skip + " total=" + total);
+    }
+
+    private void fireHistoryTruncated(int total, int displayed, int hidden) {
+        for (IConversationListener l : listeners) {
+            try { l.onHistoryTruncated(total, displayed, hidden); }
+            catch (Throwable t) { Activator.logError("listener.onHistoryTruncated failed", t); }
+        }
     }
 
     /**

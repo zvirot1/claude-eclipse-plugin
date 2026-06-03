@@ -2492,6 +2492,37 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
     // ==================== IConversationListener Implementation ====================
 
     @Override
+    public void onHistoryTruncated(int total, int displayed, int hidden) {
+        // Banner at the top of the chat warning the user that the OLDEST
+        // messages are not rendered. The trimmed messages are still on disk
+        // and still in the CLI's context; this is purely a rendering trim
+        // to keep messageContainer's total height under SWT's 32767px child-
+        // coordinate limit on Win32.
+        asyncExec(() -> {
+            if (messageContainer == null || messageContainer.isDisposed()) return;
+            // Dismiss the welcome composite first if it's still showing.
+            dismissWelcomeMessage();
+            Composite banner = new Composite(messageContainer, SWT.NONE);
+            GridLayout gl = new GridLayout(1, false);
+            gl.marginWidth = 8;
+            gl.marginHeight = 8;
+            banner.setLayout(gl);
+            banner.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+            try { banner.setBackground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
+            catch (Throwable ignored) {}
+            Label lbl = new Label(banner, SWT.WRAP);
+            lbl.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+            lbl.setText(hidden + " older messages hidden — showing the most recent "
+                    + displayed + " of " + total
+                    + " (full transcript is still on disk and in the AI's context)");
+            try { lbl.setBackground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
+            catch (Throwable ignored) {}
+            try { lbl.setForeground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_FOREGROUND)); }
+            catch (Throwable ignored) {}
+        });
+    }
+
+    @Override
     public void onSessionInitialized(SessionInfo info) {
         if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
             stickySessionId = info.getSessionId();
@@ -2564,13 +2595,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             MessageComposite widget = new MessageComposite(messageContainer, block);
             widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
-            // Synchronous scroll — calling layout in this same asyncExec
-            // means the new bubble is laid out and visible before the
-            // runnable returns. The earlier "defer to next tick" attempt
-            // raced against a flood of onStreamEvent → updateThinkingLabel
-            // asyncExecs and left bubbles invisible. scrollToBottom itself
-            // is already only 1 layout pass (was 4) so the immediate call
-            // is fast enough.
+            // Trigger normal scroll path (updates content size, sets min size,
+            // restores keyboard focus).
+            // NOTE: don't call scrolledMessages.showControl(widget) here —
+            // the new MessageComposite has bounds (0,0,0,0) until
+            // messageContainer.layout runs inside scrollToBottom, so
+            // showControl would scroll to Y=0 (start of chat). The user
+            // then saw the chat jump to the top and immediately back to
+            // the bottom on every send.
             scrollToBottom();
         });
     }
@@ -2613,6 +2645,9 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             widget.setForkCallback(this::forkFromMessage);
             messageWidgetMap.put(block, widget);
             scrollToBottom();
+            // No showControl here — see onUserMessageAdded for the rationale
+            // (widget bounds are 0,0,0,0 at this point, so showControl would
+            // scroll to Y=0 and cause the chat to jump to the top).
         });
     }
 
@@ -4655,6 +4690,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                     messageContainer.computeSize(widthHint, SWT.DEFAULT, true);
             scrolledMessages.setMinSize(sz);
             scrolledMessages.layout(true, true);
+            // CRITICAL: ScrolledComposite.setMinSize alone does not always
+            // resize the content widget. On the user's 388-bubble session
+            // we observed messageContainer's actual bounds staying at the
+            // pre-send size while computeSize correctly reported the new
+            // (larger) size — the just-added bubble was at a Y position
+            // outside messageContainer's bounds and got clipped, so the
+            // user saw their send "disappear". Force the content widget
+            // to take the computed size so its children are inside its
+            // bounds and visible.
+            int forcedWidth = (cw > 0 ? cw : Math.max(sz.x, messageContainer.getSize().x));
+            messageContainer.setSize(forcedWidth, sz.y);
             contentHeight = sz.y;
             if (currentLastIdentity instanceof Control && !((Control) currentLastIdentity).isDisposed()) {
                 lastBubbleHeight = ((Control) currentLastIdentity).computeSize(widthHint, SWT.DEFAULT, false).y;
@@ -4682,6 +4728,12 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // setMinSize with the updated height — scrollbar range reflects
             // the growing content; setOrigin can reach the new bottom.
             scrolledMessages.setMinSize(widthHint, contentHeight);
+            // Force the content widget to grow to the new height. Same
+            // bug as the FULL path: setMinSize alone leaves messageContainer
+            // at its previous height in many SWT versions, clipping the
+            // streaming text inside the last bubble.
+            int forcedWidth = (cw > 0 ? cw : messageContainer.getSize().x);
+            messageContainer.setSize(forcedWidth, contentHeight);
             // Do NOT call messageContainer.layout(...) on this path — the
             // last bubble layout was just done above; siblings are untouched.
             scrolledMessages.layout(false, false);
@@ -4709,8 +4761,17 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
                 }
             }
         });
+        org.eclipse.swt.graphics.Point mcSize = messageContainer.getSize();
+        String lastBubbleBounds = "(none)";
+        if (currentLastIdentity instanceof Control && !((Control) currentLastIdentity).isDisposed()) {
+            org.eclipse.swt.graphics.Rectangle lb = ((Control) currentLastIdentity).getBounds();
+            lastBubbleBounds = lb.x + "," + lb.y + "," + lb.width + "x" + lb.height;
+        }
         Activator.logDiag("[DIAG-PERF] scrollToBottom elapsed="
                 + (System.currentTimeMillis() - t0) + "ms contentHeight=" + sz.y
+                + " mcSize=" + mcSize.x + "x" + mcSize.y
+                + " kidsLen=" + currentCount
+                + " lastBubble=" + lastBubbleBounds
                 + " path=" + (structuralChange ? "FULL" : "INCR"));
     }
 
