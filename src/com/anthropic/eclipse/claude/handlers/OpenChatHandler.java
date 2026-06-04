@@ -12,8 +12,8 @@ public class OpenChatHandler extends AbstractHandler {
     @Override
     public Object execute(ExecutionEvent event) throws ExecutionException {
         IWorkbenchWindow window = HandlerUtils.getActiveWindow(event);
-        if (window != null) {
-            HandlerUtils.getConversationView(window.getActivePage());
+        if (window != null && window.getActivePage() != null) {
+            HandlerUtils.openPrimaryView(window.getActivePage());
         }
         return null;
     }

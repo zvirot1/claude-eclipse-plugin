@@ -12,10 +12,26 @@
 
    <!-- ========== Views ========== -->
    <extension point="org.eclipse.ui.views">
-      <!-- NEW: Main Claude Code Conversation View -->
+      <!-- DEFAULT: Webview-based Claude Code conversation view (V2).
+           Renders the chat as HTML inside an embedded Chromium (SWT.Browser
+           on Edge WebView2 on Windows 10+), bypassing the SWT 32767px child-Y
+           coordinate limit and all native widget creation cost. Same model
+           layer as the legacy SWT view — only the rendering differs. -->
+      <view
+         id="com.anthropic.eclipse.claude.views.ClaudeConversationViewV2"
+         name="Claude Code"
+         class="com.anthropic.eclipse.claude.views.ClaudeConversationViewV2"
+         category="com.anthropic.eclipse.claude"
+         icon="icons/claude.png"
+         allowMultiple="true">
+      </view>
+      <!-- LEGACY: Original SWT-based conversation view.
+           Still reachable via Show View > Other for emergency rollback or
+           comparison. Receives code-aware commands (Send Selection, Explain
+           Code, etc.) since those handlers expect this view's Java API. -->
       <view
          id="com.anthropic.eclipse.claude.views.ClaudeConversationView"
-         name="Claude Code"
+         name="Claude Code (Legacy SWT)"
          class="com.anthropic.eclipse.claude.views.ClaudeConversationView"
          category="com.anthropic.eclipse.claude"
          icon="icons/claude.png"
