@@ -55,6 +55,10 @@ public class MessageComposite extends Composite {
     public MessageComposite(Composite parent, MessageBlock block) {
         super(parent, SWT.NONE);
         this.messageBlock = block;
+        // Store a back-reference so the sliding-window scroll-anchor logic
+        // in ClaudeConversationView can identify "which bubble is at the
+        // top of the viewport right now" without an O(N) walk of the map.
+        setData("blockId", block);
         // For historical bubbles (replayed from JSONL), the "finished" time
         // IS the block's timestamp — by the time the entry was written to
         // disk, the message was complete. Without this, finalizeContent
