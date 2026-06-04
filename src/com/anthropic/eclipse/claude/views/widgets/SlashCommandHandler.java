@@ -33,7 +33,7 @@ public class SlashCommandHandler {
         COMMANDS.add(new CommandInfo("/help", "Show available commands", true));
         COMMANDS.add(new CommandInfo("/stop", "Stop the current query", true));
         COMMANDS.add(new CommandInfo("/resume", "Resume a previous session", true));
-        COMMANDS.add(new CommandInfo("/model", "Switch to a different model", true));
+        COMMANDS.add(new CommandInfo("/model", "Show or switch the model", true));
         COMMANDS.add(new CommandInfo("/rules", "Manage Claude rules and permissions", true));
         COMMANDS.add(new CommandInfo("/mcp", "Manage MCP server configurations", true));
         COMMANDS.add(new CommandInfo("/hooks", "Manage hooks (pre/post tool use)", true));
@@ -42,6 +42,7 @@ public class SlashCommandHandler {
         COMMANDS.add(new CommandInfo("/skills", "Manage skills and plugins", true));
 
         // CLI-forwarded commands (sent to Claude as regular messages)
+        COMMANDS.add(new CommandInfo("/compact", "Compact the conversation context (CLI built-in)", false));
         COMMANDS.add(new CommandInfo("/commit", "Generate a git commit message", false));
         COMMANDS.add(new CommandInfo("/review-pr", "Review a pull request", false));
         COMMANDS.add(new CommandInfo("/explain", "Explain the current file or selection", false));

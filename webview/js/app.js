@@ -2576,7 +2576,9 @@
             e.preventDefault();
             e.stopPropagation();
             dragCounter++;
-            if (hasImageFiles(e)) {
+            // Show overlay for ANY file drop, not just images — V2 now
+            // attaches non-image files as chips too.
+            if (hasAnyFiles(e)) {
                 dropOverlay.classList.remove('hidden');
             }
         });
@@ -2606,21 +2608,41 @@
             for (var i = 0; i < files.length; i++) {
                 if (files[i].type.startsWith('image/')) {
                     addImageAttachment(files[i]);
+                } else {
+                    // Non-image file: read bytes and send to Java so the
+                    // server-side attachedFiles list ingests it and pushes
+                    // an attachments_updated event back to render a chip.
+                    addNonImageFileAttachment(files[i]);
                 }
             }
         });
 
-        // Also handle paste (Ctrl+V image paste)
+        // Also handle paste (Ctrl+V image paste). For images we attach
+        // inline via the native clipboardData. For file references from
+        // OS file-managers (Explorer / Finder Copy → Ctrl+V), the
+        // browser doesn't expose them — defer to Java which probes the
+        // SWT clipboard for FileTransfer and attaches as chips.
         messageInput.addEventListener('paste', function (e) {
-            var items = (e.clipboardData || e.originalEvent.clipboardData).items;
-            for (var i = 0; i < items.length; i++) {
-                if (items[i].type.startsWith('image/')) {
-                    var file = items[i].getAsFile();
+            var cd = e.clipboardData || e.originalEvent.clipboardData;
+            if (!cd) return;
+            var imageHandled = false;
+            for (var i = 0; i < cd.items.length; i++) {
+                if (cd.items[i].type.startsWith('image/')) {
+                    var file = cd.items[i].getAsFile();
                     if (file) {
                         addImageAttachment(file);
                         e.preventDefault();
+                        imageHandled = true;
                     }
                 }
+            }
+            // Always ask Java to scan for OS-level file references. Java
+            // skips when none are on the clipboard; when present it
+            // adds them as chips via attach_file_dialog's helpers.
+            // (Plain text paste continues into the textarea natively —
+            // we never preventDefault when only text is there.)
+            if (!imageHandled) {
+                bridge.sendToJava('paste_attach_files_from_clipboard', {});
             }
         });
     }
@@ -2632,6 +2654,35 @@
             }
         }
         return false;
+    }
+
+    /** Any file at all on the drag payload — for showing the drop overlay
+     *  when the user is about to drop a non-image file. */
+    function hasAnyFiles(e) {
+        if (e.dataTransfer && e.dataTransfer.types) {
+            for (var i = 0; i < e.dataTransfer.types.length; i++) {
+                if (e.dataTransfer.types[i] === 'Files') return true;
+            }
+        }
+        return false;
+    }
+
+    /** Send a non-image file to Java so the server-side attachment list
+     *  ingests it. Java responds with attachments_updated → chip appears. */
+    function addNonImageFileAttachment(file) {
+        var reader = new FileReader();
+        reader.onload = function (ev) {
+            // data:application/octet-stream;base64,XYZ — take the part after the comma.
+            var b64 = (ev.target.result || '').split(',')[1] || '';
+            bridge.sendToJava('attach_file_bytes', {
+                name: file.name,
+                bytes: b64
+            });
+        };
+        reader.onerror = function () {
+            console.warn('[Webview] addNonImageFileAttachment: read failed for', file.name);
+        };
+        reader.readAsDataURL(file);
     }
 
     /**

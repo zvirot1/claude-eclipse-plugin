@@ -122,6 +122,17 @@ public final class JsonlHistoryLoader {
                                 text = sb.toString();
                             }
                             text = stripPrependedFileBlocks(text);
+                            // Filter out CLI-internal control messages. The
+                            // CLI writes "user" entries for things like
+                            //   <local-command-caveat>…</local-command-caveat>
+                            //   <command-name>/compact</command-name>…
+                            //   <local-command-stdout>Compacted</local-command-stdout>
+                            // when slash commands like /compact run. These
+                            // are protocol metadata, not real user input —
+                            // surfacing them in the chat looks confusing.
+                            if (text != null && isCliInternalMessage(text)) {
+                                continue;
+                            }
                             if (text != null && !text.trim().isEmpty()) {
                                 MessageBlock block = new MessageBlock(MessageBlock.Role.USER, entryTimestamp);
                                 MessageBlock.TextSegment seg = new MessageBlock.TextSegment();
@@ -176,6 +187,27 @@ public final class JsonlHistoryLoader {
             // Return whatever we managed to parse
         }
         return blocks;
+    }
+
+    /**
+     * Returns true when {@code text} is a CLI-internal "user" entry that
+     * should be hidden from the chat. The CLI writes synthetic user
+     * messages for slash-command lifecycle (a caveat block before, the
+     * command name itself, and any captured stdout) wrapped in tags like
+     * {@code <local-command-caveat>}, {@code <command-name>},
+     * {@code <local-command-stdout>}, etc. These are protocol metadata
+     * — the user never typed them. Match the first non-whitespace tag
+     * to keep the check robust to leading whitespace.
+     */
+    private static boolean isCliInternalMessage(String text) {
+        if (text == null) return false;
+        String trimmed = text.trim();
+        return trimmed.startsWith("<local-command-")
+            || trimmed.startsWith("<command-name>")
+            || trimmed.startsWith("<command-message>")
+            || trimmed.startsWith("<command-args>")
+            || trimmed.startsWith("<command-stderr>")
+            || trimmed.startsWith("<command-stdout>");
     }
 
     /**
