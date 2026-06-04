@@ -567,6 +567,9 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             case "view_diff":
                 handleViewDiff(payload);
                 break;
+            case "file_search":
+                handleFileSearch(payload);
+                break;
             case "accept_edit":
                 handleAcceptEdit(payload);
                 break;
@@ -637,6 +640,84 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             Activator.logWarning("[Webview] send_message failed: " + e.getMessage());
             bridge.sendToWebview("error",
                 "{\"message\":" + JsonBuilder.jsonString("Failed to send message: " + e.getMessage()) + "}");
+        }
+    }
+
+    /**
+     * Reply to the JS @-mention autocomplete with up to 15 matching files
+     * from the active workspace project. The webview shows the popup and
+     * inserts {@code @relativePath} into the textarea on pick — the CLI
+     * sees the @-mention in the user message and reads/attaches the file
+     * itself. We don't need to track attachments server-side.
+     */
+    private void handleFileSearch(String payload) {
+        try {
+            Map<String, Object> data = JsonParser.parseObject(payload);
+            String query = JsonParser.getString(data, "query");
+            if (query == null) query = "";
+            final String lowerQuery = query.toLowerCase();
+
+            String basePath = getDefaultWorkingDirectory();
+            if (basePath == null || basePath.isEmpty()) {
+                bridge.sendToWebview("file_suggestions", "{\"files\":[]}");
+                return;
+            }
+
+            java.util.List<java.io.File> matches = new java.util.ArrayList<>();
+            java.io.File baseDir = new java.io.File(basePath);
+            searchFiles(baseDir, baseDir, lowerQuery, matches, 15);
+
+            StringBuilder json = new StringBuilder("{\"files\":[");
+            boolean first = true;
+            for (java.io.File f : matches) {
+                if (!first) json.append(",");
+                first = false;
+                String absolutePath = f.getAbsolutePath();
+                String relativePath = (absolutePath.length() > basePath.length() + 1
+                        && absolutePath.startsWith(basePath))
+                        ? absolutePath.substring(basePath.length() + 1)
+                        : f.getName();
+                // Webview is HTML — use forward slashes so the textarea
+                // shows POSIX-style mentions even on Windows.
+                relativePath = relativePath.replace('\\', '/');
+                json.append("{\"name\":").append(JsonBuilder.jsonString(f.getName()));
+                json.append(",\"relativePath\":").append(JsonBuilder.jsonString(relativePath));
+                json.append(",\"absolutePath\":").append(JsonBuilder.jsonString(absolutePath));
+                json.append("}");
+            }
+            json.append("]}");
+            bridge.sendToWebview("file_suggestions", json.toString());
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] file_search failed: " + e.getMessage());
+            bridge.sendToWebview("file_suggestions", "{\"files\":[]}");
+        }
+    }
+
+    /** Recursive depth-first search skipping common ignore directories. */
+    private void searchFiles(java.io.File dir, java.io.File baseDir, String lowerQuery,
+                             java.util.List<java.io.File> results, int maxResults) {
+        if (results.size() >= maxResults) return;
+        java.io.File[] children = dir.listFiles();
+        if (children == null) return;
+        for (java.io.File child : children) {
+            if (results.size() >= maxResults) return;
+            String name = child.getName();
+            if (name.startsWith(".") || "node_modules".equals(name)
+                    || "build".equals(name) || "out".equals(name)
+                    || "target".equals(name) || "__pycache__".equals(name)
+                    || ".gradle".equals(name) || ".idea".equals(name)
+                    || "bin".equals(name)) {
+                continue;
+            }
+            if (child.isDirectory()) {
+                searchFiles(child, baseDir, lowerQuery, results, maxResults);
+            } else if (child.isFile()) {
+                String lowerName = name.toLowerCase();
+                String relPath = baseDir.toPath().relativize(child.toPath()).toString().toLowerCase();
+                if (lowerQuery.isEmpty() || lowerName.contains(lowerQuery) || relPath.contains(lowerQuery)) {
+                    results.add(child);
+                }
+            }
         }
     }
 
