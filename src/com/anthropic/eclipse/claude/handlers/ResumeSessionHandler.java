@@ -6,10 +6,11 @@ import org.eclipse.core.commands.ExecutionException;
 import org.eclipse.ui.IWorkbenchWindow;
 
 import com.anthropic.eclipse.claude.views.ClaudeConversationView;
+import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 /**
  * Handler to resume a previous Claude conversation session.
- * Delegates to ClaudeConversationView.showResumeDialog().
+ * Prefers the V2 webview; falls back to the legacy SWT view.
  */
 public class ResumeSessionHandler extends AbstractHandler {
 
@@ -18,9 +19,15 @@ public class ResumeSessionHandler extends AbstractHandler {
         IWorkbenchWindow window = HandlerUtils.getActiveWindow(event);
         if (window == null || window.getActivePage() == null) return null;
 
-        ClaudeConversationView view = HandlerUtils.getConversationView(window.getActivePage());
-        if (view != null) {
-            view.showResumeDialog();
+        // Prefer V2 (webview). Fall back to V1 if V2 unavailable.
+        ClaudeConversationViewV2 v2 = HandlerUtils.getConversationViewV2(window.getActivePage());
+        if (v2 != null) {
+            v2.showResumeDialog();
+            return null;
+        }
+        ClaudeConversationView v1 = HandlerUtils.getConversationView(window.getActivePage());
+        if (v1 != null) {
+            v1.showResumeDialog();
         }
         return null;
     }
