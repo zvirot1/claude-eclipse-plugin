@@ -1470,7 +1470,12 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             Map<String, Object> data = JsonParser.parseObject(payload);
             String editId = JsonParser.getString(data, "editId");
             if (editId == null || editDecisionManager == null) return;
-            editDecisionManager.acceptEdit(editId);
+            // applyToEditor=false: the CLI has already written the file to
+            // disk AND revertOpenEditor has refreshed the editor buffer.
+            // Calling document.set() a second time (which the V1
+            // single-arg acceptEdit does) would mark the buffer dirty
+            // (asterisk) without changing content — pure UI noise.
+            editDecisionManager.acceptEdit(editId, false);
             bridge.sendToWebview("toast",
                 "{\"message\":" + JsonBuilder.jsonString("Edit accepted: "
                     + java.nio.file.Paths.get(editId).getFileName()) + "}");
@@ -1593,9 +1598,18 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         try {
             Map<String, Object> data = JsonParser.parseObject(payload);
             String mode = JsonParser.getString(data, "mode");
-            if (mode != null) {
+            if (mode != null && !mode.equals(currentMode)) {
                 currentMode = mode;
+                // Persist so new conversations start with the same mode.
+                try {
+                    IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+                    prefs.setValue(PreferenceConstants.PERMISSION_MODE, mode);
+                } catch (Exception ignored) {}
                 bridge.sendToWebview("mode_changed", "{\"mode\":" + JsonBuilder.jsonString(mode) + "}");
+                // Hot-swap the running CLI so the new mode takes effect for
+                // the NEXT tool call. Without this, the toggle was a UI no-op
+                // until the user manually restarted the session — matches V1.
+                hotSwapCliForModeOrEffort();
             }
         } catch (Exception e) {
             Activator.logWarning("[Webview] change_mode failed: " + e.getMessage());
@@ -1606,10 +1620,58 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         try {
             Map<String, Object> data = JsonParser.parseObject(payload);
             String effort = JsonParser.getString(data, "effort");
-            currentEffort = (effort != null) ? effort : "";
+            String newEffort = (effort != null) ? effort : "";
+            if (newEffort.equals(currentEffort)) return;
+            currentEffort = newEffort;
+            // Persist so new conversations start with the same effort.
+            try {
+                IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+                prefs.setValue(PreferenceConstants.EFFORT_LEVEL, currentEffort);
+            } catch (Exception ignored) {}
             bridge.sendToWebview("effort_changed", "{\"effort\":" + JsonBuilder.jsonString(currentEffort) + "}");
+            // Hot-swap so the running CLI picks up the new effort.
+            hotSwapCliForModeOrEffort();
         } catch (Exception e) {
             Activator.logWarning("[Webview] change_effort failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Hot-swap the running CLI with the current mode/effort, preserving the
+     * session memory. Mirrors V1's {@code hotSwapCliForModeOrEffort}. Only
+     * restarts when the CLI is RUNNING or STARTING — otherwise the new
+     * values will be applied on the next start (the {@link #autoStartCli}
+     * and {@link #resumeSession} paths already read {@code currentMode} and
+     * {@code currentEffort}). Catches exceptions so a misconfigured effort
+     * string never breaks the UI.
+     */
+    private void hotSwapCliForModeOrEffort() {
+        if (cliManager == null) return;
+        try {
+            ClaudeCliManager.ProcessState state = cliManager.getState();
+            if (state != ClaudeCliManager.ProcessState.RUNNING
+                    && state != ClaudeCliManager.ProcessState.STARTING) {
+                return; // will be applied on next start
+            }
+            CliProcessConfig oldConfig = cliManager.getConfig();
+            if (oldConfig == null) return;
+
+            String sessionId = null;
+            try {
+                SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+                if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+                    sessionId = info.getSessionId();
+                }
+            } catch (Exception ignored) {}
+
+            CliProcessConfig newConfig = oldConfig.withModeAndEffort(
+                    cliPermissionModeFor(currentMode), currentEffort, sessionId);
+            cliManager.restartWithConfig(newConfig);
+        } catch (IllegalArgumentException e) {
+            bridge.sendToWebview("error", "{\"message\":"
+                    + JsonBuilder.jsonString("Invalid effort value: " + e.getMessage()) + "}");
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] hotSwapCliForModeOrEffort failed: " + e.getMessage());
         }
     }
 
@@ -2228,10 +2290,35 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         String firstMessage = text.trim();
         if (firstMessage.isEmpty()) return;
 
+        // Skip CLI-internal control messages (injected when slash commands
+        // like /compact, /review-pr run). These show up as user entries in
+        // the model but they are protocol metadata, not real user input —
+        // using them as the tab title produces names like
+        // "<local-command-caveat>Caveat:...". Do NOT consume partNameSet
+        // here so the NEXT real user message can become the title.
+        if (isCliInternalMessage(firstMessage)) {
+            return;
+        }
+
+        // Strip "[Active editor context: ...]" prefix that the plugin's
+        // input pipeline prepends to user messages — it's context for the
+        // model, not part of what the user typed.
+        firstMessage = firstMessage.replaceAll(
+                "(?is)^\\s*\\[Active editor context:[^\\]]*\\]\\s*", "");
+        firstMessage = firstMessage.trim();
+        if (firstMessage.isEmpty()) return;
+
+        // Rewrite known handler-prompt prefixes into short, file-aware
+        // titles ("Analyze: test.java" instead of "Please analyze this
+        // code from test.java:"). Falls through to the raw text if no
+        // handler prefix matches.
+        String titleSource = deriveHandlerTitle(firstMessage);
+        if (titleSource == null) titleSource = firstMessage;
+
         // Immediate fallback: truncated first message
-        String fallback = firstMessage.length() > 30
-                ? firstMessage.substring(0, 30) + "…"
-                : firstMessage;
+        String fallback = titleSource.length() > 30
+                ? titleSource.substring(0, 30) + "…"
+                : titleSource;
         partNameSet = true;
         final String finalFallback = fallback;
         Display d = (browser != null) ? browser.getDisplay() : Display.getDefault();
@@ -2241,7 +2328,9 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             });
         }
 
-        // Optional upgrade: self-generated 3-5 word topic title
+        // Optional upgrade: self-generated 3-5 word topic title (uses the
+        // ORIGINAL first message so the title-generator can reason about
+        // intent, not the abbreviated handler form).
         String strategy = "self_generated";
         try {
             strategy = Activator.getDefault().getPreferenceStore()
@@ -2251,6 +2340,70 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         if ("self_generated".equals(strategy)) {
             kickoffSelfGeneratedTitle(firstMessage);
         }
+    }
+
+    /**
+     * Returns {@code true} when {@code text} is a CLI-internal "user"
+     * entry — the CLI writes synthetic user messages wrapped in
+     * {@code <local-command-...>} / {@code <command-...>} tags as
+     * slash-command lifecycle metadata. These are protocol noise, not
+     * real user input, and must not be used as the tab title.
+     */
+    private static boolean isCliInternalMessage(String text) {
+        if (text == null) return false;
+        String trimmed = text.trim();
+        return trimmed.startsWith("<local-command-")
+            || trimmed.startsWith("<command-name>")
+            || trimmed.startsWith("<command-message>")
+            || trimmed.startsWith("<command-args>")
+            || trimmed.startsWith("<command-stderr>")
+            || trimmed.startsWith("<command-stdout>");
+    }
+
+    /**
+     * Rewrite the prompt prefix our handlers (Send Selection, Explain
+     * Code, Review Code, Refactor Code, Run CLI on File) prepend, into a
+     * short title like "Analyze: test.java". Returns {@code null} if the
+     * text doesn't match any known handler prefix — the caller falls back
+     * to the raw text. Patterns match {@code SendSelectionHandler},
+     * {@code ExplainCodeHandler}, {@code ReviewCodeHandler},
+     * {@code RefactorCodeHandler}, {@code RunCLIOnFileHandler}.
+     */
+    private static String deriveHandlerTitle(String text) {
+        if (text == null) return null;
+        // SendSelectionHandler: "Please analyze this code from <file>:"
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^Please analyze this code from\\s+([^:\\n]+):")
+                .matcher(text);
+        if (m.find()) return "Analyze: " + m.group(1).trim();
+        // RunCLIOnFileHandler: "Analyze this file (<file>):"
+        m = java.util.regex.Pattern
+                .compile("^Analyze this file\\s*\\(([^)]+)\\):")
+                .matcher(text);
+        if (m.find()) return "Analyze: " + m.group(1).trim();
+        // RunCLIOnFileHandler fallback: "Analyze the file at: <path>"
+        m = java.util.regex.Pattern
+                .compile("^Analyze the file at:\\s*(.+?)(?:\\n|$)")
+                .matcher(text);
+        if (m.find()) {
+            String path = m.group(1).trim();
+            int sep = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+            return "Analyze: " + (sep >= 0 ? path.substring(sep + 1) : path);
+        }
+        // ExplainCodeHandler: "Please explain what this code does, step by step:"
+        if (text.startsWith("Please explain what this code does")) {
+            return "Explain Code";
+        }
+        // ReviewCodeHandler: "Please review this code. Look for: ..."
+        if (text.startsWith("Please review this code")) {
+            return "Review Code";
+        }
+        // RefactorCodeHandler: "<instruction>\n\nFile: <file>"
+        m = java.util.regex.Pattern
+                .compile("(?s)^.*?\\n\\nFile:\\s*([^\\n]+)")
+                .matcher(text);
+        if (m.find()) return "Refactor: " + m.group(1).trim();
+        return null;
     }
 
     /**
@@ -2349,6 +2502,17 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         bridge.sendToWebview("tool_call_started", JsonBuilder.buildToolCallJson(toolCall));
     }
 
+    /**
+     * Tool calls that have already had their pre-edit staging widget
+     * emitted from {@link #onToolCallInputComplete}. We skip the
+     * post-edit emission for these in {@link #onToolCallCompleted} so
+     * the widget appears once, BEFORE the "Completed" status — matching
+     * IntelliJ behavior where the user sees the proposed change and
+     * decides Keep/Revert rather than reviewing an already-applied edit.
+     */
+    private final java.util.Set<String> preStagedEditToolIds =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     @Override
     public void onToolCallInputComplete(MessageBlock block, MessageBlock.ToolCallSegment toolCall) {
         // BEFORE the tool runs: snapshot the target file so we can show
@@ -2356,15 +2520,140 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         // completes. Without this snapshot, post-edit "View Diff" would
         // compare the file to itself (CLI has already overwritten it).
         String toolName = toolCall.getToolName();
-        if (toolName != null && ("Write".equals(toolName) || "Edit".equals(toolName)
-                || "MultiEdit".equals(toolName))) {
-            String filePath = extractFilePath(toolCall.getInput());
-            if (filePath != null) {
-                try {
-                    Activator.getDefault().getCheckpointManager().snapshot(filePath);
-                } catch (Exception ignored) {}
-            }
+        if (toolName == null) return;
+        boolean isEditTool = "Write".equals(toolName) || "Edit".equals(toolName)
+                || "MultiEdit".equals(toolName);
+        if (!isEditTool) return;
+
+        String filePath = extractFilePath(toolCall.getInput());
+        if (filePath == null) return;
+        try {
+            Activator.getDefault().getCheckpointManager().snapshot(filePath);
+        } catch (Exception ignored) {}
+
+        // In "Edit automatically" (acceptEdits) mode the user opted out of
+        // per-edit gates — don't render the widget. handleEditToolCompleted
+        // also skips for the same reason. The snapshot above is still
+        // taken so power-users can revert through other channels.
+        if ("acceptEdits".equals(currentMode)) {
+            return;
         }
+
+        // IntelliJ-style PRE-EDIT staging: compute the proposed content
+        // from the tool input and show the diff widget NOW, before the
+        // CLI executes the tool. The user sees "Claude wants to edit
+        // file.java" with [View Diff] [Accept] [Reject] BEFORE the
+        // edit's "Completed" status appears, so the modes feel distinct.
+        try {
+            preStageEdit(toolCall, filePath);
+        } catch (Exception e) {
+            Activator.logWarning("[Webview/Edit] preStageEdit failed: " + e.getMessage());
+            // Fall back to post-edit staging if pre-staging blew up.
+        }
+    }
+
+    /**
+     * Compute the proposed file content from {@code toolCall.input} and
+     * emit {@code edit_staged} so JS renders the widget BEFORE the CLI
+     * runs the tool. Reads the current on-disk content as the
+     * "original" (the snapshot we just took is identical at this point)
+     * and applies the Edit/Write/MultiEdit operation in-memory to
+     * produce the "modified" content. Records the pair with
+     * {@link EditDecisionManager} so View Diff / Revert work the same
+     * way as post-edit staging.
+     */
+    private void preStageEdit(MessageBlock.ToolCallSegment toolCall, String filePath)
+            throws Exception {
+        if (editDecisionManager == null) return;
+        String toolName = toolCall.getToolName();
+        String inputJson = toolCall.getInput();
+        if (inputJson == null || inputJson.isBlank()) return;
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> input = JsonParser.parseObject(inputJson);
+        if (input == null) return;
+
+        // Read CURRENT content (or "" for a brand-new Write).
+        java.nio.file.Path p = java.nio.file.Paths.get(filePath);
+        String original;
+        if (java.nio.file.Files.exists(p)) {
+            original = new String(java.nio.file.Files.readAllBytes(p),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } else {
+            original = "";
+        }
+
+        String proposed = computeProposedContent(toolName, original, input);
+        if (proposed == null) return;          // unsupported tool / unparsable input
+        if (proposed.equals(original)) return; // no-op edit
+
+        editDecisionManager.recordCompletedEdit(filePath, original, proposed, toolCall);
+        preStagedEditToolIds.add(toolCall.getToolId());
+
+        String fileName = p.getFileName().toString();
+        StringBuilder json = new StringBuilder("{");
+        json.append("\"editId\":").append(JsonBuilder.jsonString(filePath));
+        json.append(",\"filePath\":").append(JsonBuilder.jsonString(filePath));
+        json.append(",\"fileName\":").append(JsonBuilder.jsonString(fileName));
+        json.append(",\"toolName\":").append(JsonBuilder.jsonString(toolName));
+        json.append("}");
+        bridge.sendToWebview("edit_staged", json.toString());
+        Activator.logInfo("[Webview/Edit] PRE-STAGED file=" + fileName
+                + " (original=" + original.length() + " bytes, proposed=" + proposed.length()
+                + " bytes) toolId=" + toolCall.getToolId());
+    }
+
+    /**
+     * Apply the Edit/Write/MultiEdit operation in-memory and return the
+     * resulting content. Returns {@code null} when the input is
+     * malformed or the operation can't be performed (e.g., old_string
+     * not found in current content) so the caller can fall back to
+     * post-edit staging.
+     */
+    @SuppressWarnings("unchecked")
+    private String computeProposedContent(String toolName, String current,
+                                          Map<String, Object> input) {
+        if (input == null) return null;
+        if ("Write".equals(toolName)) {
+            String content = JsonParser.getString(input, "content");
+            return content == null ? "" : content;
+        }
+        if ("Edit".equals(toolName)) {
+            String oldStr = JsonParser.getString(input, "old_string");
+            String newStr = JsonParser.getString(input, "new_string");
+            if (oldStr == null || newStr == null) return null;
+            Object replaceAllObj = input.get("replace_all");
+            boolean replaceAll = (replaceAllObj instanceof Boolean) && (Boolean) replaceAllObj;
+            if (replaceAll) {
+                return current.replace(oldStr, newStr);
+            }
+            int idx = current.indexOf(oldStr);
+            if (idx < 0) return null; // old_string not found — can't pre-compute
+            return current.substring(0, idx) + newStr + current.substring(idx + oldStr.length());
+        }
+        if ("MultiEdit".equals(toolName)) {
+            Object editsObj = input.get("edits");
+            if (!(editsObj instanceof java.util.List)) return null;
+            String result = current;
+            for (Object e : (java.util.List<Object>) editsObj) {
+                if (!(e instanceof Map)) continue;
+                Map<String, Object> editMap = (Map<String, Object>) e;
+                String oldStr = JsonParser.getString(editMap, "old_string");
+                String newStr = JsonParser.getString(editMap, "new_string");
+                if (oldStr == null || newStr == null) return null;
+                Object replaceAllObj = editMap.get("replace_all");
+                boolean replaceAll = (replaceAllObj instanceof Boolean) && (Boolean) replaceAllObj;
+                if (replaceAll) {
+                    result = result.replace(oldStr, newStr);
+                } else {
+                    int idx = result.indexOf(oldStr);
+                    if (idx < 0) return null;
+                    result = result.substring(0, idx) + newStr + result.substring(idx + oldStr.length());
+                }
+            }
+            return result;
+        }
+        return null;
     }
 
     @Override
@@ -2382,11 +2671,142 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         bridge.sendToWebview("tool_call_completed", JsonBuilder.buildToolCallJson(toolCall));
 
         // Edit/Write/MultiEdit changed a file — stage the edit so the user
-        // can View Diff / Accept / Reject via the inline widget in JS.
+        // can View Diff / Accept / Reject via the inline widget in JS, AND
+        // refresh Eclipse's view of the file so the editor reflects what
+        // the CLI just wrote (without this, the editor buffer stays stale
+        // even though the file on disk has changed — V1 had this fix and
+        // V2 was missing it).
         String tn = toolCall.getToolName();
         if (tn != null && toolCall.getStatus() == MessageBlock.ToolStatus.COMPLETED
                 && ("Edit".equals(tn) || "Write".equals(tn) || "MultiEdit".equals(tn))) {
             handleEditToolCompleted(toolCall);
+            String path = extractFilePath(toolCall.getInput());
+            if (path != null && !path.isEmpty()) {
+                refreshSingleFileAsync(path);
+            }
+        }
+    }
+
+    /**
+     * Refresh Eclipse's workspace view of a single OS file path after the
+     * CLI wrote it externally. Without this the editor shows the previous
+     * (cached) buffer content even though the file on disk has changed —
+     * users see "Edit completed" but no visible change in the open
+     * editor. Ported from V1's identical method. Gated by the
+     * {@code AUTO_REFRESH_WORKSPACE} preference and runs on a
+     * background {@link org.eclipse.core.resources.WorkspaceJob} so the
+     * UI thread is never blocked by potentially-slow z-OS / network
+     * filesystem walks.
+     */
+    private void refreshSingleFileAsync(String osPath) {
+        if (osPath == null || osPath.isEmpty()) return;
+        try {
+            if (!Activator.getDefault().getPreferenceStore()
+                    .getBoolean(PreferenceConstants.AUTO_REFRESH_WORKSPACE)) {
+                return;
+            }
+        } catch (Throwable ignored) {
+            // If the preference isn't defined yet, default to refreshing —
+            // a stale editor is a worse UX than a brief refresh.
+        }
+        final String pathSnapshot = osPath;
+        // STEP 1 — on the UI thread, find any open editor for this path and
+        // discard its in-memory buffer in favor of the on-disk content.
+        // Eclipse's default auto-refresh dialog ("File has been changed.
+        // Replace editor contents?") fires whenever the editor buffer
+        // differs from disk AT THE MOMENT THE WORKSPACE LEARNS OF THE
+        // CHANGE — but in our case the CLI just deliberately wrote the
+        // disk version, so prompting the user is noise. doRevertToSaved
+        // reloads the editor from disk WITHOUT the prompt and marks the
+        // buffer clean.
+        Display d = (browser != null && !browser.isDisposed())
+                ? browser.getDisplay() : Display.getDefault();
+        if (d != null && !d.isDisposed()) {
+            d.asyncExec(() -> revertOpenEditor(pathSnapshot));
+        }
+        // STEP 2 — background WorkspaceJob refreshes Eclipse's workspace
+        // metadata (so the Project Explorer + decorators pick up the
+        // change too). Refresh happens on a system job so the UI thread
+        // is never blocked by a potentially-slow filesystem walk.
+        org.eclipse.core.resources.WorkspaceJob job =
+            new org.eclipse.core.resources.WorkspaceJob("Claude: refresh edited file") {
+                @Override
+                public org.eclipse.core.runtime.IStatus runInWorkspace(
+                        org.eclipse.core.runtime.IProgressMonitor monitor) {
+                    try {
+                        org.eclipse.core.runtime.IPath p =
+                                new org.eclipse.core.runtime.Path(pathSnapshot);
+                        org.eclipse.core.resources.IWorkspaceRoot root =
+                                ResourcesPlugin.getWorkspace().getRoot();
+                        IFile f = root.getFileForLocation(p);
+                        if (f != null && f.exists()) {
+                            f.refreshLocal(
+                                org.eclipse.core.resources.IResource.DEPTH_ZERO, monitor);
+                            return org.eclipse.core.runtime.Status.OK_STATUS;
+                        }
+                        org.eclipse.core.resources.IContainer parent =
+                                root.getContainerForLocation(p.removeLastSegments(1));
+                        if (parent != null && parent.exists()) {
+                            parent.refreshLocal(
+                                org.eclipse.core.resources.IResource.DEPTH_ONE, monitor);
+                        }
+                    } catch (Throwable e) {
+                        Activator.logWarning("[Webview/Refresh] failed path=" + pathSnapshot
+                                + " err=" + e.getMessage());
+                    }
+                    return org.eclipse.core.runtime.Status.OK_STATUS;
+                }
+            };
+        job.setSystem(true);
+        job.setUser(false);
+        job.schedule();
+    }
+
+    /**
+     * If an editor is currently open on the given OS file path, reload it
+     * from disk and mark its buffer clean. This suppresses the "File has
+     * been changed. Replace editor contents?" prompt Eclipse would
+     * otherwise show whenever the buffer differs from disk — appropriate
+     * here because the CLI's deliberate write IS what we want the editor
+     * to show. Falls through silently if no editor is open for the path.
+     * Must run on the UI thread.
+     */
+    private void revertOpenEditor(String osPath) {
+        try {
+            org.eclipse.core.runtime.IPath p =
+                    new org.eclipse.core.runtime.Path(osPath);
+            org.eclipse.core.resources.IWorkspaceRoot root =
+                    ResourcesPlugin.getWorkspace().getRoot();
+            IFile target = root.getFileForLocation(p);
+            if (target == null) return;
+
+            org.eclipse.ui.IWorkbench wb = org.eclipse.ui.PlatformUI.getWorkbench();
+            if (wb == null) return;
+            for (org.eclipse.ui.IWorkbenchWindow w : wb.getWorkbenchWindows()) {
+                if (w == null) continue;
+                for (org.eclipse.ui.IWorkbenchPage page : w.getPages()) {
+                    if (page == null) continue;
+                    for (org.eclipse.ui.IEditorReference ref : page.getEditorReferences()) {
+                        try {
+                            org.eclipse.ui.IEditorInput in = ref.getEditorInput();
+                            if (!(in instanceof org.eclipse.ui.IFileEditorInput)) continue;
+                            IFile editorFile = ((org.eclipse.ui.IFileEditorInput) in).getFile();
+                            if (!target.equals(editorFile)) continue;
+                            org.eclipse.ui.IEditorPart editor = ref.getEditor(false);
+                            if (editor == null) continue;
+                            if (editor instanceof org.eclipse.ui.texteditor.ITextEditor) {
+                                ((org.eclipse.ui.texteditor.ITextEditor) editor).doRevertToSaved();
+                                Activator.logInfo("[Webview/Refresh] reverted editor to disk: "
+                                        + editorFile.getName());
+                            }
+                        } catch (Exception ignored) {
+                            // best-effort per-editor
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Activator.logWarning("[Webview/Refresh] revertOpenEditor failed: " + e.getMessage());
         }
     }
 
@@ -2399,6 +2819,23 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
      */
     private void handleEditToolCompleted(MessageBlock.ToolCallSegment toolCall) {
         if (editDecisionManager == null) return;
+        // In "Edit automatically" (acceptEdits) mode the user has explicitly
+        // opted out of any per-edit UI gate — surfacing the [View Diff]
+        // [Accept] [Reject] staging widget defeats the point and reads as a
+        // permission prompt for an edit that already landed. Skip the
+        // staging widget entirely; the CheckpointManager snapshot is still
+        // taken in onToolCallInputComplete, so power-users can still revert
+        // through other paths.
+        if ("acceptEdits".equals(currentMode)) {
+            return;
+        }
+        // If we already pre-staged this edit at onToolCallInputComplete
+        // (the IntelliJ-style flow), the widget is already up. Don't
+        // emit a duplicate edit_staged event — that would double-render
+        // the widget and produce a confusing "two diffs" effect.
+        if (preStagedEditToolIds.remove(toolCall.getToolId())) {
+            return;
+        }
         try {
             String input = toolCall.getInput();
             String filePath = extractFilePath(input);
