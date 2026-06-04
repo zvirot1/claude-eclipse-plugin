@@ -124,14 +124,37 @@ public class EditDecisionManager {
 
     /**
      * Accept and apply the edit to the Eclipse editor.
+     *
+     * <p>Equivalent to {@link #acceptEdit(String, boolean) acceptEdit(filePath, true)}
+     * — used by the legacy V1 view where the staging widget represents
+     * a proposed (not-yet-written) change and the editor document needs
+     * to be updated explicitly on Accept.
      */
     public void acceptEdit(String filePath) {
+        acceptEdit(filePath, true);
+    }
+
+    /**
+     * Accept the edit, optionally applying it to the Eclipse editor.
+     *
+     * @param applyToEditor when {@code true}, write the edit's modified
+     *     content into the open editor's document (V1 behavior). When
+     *     {@code false}, just mark the edit accepted and notify listeners
+     *     — used by the V2 webview view where the CLI has already
+     *     written the file to disk and {@code revertOpenEditor} has
+     *     already refreshed the editor buffer; calling
+     *     {@code document.set()} a second time would mark the buffer
+     *     dirty (asterisk) for no functional benefit.
+     */
+    public void acceptEdit(String filePath, boolean applyToEditor) {
         PendingEdit edit = pendingEdits.get(filePath);
         if (edit == null || edit.getState() != EditState.PENDING) return;
 
         edit.setState(EditState.ACCEPTED);
         removeAnnotations(filePath);
-        applyToDocument(edit);
+        if (applyToEditor) {
+            applyToDocument(edit);
+        }
 
         for (EditDecisionListener l : listeners) {
             l.onEditAccepted(edit);
