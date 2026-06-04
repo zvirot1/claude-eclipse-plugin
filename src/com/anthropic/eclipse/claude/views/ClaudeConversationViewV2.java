@@ -115,6 +115,21 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
     /** Last active file path pushed to the webview — used to dedup. */
     private volatile String lastActiveFilePath;
 
+    /** Files attached via the 📎 button (or future @-mention attach path).
+     *  Rendered as chips in the webview's #file-chips and prepended as
+     *  &lt;file path="…"&gt;…&lt;/file&gt; blocks to the outgoing message. */
+    private final java.util.List<AttachedFile> attachedFiles = new java.util.ArrayList<>();
+
+    /** Plain holder for a user-attached file (separate from images). */
+    private static final class AttachedFile {
+        final String path;
+        final String label;
+        final byte[] bytes;
+        AttachedFile(String path, String label, byte[] bytes) {
+            this.path = path; this.label = label; this.bytes = bytes;
+        }
+    }
+
     @Override
     public void init(org.eclipse.ui.IViewSite site, org.eclipse.ui.IMemento memento)
             throws org.eclipse.ui.PartInitException {
@@ -597,6 +612,29 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             case "fork_from_message":
                 handleForkFromMessage(payload);
                 break;
+            case "attach_file_dialog":
+                handleAttachFileDialog();
+                break;
+            case "remove_attachment":
+                handleRemoveAttachment(payload);
+                break;
+            case "attach_file_bytes":
+                // JS dropped a non-image file onto the webview; it read
+                // the bytes via FileReader (browser sandboxed it so we
+                // don't get a real OS path), and now wants us to add it
+                // as a chip. We don't have a path, so use the file name
+                // for both the chip label and the <file> block path.
+                handleAttachFileBytes(payload);
+                break;
+            case "paste_attach_files_from_clipboard":
+                // JS triggers this on EVERY Ctrl+V in the textarea. We
+                // probe SWT FileTransfer ONLY — text/image already
+                // handled by the browser natively. If files are found,
+                // attach them as chips.
+                org.eclipse.swt.widgets.Display d2 =
+                    (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+                d2.asyncExec(this::probeSwtClipboardForFiles);
+                break;
             case "accept_edit":
                 handleAcceptEdit(payload);
                 break;
@@ -633,32 +671,66 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         try {
             Map<String, Object> data = JsonParser.parseObject(payload);
             String message = JsonParser.getString(data, "message");
-            if (message == null || message.isEmpty()) return;
+            // Images (from clipboard paste, drag-drop, or attach menu) —
+            // base64-encoded PNG/JPG bytes that the CLI can ingest via the
+            // rich user_input NDJSON variant.
+            java.util.List<byte[]> images = new java.util.ArrayList<>();
+            java.util.List<String> imageNames = new java.util.ArrayList<>();
+            Object imgList = (data != null) ? data.get("images") : null;
+            if (imgList instanceof java.util.List) {
+                for (Object item : (java.util.List<?>) imgList) {
+                    if (item instanceof String) {
+                        try {
+                            images.add(java.util.Base64.getDecoder().decode((String) item));
+                            imageNames.add("clipboard.png");
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+            if ((message == null || message.isEmpty()) && images.isEmpty()) return;
 
-            // The webview bubble shows ONLY what the user typed.
-            model.addUserMessage(message);
+            // The webview bubble shows ONLY what the user typed (+ inline
+            // image thumbnails via ImageSegment).
+            model.addUserMessage(message == null ? "" : message, images, imageNames);
 
-            // If the active-file chip is enabled (JS sets includeActiveFile
-            // based on chip visibility), prepend a <file path="…">…</file>
-            // context block to what we send to the CLI — matches V1's
-            // buildActiveFilePinContext behaviour. The chip in app.js
-            // already filtered out dismissed paths and disabled state.
+            // If the active-file chip is enabled, prepend a
+            // <file path="…">…</file> context block (V1 parity).
             boolean includeActiveFile = false;
             Object iaf = (data != null) ? data.get("includeActiveFile") : null;
             if (iaf instanceof Boolean) includeActiveFile = (Boolean) iaf;
-            String outgoing = message;
+            String textForCli = message == null ? "" : message;
             if (includeActiveFile) {
                 String ctx = buildActiveFilePinContext();
                 if (ctx != null && !ctx.isEmpty()) {
-                    outgoing = ctx + message;
+                    textForCli = ctx + textForCli;
                 }
+            }
+            // Prepend user-attached files (from the 📎 menu) — their
+            // <file> blocks come BEFORE the message so Claude reads them
+            // as established context, then the message as a follow-up.
+            String attachedCtx = buildAttachedFilesContext();
+            if (!attachedCtx.isEmpty()) {
+                textForCli = attachedCtx + textForCli;
             }
 
             if (!cliManager.isRunning()) {
                 autoStartCli();
             }
             if (cliManager.isRunning()) {
-                cliManager.sendMessage(outgoing);
+                if (!images.isEmpty()) {
+                    // Rich NDJSON variant — text + base64 image bytes.
+                    cliManager.sendRawNdjson(
+                        com.anthropic.eclipse.claude.cli.CliMessage
+                            .createUserInputJsonRich(textForCli, images));
+                } else {
+                    cliManager.sendMessage(textForCli);
+                }
+                // Clear attachments AFTER successful send so the next
+                // message doesn't accidentally re-include them.
+                if (!attachedFiles.isEmpty()) {
+                    attachedFiles.clear();
+                    pushAttachmentsToWebview();
+                }
             } else {
                 bridge.sendToWebview("error",
                     "{\"message\":" + JsonBuilder.jsonString("Claude CLI is not running.") + "}");
@@ -668,6 +740,296 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             bridge.sendToWebview("error",
                 "{\"message\":" + JsonBuilder.jsonString("Failed to send message: " + e.getMessage()) + "}");
         }
+    }
+
+    /**
+     * Click on the paperclip / attach button in the webview header.
+     * Shows a popup menu next to the cursor with two options — matches
+     * V1's menu ("Add workspace file..." / "Paste image from clipboard")
+     * so the user can choose which source to pull from, even when both
+     * the clipboard has an image AND they want to pick a different file.
+     */
+    private void handleAttachFileDialog() {
+        org.eclipse.swt.widgets.Display d =
+            (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+        d.asyncExec(() -> {
+            try {
+                org.eclipse.swt.widgets.Menu menu =
+                    new org.eclipse.swt.widgets.Menu(getViewSite().getShell(), org.eclipse.swt.SWT.POP_UP);
+
+                org.eclipse.swt.widgets.MenuItem fileItem =
+                    new org.eclipse.swt.widgets.MenuItem(menu, org.eclipse.swt.SWT.PUSH);
+                fileItem.setText("Add file...");
+                fileItem.addListener(org.eclipse.swt.SWT.Selection, e -> openAttachFileDialog());
+
+                org.eclipse.swt.widgets.MenuItem pasteItem =
+                    new org.eclipse.swt.widgets.MenuItem(menu, org.eclipse.swt.SWT.PUSH);
+                pasteItem.setText("Paste from clipboard (image / files)");
+                pasteItem.addListener(org.eclipse.swt.SWT.Selection, e -> {
+                    if (!pasteFromSwtClipboard()) {
+                        bridge.sendToWebview("toast",
+                            "{\"message\":" + JsonBuilder.jsonString(
+                                "Nothing to paste — clipboard has no image or files.") + "}");
+                    }
+                });
+
+                // Anchor the menu at the current cursor — the webview
+                // can't tell SWT where the button is, but the cursor was
+                // just over the button when it was clicked, so this is
+                // a natural anchor.
+                org.eclipse.swt.graphics.Point pt = d.getCursorLocation();
+                menu.setLocation(pt.x, pt.y);
+                menu.setVisible(true);
+            } catch (Exception e) {
+                Activator.logError("[Webview] attach_file_dialog failed", e);
+            }
+        });
+    }
+
+    /** Remove a chip-rendered attachment by index when the user clicks
+     *  the × on the chip in the webview. */
+    private void handleRemoveAttachment(String payload) {
+        try {
+            Map<String, Object> data = JsonParser.parseObject(payload);
+            Object idxObj = (data != null) ? data.get("index") : null;
+            if (!(idxObj instanceof Number)) return;
+            int idx = ((Number) idxObj).intValue();
+            if (idx >= 0 && idx < attachedFiles.size()) {
+                attachedFiles.remove(idx);
+                pushAttachmentsToWebview();
+            }
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] remove_attachment failed: " + e.getMessage());
+        }
+    }
+
+    /** Open SWT FileDialog (multi-select) for the "Add file..." menu item. */
+    private void openAttachFileDialog() {
+        try {
+            org.eclipse.swt.widgets.FileDialog dlg =
+                new org.eclipse.swt.widgets.FileDialog(
+                    getViewSite().getShell(),
+                    org.eclipse.swt.SWT.OPEN | org.eclipse.swt.SWT.MULTI);
+            dlg.setText("Attach files to Claude");
+            String workDir = getDefaultWorkingDirectory();
+            if (workDir != null) dlg.setFilterPath(workDir);
+            if (dlg.open() == null) return; // user cancelled
+            String[] names = dlg.getFileNames();
+            String dir = dlg.getFilterPath();
+            if (names == null || names.length == 0) return;
+            for (String name : names) {
+                java.io.File f = new java.io.File(dir, name);
+                if (f.exists() && f.isFile()) attachOneFile(f);
+            }
+        } catch (Exception e) {
+            Activator.logError("[Webview] openAttachFileDialog failed", e);
+        }
+    }
+
+    /**
+     * Probe SWT clipboard for FILE references only (no images, no text).
+     * Used as a complement to the JS native onpaste handler — the JS
+     * handles text+images, and this catches OS-level file copies
+     * (Explorer / Finder → Ctrl+V) which the browser cannot see.
+     */
+    /** Decode a base64-encoded file body sent by JS (drag-drop of a
+     *  non-image file) and add it to the attachedFiles list. */
+    private void handleAttachFileBytes(String payload) {
+        try {
+            Map<String, Object> data = JsonParser.parseObject(payload);
+            String name = JsonParser.getString(data, "name");
+            String b64 = JsonParser.getString(data, "bytes");
+            if (name == null || b64 == null) return;
+            byte[] bytes;
+            try {
+                bytes = java.util.Base64.getDecoder().decode(b64);
+            } catch (IllegalArgumentException e) {
+                Activator.logWarning("[Webview/Attach] attach_file_bytes: bad base64 for " + name);
+                return;
+            }
+            // No real OS path available (browser sandboxed the drop).
+            // Use the name as the displayed path; <file> block will still
+            // be valid context for Claude.
+            attachedFiles.add(new AttachedFile(name, name, bytes));
+            pushAttachmentsToWebview();
+            Activator.logInfo("[Webview/Attach] file bytes attached: " + name
+                + " (" + bytes.length + " bytes)");
+        } catch (Exception e) {
+            Activator.logWarning("[Webview/Attach] attach_file_bytes failed: " + e.getMessage());
+        }
+    }
+
+    private void probeSwtClipboardForFiles() {
+        try {
+            org.eclipse.swt.dnd.Clipboard cb = new org.eclipse.swt.dnd.Clipboard(
+                org.eclipse.swt.widgets.Display.getCurrent());
+            try {
+                Object contents = cb.getContents(org.eclipse.swt.dnd.FileTransfer.getInstance());
+                if (!(contents instanceof String[])) return;
+                String[] paths = (String[]) contents;
+                int attached = 0;
+                for (String p : paths) {
+                    if (p == null || p.isEmpty()) continue;
+                    java.io.File f = new java.io.File(p);
+                    if (f.exists() && f.isFile()) {
+                        attachOneFile(f);
+                        attached++;
+                    }
+                }
+                if (attached > 0) {
+                    Activator.logInfo("[Webview/Paste] attached " + attached
+                        + " file(s) from OS clipboard");
+                }
+            } finally {
+                cb.dispose();
+            }
+        } catch (Exception e) {
+            Activator.logWarning("[Webview/Paste] SWT clipboard file probe failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Probe the SWT clipboard for content the user can attach and route
+     * it through the right pipeline:
+     * <ul>
+     *   <li>Image data (e.g. Win+Shift+S screenshot, Snipping Tool) →
+     *       paste_from_clipboard {kind:"image"} → thumbnail chip</li>
+     *   <li>File references (Copy from File Explorer) → call
+     *       {@link #attachOneFile(File)} for each, which adds chips or
+     *       image thumbnails as appropriate</li>
+     * </ul>
+     * Returns true if anything was found and dispatched. Unlike V1 and
+     * IntelliJ — which only handle images — V2 also handles file
+     * references, so a user can Copy a file in Explorer then attach it
+     * with one paste.
+     */
+    private boolean pasteFromSwtClipboard() {
+        try {
+            org.eclipse.swt.dnd.Clipboard cb = new org.eclipse.swt.dnd.Clipboard(
+                org.eclipse.swt.widgets.Display.getCurrent());
+            try {
+                // 1) Image data first — most common "Ctrl+V to attach screenshot" UX.
+                Object imgContents = cb.getContents(org.eclipse.swt.dnd.ImageTransfer.getInstance());
+                if (imgContents instanceof org.eclipse.swt.graphics.ImageData) {
+                    org.eclipse.swt.graphics.ImageData imgData =
+                        (org.eclipse.swt.graphics.ImageData) imgContents;
+                    org.eclipse.swt.graphics.ImageLoader loader =
+                        new org.eclipse.swt.graphics.ImageLoader();
+                    loader.data = new org.eclipse.swt.graphics.ImageData[] { imgData };
+                    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+                    loader.save(out, org.eclipse.swt.SWT.IMAGE_PNG);
+                    String b64 = java.util.Base64.getEncoder().encodeToString(out.toByteArray());
+                    bridge.sendToWebview("paste_from_clipboard",
+                        "{\"kind\":\"image\",\"mediaType\":\"image/png\",\"bytes\":"
+                        + JsonBuilder.jsonString(b64) + "}");
+                    return true;
+                }
+                // 2) File references (Copy in File Explorer / Finder).
+                Object fileContents = cb.getContents(org.eclipse.swt.dnd.FileTransfer.getInstance());
+                if (fileContents instanceof String[]) {
+                    String[] paths = (String[]) fileContents;
+                    int attached = 0;
+                    for (String p : paths) {
+                        if (p == null || p.isEmpty()) continue;
+                        java.io.File f = new java.io.File(p);
+                        if (f.exists() && f.isFile()) {
+                            attachOneFile(f);
+                            attached++;
+                        }
+                    }
+                    if (attached > 0) return true;
+                }
+                return false;
+            } finally {
+                cb.dispose();
+            }
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] SWT clipboard probe failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Attach a single file as a chip in the input area.
+     *
+     * <p>Images go through the existing image-attachment pipeline (they
+     * show as thumbnails AND get sent as actual image bytes via the
+     * rich NDJSON variant so Claude can SEE them).
+     *
+     * <p>Non-image files (text, source code, configs, etc.) get added
+     * to {@link #attachedFiles} and shown as a chip in #file-chips;
+     * their content is prepended as a {@code <file>} block on the
+     * next send. Matches V1's "Add workspace file..." behaviour:
+     * file shows as a chip, content is part of the prompt context,
+     * never pasted into the textarea.
+     */
+    private void attachOneFile(java.io.File f) {
+        try {
+            String name = f.getName();
+            String lower = name.toLowerCase();
+            byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
+            if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                    || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp")) {
+                // Image: reuse the existing paste_from_clipboard path that
+                // adds the image as a thumbnail chip and sends bytes with
+                // the next message.
+                String media = lower.endsWith(".png") ? "image/png"
+                    : (lower.endsWith(".gif") ? "image/gif"
+                    : (lower.endsWith(".webp") ? "image/webp" : "image/jpeg"));
+                String b64 = java.util.Base64.getEncoder().encodeToString(bytes);
+                bridge.sendToWebview("paste_from_clipboard",
+                    "{\"kind\":\"image\",\"mediaType\":" + JsonBuilder.jsonString(media)
+                    + ",\"bytes\":" + JsonBuilder.jsonString(b64) + "}");
+                return;
+            }
+            // Non-image: track server-side, render chip in webview.
+            attachedFiles.add(new AttachedFile(f.getAbsolutePath(), name, bytes));
+            pushAttachmentsToWebview();
+        } catch (Exception e) {
+            Activator.logWarning("[Webview/Attach] failed to read " + f.getName()
+                + ": " + e.getMessage());
+            bridge.sendToWebview("toast", "{\"message\":"
+                + JsonBuilder.jsonString("Failed to attach: " + e.getMessage()) + "}");
+        }
+    }
+
+    /** Push the current attachments list to the webview so it can render
+     *  the chips in #file-chips. The {label, path} shape matches what JS
+     *  expects in handleAttachmentsUpdated. */
+    private void pushAttachmentsToWebview() {
+        StringBuilder json = new StringBuilder("{\"attachments\":[");
+        for (int i = 0; i < attachedFiles.size(); i++) {
+            if (i > 0) json.append(",");
+            AttachedFile af = attachedFiles.get(i);
+            json.append("{\"label\":").append(JsonBuilder.jsonString(af.label));
+            json.append(",\"path\":").append(JsonBuilder.jsonString(af.path));
+            json.append("}");
+        }
+        json.append("]}");
+        bridge.sendToWebview("attachments_updated", json.toString());
+    }
+
+    /** Build the {@code <file>…</file>} context blocks for all currently
+     *  attached files, in the order they were added. */
+    private String buildAttachedFilesContext() {
+        if (attachedFiles.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (AttachedFile af : attachedFiles) {
+            try {
+                String content = new String(af.bytes, java.nio.charset.StandardCharsets.UTF_8);
+                final int MAX = 64 * 1024;
+                String truncatedNote = "";
+                if (content.length() > MAX) {
+                    content = content.substring(0, MAX);
+                    truncatedNote = "\n... (truncated to 64KB)";
+                }
+                sb.append("<file path=\"").append(af.path).append("\" attached=\"user\">\n");
+                sb.append(content).append(truncatedNote);
+                if (!content.endsWith("\n")) sb.append("\n");
+                sb.append("</file>\n\n");
+            } catch (Exception ignored) {}
+        }
+        return sb.toString();
     }
 
     /**
@@ -882,14 +1244,32 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                         new com.anthropic.eclipse.claude.views.MemoryDialog(shell, workDir).open(); break;
                     case "/skills":
                         new com.anthropic.eclipse.claude.views.SkillsDialog(shell).open(); break;
-                    case "/cost":
-                    case "/model":
-                        // V2 doesn't yet have dedicated UIs for these —
-                        // surface a toast so the user knows it's a known
-                        // command but not wired up.
-                        bridge.sendToWebview("toast", "{\"message\":"
-                            + JsonBuilder.jsonString(cmd + " is not yet wired in V2 — use the CLI.") + "}");
+                    case "/cost": {
+                        UsageInfo u = (model != null) ? model.getCumulativeUsage() : null;
+                        StringBuilder sb = new StringBuilder("Token usage & cost\n\n");
+                        if (u == null || u.getTotalTokens() == 0) {
+                            sb.append("No usage yet in this session.");
+                        } else {
+                            sb.append("Tokens:   ").append(u.formatTokens()).append("\n");
+                            sb.append("Cost:     ").append(u.formatCost()).append("\n");
+                            sb.append("Duration: ").append(u.formatDuration()).append("\n");
+                            sb.append("Turns:    ").append(u.getTotalTurns());
+                        }
+                        bridge.sendToWebview("system_message",
+                            "{\"text\":" + JsonBuilder.jsonString(sb.toString()) + "}");
                         break;
+                    }
+                    case "/model": {
+                        SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+                        String cur = (info != null && info.getModel() != null)
+                            ? info.getModel() : "(unknown)";
+                        bridge.sendToWebview("system_message",
+                            "{\"text\":" + JsonBuilder.jsonString(
+                                "Current model: " + cur
+                                + "\n\nTo switch models, edit Window > Preferences > Claude AI > Model "
+                                + "and start a new conversation.") + "}");
+                        break;
+                    }
                     default:
                         Activator.logInfo("[Webview] unhandled local slash: " + cmd);
                 }
@@ -1754,6 +2134,24 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
 
     @Override
     public void onUserMessageAdded(MessageBlock block) {
+        // Filter CLI-internal user entries (the synthetic ones the CLI
+        // writes for slash-command lifecycle wrapped in <local-command-*>
+        // / <command-*> tags). They're protocol metadata, not real user
+        // input, and surfacing them just confuses the chat transcript.
+        if (block != null) {
+            String t = block.getFullText();
+            if (t != null) {
+                String trimmed = t.trim();
+                if (trimmed.startsWith("<local-command-")
+                        || trimmed.startsWith("<command-name>")
+                        || trimmed.startsWith("<command-message>")
+                        || trimmed.startsWith("<command-args>")
+                        || trimmed.startsWith("<command-stderr>")
+                        || trimmed.startsWith("<command-stdout>")) {
+                    return;
+                }
+            }
+        }
         bridge.sendToWebview("user_message_added", JsonBuilder.buildMessageBlockJson(block));
         maybeUpdateTabTitle(block);
     }
