@@ -14,7 +14,7 @@ public class OpenConversationHandler extends AbstractHandler {
     public Object execute(ExecutionEvent event) throws ExecutionException {
         IWorkbenchWindow window = HandlerUtils.getActiveWindow(event);
         if (window != null && window.getActivePage() != null) {
-            HandlerUtils.getConversationView(window.getActivePage());
+            HandlerUtils.openPrimaryView(window.getActivePage());
         }
         return null;
     }

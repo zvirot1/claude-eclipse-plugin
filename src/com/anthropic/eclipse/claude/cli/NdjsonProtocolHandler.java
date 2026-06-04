@@ -225,8 +225,30 @@ public class NdjsonProtocolHandler {
                 Map<String, Object> rlInfo = JsonParser.getMap(json, "rate_limit_info");
                 String rlStatus = JsonParser.getString(rlInfo, "status");
                 String rlOverage = JsonParser.getString(rlInfo, "overageStatus");
-                Activator.logInfo("[NDJSON] rate_limit_event: status=" + rlStatus
-                    + " overageStatus=" + rlOverage);
+                // Explain what these values mean — devs reading the log
+                // shouldn't have to guess. The "rejected" overageStatus
+                // is the case that actually breaks user-facing flows.
+                if ("rejected".equalsIgnoreCase(rlOverage)) {
+                    Activator.logWarning("[NDJSON] rate_limit_event: status=" + rlStatus
+                        + " overageStatus=REJECTED  --  Bedrock proxy (Bank Leumi) "
+                        + "rejected the OVERAGE allowance for this account/region. "
+                        + "The current model turn may terminate prematurely - "
+                        + "any tool_call_started without a matching tool_call_completed "
+                        + "will be marked 'Aborted' by the webview cleanup when "
+                        + "result_received arrives. This is an INFRASTRUCTURE limit, "
+                        + "NOT a plugin bug. Mitigation: wait for quota to refresh, "
+                        + "switch model, or ask IT to raise the overage allowance.");
+                } else if ("approved".equalsIgnoreCase(rlOverage)) {
+                    Activator.logInfo("[NDJSON] rate_limit_event: status=" + rlStatus
+                        + " overageStatus=approved (Bedrock granted overage; "
+                        + "turn proceeding above base quota).");
+                } else {
+                    Activator.logInfo("[NDJSON] rate_limit_event: status=" + rlStatus
+                        + " overageStatus=" + rlOverage
+                        + " (status: 'allowed'=under quota, 'approaching'=near limit, "
+                        + "'exceeded'=hit limit; overageStatus reflects whether the "
+                        + "proxy permits going past the base quota for this turn).");
+                }
                 CliMessage.RateLimitEvent rlEvent = new CliMessage.RateLimitEvent();
                 rlEvent.setStatus(rlStatus);
                 rlEvent.setOverageStatus(rlOverage);
