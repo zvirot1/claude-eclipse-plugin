@@ -4,11 +4,13 @@ import org.eclipse.core.commands.*;
 import org.eclipse.ui.*;
 import org.eclipse.core.resources.*;
 import org.eclipse.swt.widgets.Display;
+
 import com.anthropic.eclipse.claude.views.ClaudeConversationView;
+import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 /**
  * Runs Claude Code CLI on the currently open file.
- * Opens the ConversationView and sends the file for analysis.
+ * Prefers the V2 webview; falls back to the legacy SWT view.
  */
 public class RunCLIOnFileHandler extends AbstractHandler {
 
@@ -33,18 +35,36 @@ public class RunCLIOnFileHandler extends AbstractHandler {
             String filePath = file.getLocation().toOSString();
             String fileName = file.getName();
 
-            ClaudeConversationView view = HandlerUtils.getConversationView(page);
-            if (view != null) {
-                // Read file content and send to Claude
-                try {
-                    String content = new String(
-                        java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
-                        java.nio.charset.StandardCharsets.UTF_8
-                    );
-                    view.sendCode("Analyze this file (" + fileName + "):", content);
-                } catch (Exception e) {
-                    view.sendCode("Analyze the file at: " + filePath, "");
-                }
+            // Read file content (best-effort).
+            String content = null;
+            try {
+                content = new String(
+                    java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
+                    java.nio.charset.StandardCharsets.UTF_8
+                );
+            } catch (Exception ignored) {
+                // fall through; we'll send the path instead
+            }
+
+            String prompt;
+            String code;
+            if (content != null) {
+                prompt = "Analyze this file (" + fileName + "):";
+                code = content;
+            } else {
+                prompt = "Analyze the file at: " + filePath;
+                code = "";
+            }
+
+            // Prefer V2 (webview). Fall back to V1 if V2 unavailable.
+            ClaudeConversationViewV2 v2 = HandlerUtils.getConversationViewV2(page);
+            if (v2 != null) {
+                v2.sendCode(prompt, code);
+                return null;
+            }
+            ClaudeConversationView v1 = HandlerUtils.getConversationView(page);
+            if (v1 != null) {
+                v1.sendCode(prompt, code);
             }
         }
         return null;
