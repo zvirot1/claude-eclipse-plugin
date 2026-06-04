@@ -1,5 +1,7 @@
 package com.anthropic.eclipse.claude.model;
 
+import java.util.List;
+
 /**
  * Listener for conversation model changes.
  * All callbacks may be called from a background thread -
@@ -14,11 +16,34 @@ public interface IConversationListener {
 
     /**
      * Called once at the start of {@code loadHistory} when the chat view is
-     * about to receive FEWER bubble events than the session actually has —
-     * the oldest blocks are being skipped to stay under the SWT/Win32 32767px
-     * child-coordinate limit.
+     * about to receive FEWER bubble events than the session actually has — the
+     * oldest blocks are being skipped to stay under the SWT/Win32 32767px
+     * child-coordinate limit. The view should render a banner at the top of
+     * the chat: "X earlier messages hidden". The trimmed messages are still
+     * in the model, in the JSONL on disk, and in the CLI's context.
      */
     default void onHistoryTruncated(int total, int displayed, int hidden) {}
+
+    /**
+     * Called after a scroll-driven window shift. The view should dispose
+     * the {@code removed} bubbles and create+position the {@code added}
+     * bubbles (BACKWARD = prepend at top, FORWARD = append at bottom),
+     * then restore the scroll anchor so the user's visible content stays
+     * put.
+     */
+    default void onHistoryWindowShifted(
+            List<MessageBlock> added,
+            List<MessageBlock> removed,
+            ConversationModel.ShiftDirection direction,
+            int newStart, int newEnd, int total) {}
+
+    /**
+     * Called when a new live message arrives while the user's window is
+     * NOT at the tail (i.e., they're scrolled back reading older history).
+     * The view should display a small unobtrusive indicator: "N new
+     * messages — click to jump to latest".
+     */
+    default void onNewMessagesAvailable(int countWaiting) {}
 
     /**
      * Called when a user message is added to the conversation.

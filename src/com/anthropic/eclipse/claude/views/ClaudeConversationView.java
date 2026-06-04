@@ -836,6 +836,18 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
         scrolledMessages.setContent(messageContainer);
 
+        // Scroll-driven sliding window: when the user scrolls past the top
+        // trigger zone, ask the model to shift the displayed window backward
+        // (load older, drop newer). Past the bottom trigger zone, shift
+        // forward. The model debounces back-to-back triggers via
+        // hasShiftedRecently. See ConversationModel.shiftWindowBackward /
+        // shiftWindowForward + the matching onHistoryWindowShifted handler
+        // below.
+        org.eclipse.swt.widgets.ScrollBar vbar = scrolledMessages.getVerticalBar();
+        if (vbar != null) {
+            vbar.addListener(SWT.Selection, e -> onVerticalScrollForWindow());
+        }
+
         // Re-layout on resize so text wraps at the new panel width
         scrolledMessages.addControlListener(new org.eclipse.swt.events.ControlAdapter() {
             @Override
@@ -2493,28 +2505,272 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
 
     @Override
     public void onHistoryTruncated(int total, int displayed, int hidden) {
+        // Banner at the top of the chat. The banner Composite + its Label
+        // are kept as fields so the label can be REFRESHED on every window
+        // shift (e.g. "Showing 138-388 of 388" after Load Older).
         asyncExec(() -> {
             if (messageContainer == null || messageContainer.isDisposed()) return;
             dismissWelcomeMessage();
-            Composite banner = new Composite(messageContainer, SWT.NONE);
-            GridLayout gl = new GridLayout(1, false);
-            gl.marginWidth = 8;
-            gl.marginHeight = 8;
-            banner.setLayout(gl);
-            banner.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
-            try { banner.setBackground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
-            catch (Throwable ignored) {}
-            Label lbl = new Label(banner, SWT.WRAP);
-            lbl.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-            lbl.setText(hidden + " older messages hidden — showing the most recent "
-                    + displayed + " of " + total
-                    + " (full transcript is still on disk and in the AI's context)");
-            try { lbl.setBackground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
-            catch (Throwable ignored) {}
-            try { lbl.setForeground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_FOREGROUND)); }
-            catch (Throwable ignored) {}
+            if (historyBanner == null || historyBanner.isDisposed()) {
+                historyBanner = new Composite(messageContainer, SWT.NONE);
+                GridLayout gl = new GridLayout(1, false);
+                gl.marginWidth = 8;
+                gl.marginHeight = 8;
+                historyBanner.setLayout(gl);
+                historyBanner.setLayoutData(new GridData(SWT.FILL, SWT.TOP, true, false));
+                try { historyBanner.setBackground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
+                catch (Throwable ignored) {}
+                historyBannerLabel = new Label(historyBanner, SWT.WRAP);
+                historyBannerLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+                try { historyBannerLabel.setBackground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
+                catch (Throwable ignored) {}
+                try { historyBannerLabel.setForeground(messageContainer.getDisplay().getSystemColor(SWT.COLOR_INFO_FOREGROUND)); }
+                catch (Throwable ignored) {}
+            }
+            refreshHistoryBannerText();
         });
     }
+
+    /**
+     * Update the banner label from the model's current window state. Called
+     * after loadHistory, after every window shift, and after live-message
+     * tail advance.
+     */
+    private void refreshHistoryBannerText() {
+        if (historyBannerLabel == null || historyBannerLabel.isDisposed()) return;
+        if (model == null) return;
+        int ws = model.getWindowStart();
+        int we = model.getWindowEnd();
+        int total = model.getTotalMessageCount();
+        if (ws <= 0 && we >= total) {
+            // Whole conversation is rendered; hide the banner.
+            if (historyBanner != null && !historyBanner.isDisposed()) {
+                historyBanner.setVisible(false);
+                ((GridData) historyBanner.getLayoutData()).exclude = true;
+                messageContainer.layout(true, true);
+            }
+            return;
+        }
+        if (historyBanner != null) {
+            historyBanner.setVisible(true);
+            ((GridData) historyBanner.getLayoutData()).exclude = false;
+        }
+        historyBannerLabel.setText("Showing messages " + (ws + 1) + "-" + we + " of " + total
+                + "  —  scroll up to load older, scroll down for newer");
+    }
+
+    @Override
+    public void onHistoryWindowShifted(
+            java.util.List<MessageBlock> added,
+            java.util.List<MessageBlock> removed,
+            ConversationModel.ShiftDirection direction,
+            int newStart, int newEnd, int total) {
+        asyncExec(() -> {
+            if (messageContainer == null || messageContainer.isDisposed()) return;
+            lastProgrammaticScrollAtMs = System.currentTimeMillis();
+            messageContainer.setRedraw(false);
+            // CRITICAL: suppress the per-bubble relayoutParent() that
+            // finalizeContent() calls on every new MessageComposite. Without
+            // this, each of the 50 added bubbles would trigger a full
+            // parent.layout(true, true) — 50 layouts × ~3s = ~150s of UI
+            // freeze per scroll-driven window shift. The flag was added
+            // specifically for the replay path; we just leverage the same
+            // mechanism here. One single explicit layout call at the end.
+            MessageComposite.SUPPRESS_PARENT_LAYOUT = true;
+            try {
+                // 1. Dispose the removed bubbles.
+                for (MessageBlock b : removed) {
+                    MessageComposite w = messageWidgetMap.remove(b);
+                    if (w != null && !w.isDisposed()) {
+                        w.dispose();
+                    }
+                }
+                // 2. Create new bubbles for `added`.
+                Control anchorAbove = null;
+                if (direction == ConversationModel.ShiftDirection.BACKWARD) {
+                    Control[] kids = messageContainer.getChildren();
+                    for (Control c : kids) {
+                        if (c == historyBanner) continue;
+                        anchorAbove = c;
+                        break;
+                    }
+                }
+                for (MessageBlock b : added) {
+                    MessageComposite w = new MessageComposite(messageContainer, b);
+                    w.setForkCallback(this::forkFromMessage);
+                    messageWidgetMap.put(b, w);
+                    if (direction == ConversationModel.ShiftDirection.BACKWARD && anchorAbove != null) {
+                        w.moveAbove(anchorAbove);
+                    }
+                    try {
+                        w.finalizeContent();
+                    } catch (Throwable t) {
+                        Activator.logWarning("[historyWindowShifted] finalizeContent failed: " + t);
+                    }
+                }
+                // 3. Single layout + scroll. Keep replayingHistory false here;
+                //    we WANT scrollToBottom to land the user at the tail of
+                //    the (possibly very different) window. For BACKWARD shifts
+                //    that's wrong — restore the scroll anchor instead.
+                messageContainer.layout(true, true);
+                // Re-bump the programmatic-scroll guard right before
+                // setMinSize/setOrigin. The asyncExec started 2+ seconds
+                // ago (long enough for the layout above), so the original
+                // guard timestamp from onHistoryWindowShifted entry is
+                // already stale — without this, the Selection event from
+                // setOrigin below could immediately trigger another shift.
+                lastProgrammaticScrollAtMs = System.currentTimeMillis();
+                if (direction == ConversationModel.ShiftDirection.BACKWARD) {
+                    // Don't scrollToBottom — that would yank the user to the
+                    // bottom of the new (older) bubbles. Just restore the
+                    // ScrolledComposite's minSize.
+                    int cw = scrolledMessages.getClientArea().width;
+                    org.eclipse.swt.graphics.Point sz =
+                            messageContainer.computeSize(cw > 0 ? cw : SWT.DEFAULT, SWT.DEFAULT, true);
+                    scrolledMessages.setMinSize(sz);
+                    scrolledMessages.layout(true, true);
+                    // The added bubbles are above the previously-visible top.
+                    // Scroll DOWN by the height of the added bubbles so the
+                    // user's previously-visible content stays visible.
+                    int addedHeight = 0;
+                    for (MessageBlock b : added) {
+                        MessageComposite w = messageWidgetMap.get(b);
+                        if (w != null && !w.isDisposed()) addedHeight += w.getBounds().height;
+                    }
+                    int newOrigin = scrolledMessages.getOrigin().y + addedHeight;
+                    lastProgrammaticScrollAtMs = System.currentTimeMillis();
+                    scrolledMessages.setOrigin(0, newOrigin);
+                } else {
+                    // FORWARD shift — scroll to bottom (we've loaded newer
+                    // content the user wants to see).
+                    scrollToBottom();
+                }
+                refreshHistoryBannerText();
+            } finally {
+                MessageComposite.SUPPRESS_PARENT_LAYOUT = false;
+                messageContainer.setRedraw(true);
+            }
+        });
+    }
+
+    @Override
+    public void onNewMessagesAvailable(int countWaiting) {
+        asyncExec(() -> {
+            if (newMessagesToast == null || newMessagesToast.isDisposed()) {
+                createNewMessagesToast();
+            }
+            if (newMessagesToastLabel != null && !newMessagesToastLabel.isDisposed()) {
+                newMessagesToastLabel.setText(countWaiting + " new message"
+                        + (countWaiting > 1 ? "s" : "")
+                        + " — click to jump to latest");
+            }
+            if (newMessagesToast != null) {
+                newMessagesToast.setVisible(true);
+                ((GridData) newMessagesToast.getLayoutData()).exclude = false;
+                newMessagesToast.getParent().layout(true, true);
+            }
+        });
+    }
+
+    /** Lazy-create the "X new messages — click to jump" toast above the input field. */
+    private void createNewMessagesToast() {
+        if (inputField == null || inputField.isDisposed()) return;
+        Composite parent = inputField.getParent().getParent();  // chat panel
+        newMessagesToast = new Composite(parent, SWT.NONE);
+        GridLayout gl = new GridLayout(1, false);
+        gl.marginWidth = 8;
+        gl.marginHeight = 6;
+        newMessagesToast.setLayout(gl);
+        GridData gd = new GridData(SWT.FILL, SWT.BOTTOM, true, false);
+        newMessagesToast.setLayoutData(gd);
+        try { newMessagesToast.setBackground(parent.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
+        catch (Throwable ignored) {}
+        newMessagesToastLabel = new Label(newMessagesToast, SWT.NONE);
+        newMessagesToastLabel.setLayoutData(new GridData(SWT.CENTER, SWT.CENTER, true, false));
+        try { newMessagesToastLabel.setBackground(parent.getDisplay().getSystemColor(SWT.COLOR_INFO_BACKGROUND)); }
+        catch (Throwable ignored) {}
+        try { newMessagesToastLabel.setForeground(parent.getDisplay().getSystemColor(SWT.COLOR_INFO_FOREGROUND)); }
+        catch (Throwable ignored) {}
+        // Click anywhere on the toast → jump to latest.
+        org.eclipse.swt.events.MouseAdapter clickHandler = new org.eclipse.swt.events.MouseAdapter() {
+            @Override public void mouseUp(org.eclipse.swt.events.MouseEvent e) {
+                if (model != null) model.shiftWindowToLatest();
+                if (newMessagesToast != null && !newMessagesToast.isDisposed()) {
+                    newMessagesToast.setVisible(false);
+                    ((GridData) newMessagesToast.getLayoutData()).exclude = true;
+                    newMessagesToast.getParent().layout(true, true);
+                }
+            }
+        };
+        newMessagesToast.addMouseListener(clickHandler);
+        newMessagesToastLabel.addMouseListener(clickHandler);
+        // Anchor at the end of the parent — make sure it appears above the
+        // input field. Eclipse uses GridLayout so it goes to the bottom by
+        // default; we want it just BEFORE the input area, which is the last
+        // child. Move it above the input field's parent.
+        try { newMessagesToast.moveAbove(inputField.getParent()); } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Vertical-scroll listener — fires on every wheel-tick / drag
+     * notification while the user scrolls. We DON'T trigger a shift
+     * immediately because each shift costs 2-4s of layout, and a slow
+     * continuous scroll would queue many shifts back-to-back, freezing
+     * Eclipse. Instead, schedule a deferred check via timerExec; every
+     * fresh scroll event RESETS the timer. The shift only fires once
+     * the user STOPS scrolling for {@code SCROLL_SETTLE_MS}.
+     */
+    private void onVerticalScrollForWindow() {
+        if (model == null) return;
+        if (replayingHistory) return;
+        if ((System.currentTimeMillis() - lastProgrammaticScrollAtMs) < PROGRAMMATIC_SCROLL_GUARD_MS) return;
+        // Reset the settle timer: pending firing gets cancelled, new one
+        // scheduled SCROLL_SETTLE_MS in the future.
+        Display.getDefault().timerExec(SCROLL_SETTLE_MS, scrollShiftTrigger);
+    }
+
+    private final Runnable scrollShiftTrigger = this::checkAndShiftWindow;
+
+    /** Called by timerExec after the user has stopped scrolling for SCROLL_SETTLE_MS. */
+    private void checkAndShiftWindow() {
+        if (model == null) return;
+        if (replayingHistory) return;
+        if ((System.currentTimeMillis() - lastProgrammaticScrollAtMs) < PROGRAMMATIC_SCROLL_GUARD_MS) return;
+        if (model.hasShiftedRecently(SCROLL_SHIFT_DEBOUNCE_MS)) return;
+        if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        if (messageContainer == null || messageContainer.isDisposed()) return;
+        int origin = scrolledMessages.getOrigin().y;
+        int contentH = messageContainer.getSize().y;
+        int viewportH = scrolledMessages.getClientArea().height;
+        int distFromTop = origin;
+        int distFromBottom = contentH - (origin + viewportH);
+        if (distFromTop < SCROLL_TRIGGER_PX && model.hasOlder()) {
+            model.shiftWindowBackward(SCROLL_SHIFT_STEP);
+        } else if (distFromBottom < SCROLL_TRIGGER_PX && model.hasNewer()) {
+            model.shiftWindowForward(SCROLL_SHIFT_STEP);
+        }
+    }
+
+    /** Updated before every programmatic scroll/minsize change to suppress
+     *  spurious SWT.Selection-triggered shifts during view-driven layout. */
+    private volatile long lastProgrammaticScrollAtMs = 0;
+    private static final int PROGRAMMATIC_SCROLL_GUARD_MS = 1500;
+    // 400px gives the user enough warning that they're near the edge
+    // without firing shifts when they're casually scrolling mid-list.
+    private static final int SCROLL_TRIGGER_PX = 400;
+    private static final int SCROLL_SHIFT_DEBOUNCE_MS = 3000;
+    // 25 bubbles per shift means ~half the widget-creation cost vs 50.
+    // The user can still reach end-to-end of a 388-bubble session in
+    // ~8 shifts, which feels fine when each shift is ~1.5s instead of 3s.
+    private static final int SCROLL_SHIFT_STEP = 25;
+    // The shift only fires after the user STOPS scrolling for this long.
+    // 500ms feels responsive without firing while the user is still
+    // dragging the scrollbar / spinning the wheel.
+    private static final int SCROLL_SETTLE_MS = 500;
+    private Composite historyBanner;
+    private Label historyBannerLabel;
+    private Composite newMessagesToast;
+    private Label newMessagesToastLabel;
 
     @Override
     public void onSessionInitialized(SessionInfo info) {
@@ -2847,8 +3103,8 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // dominant cost. That's O(N²) tool-call updates, and on the user's
             // 388-bubble session it pinned the UI thread for MINUTES (thread
             // dump caught it in ScriptGetLogicalWidths → calculateClientArea).
-            // Restored bubbles already have their final tool statuses set at
-            // construction time, so the safety-net sweep is unnecessary.
+            // Restored bubbles already have their final status set at construction
+            // time, so the safety-net sweep is unnecessary.
             if (!replayingHistory) {
                 syncAllToolCallStatuses();
             }
@@ -4642,6 +4898,11 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         if (replayingHistory) return;
         if (messageContainer == null || messageContainer.isDisposed()) return;
         if (scrolledMessages == null || scrolledMessages.isDisposed()) return;
+        // Suppress scroll-driven window shifts for the next
+        // PROGRAMMATIC_SCROLL_GUARD_MS — the setMinSize / setOrigin calls
+        // below will fire SWT.Selection events that would otherwise
+        // immediately trigger model.shiftWindowBackward/Forward.
+        lastProgrammaticScrollAtMs = System.currentTimeMillis();
         long t0 = System.currentTimeMillis();
         // Three-mode layout strategy. The naive approach (always pass
         // changed=true) costs ~3000ms per scroll on this user's 396-bubble
@@ -4681,10 +4942,13 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
             // ~3s. Necessary when a new bubble was added or the structure
             // changed in any way.
             //
-            // (Earlier builds force-called messageContainer.setSize here
-            // as a workaround for the SWT 32767px child-Y clamp; now
-            // bypassed by ConversationModel.loadHistory truncating to 200
-            // displayed bubbles. setMinSize alone is sufficient.)
+            // (Earlier builds force-called messageContainer.setSize here as
+            // a workaround for "bubbles invisible at the bottom". That
+            // diagnosis was wrong — the real cause was SWT/Win32's 32767px
+            // child-Y-coordinate clamp on long sessions, now bypassed by
+            // ConversationModel.loadHistory truncating to 200 displayed
+            // bubbles. With the truncation in place, setMinSize alone is
+            // sufficient — no explicit setSize override needed.)
             messageContainer.layout(true, true);
             org.eclipse.swt.graphics.Point sz =
                     messageContainer.computeSize(widthHint, SWT.DEFAULT, true);
@@ -4735,6 +4999,10 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
         // Defer just the scroll origin + focus restore — no layout work here.
         Display.getDefault().asyncExec(() -> {
             if (scrolledMessages.isDisposed()) return;
+            // The original scroll-impl-entry guard may have expired by the
+            // time this asyncExec fires (the synchronous layout/computeSize
+            // above can take seconds on long sessions). Re-bump.
+            lastProgrammaticScrollAtMs = System.currentTimeMillis();
             scrolledMessages.setOrigin(0, targetY);
             if (inputField != null && !inputField.isDisposed()) {
                 inputField.setFocus();
