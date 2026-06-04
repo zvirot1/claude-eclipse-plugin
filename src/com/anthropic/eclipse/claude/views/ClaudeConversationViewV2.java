@@ -742,6 +742,62 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         }
     }
 
+    // ====================== Public API for handlers ======================
+
+    /**
+     * Public API used by Eclipse code-aware handlers (Send Selection,
+     * Explain Code, Review Code, Refactor Code, Run CLI on File). Combines
+     * a prompt prefix with a code body and sends as a normal user message.
+     * Mirrors V1's {@code ClaudeConversationView.sendCode(String, String)}.
+     */
+    public void sendCode(String prompt, String code) {
+        if (prompt == null) prompt = "";
+        if (code == null) code = "";
+        final String message = code.isEmpty()
+            ? prompt
+            : prompt + "\n\n```\n" + code + "\n```";
+        org.eclipse.swt.widgets.Display d =
+            (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+        d.asyncExec(() -> {
+            try {
+                if (!cliManager.isRunning()) {
+                    autoStartCli();
+                }
+                model.addUserMessage(message);
+                if (cliManager.isRunning()) {
+                    cliManager.sendMessage(message);
+                } else {
+                    bridge.sendToWebview("error", "{\"message\":"
+                        + JsonBuilder.jsonString("Claude CLI is not running.") + "}");
+                }
+            } catch (Exception e) {
+                Activator.logError("[Webview/Handler] sendCode failed", e);
+            }
+        });
+    }
+
+    /** Open the Session History dialog. Public so handlers (Resume
+     *  Session menu, /history slash) can call it directly. */
+    public void showResumeDialog() {
+        org.eclipse.swt.widgets.Display d =
+            (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+        d.asyncExec(() -> {
+            try {
+                openHistoryDialog(getViewSite().getShell(), getDefaultWorkingDirectory());
+            } catch (Exception e) {
+                Activator.logError("[Webview/Handler] showResumeDialog failed", e);
+            }
+        });
+    }
+
+    /** Reset to a fresh conversation. Public wrapper for the
+     *  new_session JS message handler. */
+    public void startNewSession() {
+        org.eclipse.swt.widgets.Display d =
+            (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+        d.asyncExec(this::handleNewSession);
+    }
+
     /**
      * Click on the paperclip / attach button in the webview header.
      * Shows a popup menu next to the cursor with two options — matches

@@ -4,6 +4,7 @@ import org.eclipse.core.commands.*;
 import org.eclipse.ui.*;
 
 import com.anthropic.eclipse.claude.views.ClaudeConversationView;
+import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 import org.eclipse.swt.widgets.Display;
 
@@ -24,9 +25,16 @@ public class SendSelectionHandler extends AbstractHandler {
         }
 
         String fileName = HandlerUtils.getActiveFileName(window);
-        ClaudeConversationView view = HandlerUtils.getConversationView(window.getActivePage());
-        if (view != null) {
-            view.sendCode("Please analyze this code from " + fileName + ":", selectedText);
+        String prompt = "Please analyze this code from " + fileName + ":";
+        // Prefer V2 (webview). Fall back to V1 if V2 unavailable.
+        ClaudeConversationViewV2 v2 = HandlerUtils.getConversationViewV2(window.getActivePage());
+        if (v2 != null) {
+            v2.sendCode(prompt, selectedText);
+            return null;
+        }
+        ClaudeConversationView v1 = HandlerUtils.getConversationView(window.getActivePage());
+        if (v1 != null) {
+            v1.sendCode(prompt, selectedText);
         }
         return null;
     }

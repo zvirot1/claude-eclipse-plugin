@@ -90,4 +90,25 @@ public class HandlerUtils {
             }
         }
     }
+
+    /**
+     * Show and get the V2 (webview) Claude Code conversation view —
+     * called by the code-aware handlers (Send Selection, Explain Code,
+     * Review Code, Refactor Code, Run CLI on File, etc.) so their
+     * commands target the same chat the user sees as the default. If
+     * V2 fails (Edge WebView2 unavailable), falls back to V1 by
+     * returning null so the caller can call
+     * {@link #getConversationView(IWorkbenchPage)} as a backup.
+     */
+    public static ClaudeConversationViewV2 getConversationViewV2(IWorkbenchPage page) {
+        try {
+            IViewPart view = page.showView(ClaudeConversationViewV2.ID);
+            if (view instanceof ClaudeConversationViewV2) {
+                return (ClaudeConversationViewV2) view;
+            }
+        } catch (PartInitException e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
 }
