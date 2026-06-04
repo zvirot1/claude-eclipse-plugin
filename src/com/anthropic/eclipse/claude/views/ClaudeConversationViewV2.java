@@ -79,6 +79,13 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
      *  createPartControl to auto-resume the previously active session. */
     private org.eclipse.ui.IMemento savedMemento;
 
+    /** Static handoff for Fork: when this view triggers a fork, it puts the
+     *  prefix here keyed by the new tab's secondaryId, then opens the new
+     *  view. The new view's createPartControl pops the entry and replays
+     *  the prefix into its own model. */
+    private static final java.util.Map<String, java.util.List<MessageBlock>> PENDING_FORKS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     /** Sticky session id — preserved across CLI restarts so a failed
      *  CLI resume on the next launch doesn't lose the view's session. */
     private volatile String stickySessionId;
@@ -457,6 +464,17 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             bridge.sendToWebview("result_received", JsonBuilder.buildUsageJson(usage));
         }
 
+        // Fork path: if this view was opened as a fork from another tab,
+        // PENDING_FORKS has the prefix waiting for us. Consume it now
+        // (replays into our model, fires user/assistant events → JS) and
+        // skip the memento auto-resume path entirely.
+        if (tryConsumePendingFork()) {
+            // Drop any memento so a stale resumeId from a previous Eclipse
+            // session doesn't override the fork on the next save.
+            savedMemento = null;
+            return;
+        }
+
         // Auto-resume from memento if Eclipse restored one for this view.
         // Same semantics as V1: each view owns its own state; brand-new
         // views have null memento and start fresh. If a memento has a
@@ -570,6 +588,15 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             case "file_search":
                 handleFileSearch(payload);
                 break;
+            case "slash_suggestions":
+                handleSlashSuggestionsRequest(payload);
+                break;
+            case "execute_slash_command":
+                handleExecuteSlashCommand(payload);
+                break;
+            case "fork_from_message":
+                handleForkFromMessage(payload);
+                break;
             case "accept_edit":
                 handleAcceptEdit(payload);
                 break;
@@ -641,6 +668,235 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             bridge.sendToWebview("error",
                 "{\"message\":" + JsonBuilder.jsonString("Failed to send message: " + e.getMessage()) + "}");
         }
+    }
+
+    /**
+     * Fork the conversation from a specific message index — opens a NEW
+     * TAB next to this one with the prefix [0..forkIndex] pre-loaded,
+     * leaving the current tab unchanged. The original is preserved so the
+     * user can switch back; the new tab starts a fresh CLI session
+     * preserving only the prefix.
+     *
+     * <p>Triggered by the per-bubble "⑂ Fork from here" menu. The new
+     * tab is placed in the same MPartStack as this view (via the same
+     * mechanism as the "+ New Conversation Window" button), and the
+     * forked prefix is handed over through a static map keyed by the new
+     * view's secondaryId; the new view's createPartControl picks it up.
+     */
+    private void handleForkFromMessage(String payload) {
+        try {
+            Map<String, Object> data = JsonParser.parseObject(payload);
+            Object idxObj = (data != null) ? data.get("messageIndex") : null;
+            if (!(idxObj instanceof Number)) {
+                Activator.logWarning("[Webview] fork_from_message: missing messageIndex");
+                return;
+            }
+            final int forkIndex = ((Number) idxObj).intValue();
+
+            java.util.List<MessageBlock> all = model.getMessages();
+            if (forkIndex < 0 || forkIndex >= all.size()) {
+                Activator.logWarning("[Webview] fork_from_message: index out of range "
+                    + forkIndex + " (size=" + all.size() + ")");
+                bridge.sendToWebview("toast", "{\"message\":"
+                    + JsonBuilder.jsonString("Fork index out of range.") + "}");
+                return;
+            }
+            // getMessages() returns an unmodifiable copy — safe to keep.
+            final java.util.List<MessageBlock> forked = new java.util.ArrayList<>(
+                all.subList(0, forkIndex + 1));
+            Activator.logInfo("[Webview/Fork] forking at index " + forkIndex
+                + " (" + forked.size() + " messages kept of " + all.size() + ")");
+
+            // Save the CURRENT tab's session so the unforked tail is
+            // recoverable via Session History.
+            if (sessionManager != null) {
+                try { sessionManager.saveCurrentSession(model); }
+                catch (Exception ignored) {}
+            }
+
+            // Stash the prefix for the new view's createPartControl to pick up.
+            final String secondaryId = "fork-" + System.nanoTime();
+            PENDING_FORKS.put(secondaryId, forked);
+
+            org.eclipse.swt.widgets.Display d =
+                (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+            d.asyncExec(() -> {
+                try {
+                    org.eclipse.ui.IWorkbenchPage page = getSite().getPage();
+                    if (page == null) {
+                        PENDING_FORKS.remove(secondaryId);
+                        return;
+                    }
+                    // Open the new view (Eclipse picks initial placement),
+                    // then relocate it next to this one.
+                    org.eclipse.ui.IViewPart newView = page.showView(
+                        ID, secondaryId, org.eclipse.ui.IWorkbenchPage.VIEW_ACTIVATE);
+                    tryRelocateWithRetry(newView, 0);
+
+                    bridge.sendToWebview("toast", "{\"message\":"
+                        + JsonBuilder.jsonString("⑂ Forked conversation in new tab ("
+                            + forked.size() + " messages kept)") + "}");
+                } catch (Exception e) {
+                    PENDING_FORKS.remove(secondaryId);
+                    Activator.logError("[Webview/Fork] failed to open new tab", e);
+                }
+            });
+        } catch (Exception e) {
+            Activator.logError("[Webview] fork_from_message payload parse failed", e);
+        }
+    }
+
+    /**
+     * If THIS view instance was opened as a fork (its secondaryId is in
+     * PENDING_FORKS), load the forked prefix into our model so the new
+     * tab opens with the forked history visible. Called from
+     * pushInitialState AFTER the bridge is wired up.
+     *
+     * @return true if we handled a fork (skip the normal auto-resume path)
+     */
+    private boolean tryConsumePendingFork() {
+        try {
+            String secondaryId = getViewSite().getSecondaryId();
+            if (secondaryId == null) return false;
+            java.util.List<MessageBlock> forked = PENDING_FORKS.remove(secondaryId);
+            if (forked == null || forked.isEmpty()) return false;
+            Activator.logInfo("[Webview/Fork] new tab consuming prefix of "
+                + forked.size() + " messages (secondaryId=" + secondaryId + ")");
+            // Reset the tab title so the fork can get its own generated
+            // title from the prefix's first user message.
+            partNameSet = false;
+            try { setPartName("Claude Code (Fork)"); } catch (Exception ignored) {}
+            try {
+                model.loadHistory(forked, Integer.MAX_VALUE);
+            } catch (Exception e) {
+                Activator.logError("[Webview/Fork] loadHistory failed", e);
+            }
+            // Start a fresh CLI — this is a brand new conversation.
+            autoStartCli();
+            return true;
+        } catch (Exception e) {
+            Activator.logError("[Webview/Fork] tryConsumePendingFork failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * Reply to the JS slash-command autocomplete popup. Sends a list of
+     * commands whose name starts with the prefix, each with its
+     * description. Mirrors the IntelliJ slash_suggestions protocol.
+     */
+    private void handleSlashSuggestionsRequest(String payload) {
+        try {
+            Map<String, Object> data = JsonParser.parseObject(payload);
+            String prefix = JsonParser.getString(data, "prefix");
+            if (prefix == null) prefix = "/";
+            String lowerPrefix = prefix.toLowerCase();
+
+            StringBuilder json = new StringBuilder("{\"suggestions\":[");
+            boolean first = true;
+            for (com.anthropic.eclipse.claude.views.widgets.SlashCommandHandler.CommandInfo cmd :
+                    com.anthropic.eclipse.claude.views.widgets.SlashCommandHandler.getAllCommands()) {
+                if (cmd.name.toLowerCase().startsWith(lowerPrefix)) {
+                    if (!first) json.append(",");
+                    first = false;
+                    json.append("{\"name\":").append(JsonBuilder.jsonString(cmd.name));
+                    json.append(",\"description\":").append(JsonBuilder.jsonString(cmd.description));
+                    json.append("}");
+                }
+            }
+            json.append("]}");
+            bridge.sendToWebview("slash_suggestions", json.toString());
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] slash_suggestions failed: " + e.getMessage());
+            bridge.sendToWebview("slash_suggestions", "{\"suggestions\":[]}");
+        }
+    }
+
+    /**
+     * Execute a slash command from the webview. Local commands (handled
+     * by the plugin) dispatch to dialogs or model actions; others get
+     * forwarded to the CLI as a normal user message.
+     */
+    private void handleExecuteSlashCommand(String payload) {
+        try {
+            Map<String, Object> data = JsonParser.parseObject(payload);
+            String command = JsonParser.getString(data, "command");
+            String args = JsonParser.getString(data, "args");
+            if (command == null || command.trim().isEmpty()) return;
+
+            command = command.trim();
+            if (!command.startsWith("/")) command = "/" + command;
+            final String fullCommand = (args != null && !args.isEmpty())
+                ? command + " " + args.trim()
+                : command;
+
+            if (com.anthropic.eclipse.claude.views.widgets.SlashCommandHandler
+                    .isLocalCommand(fullCommand)) {
+                runLocalSlashCommand(fullCommand);
+                return;
+            }
+            // CLI-forwarded slash command
+            if (!cliManager.isRunning()) autoStartCli();
+            if (cliManager.isRunning()) {
+                model.addUserMessage(fullCommand);
+                cliManager.sendMessage(fullCommand);
+            }
+        } catch (Exception e) {
+            Activator.logError("[Webview] execute_slash_command failed", e);
+        }
+    }
+
+    /**
+     * Dispatch a local slash command to V2's plugin actions. Matches V1's
+     * handleSlashCommand routing. Unknown locals just fall through.
+     */
+    private void runLocalSlashCommand(String fullCommand) {
+        String[] parts = fullCommand.split("\\s+", 2);
+        String cmd = parts[0].toLowerCase();
+        org.eclipse.swt.widgets.Display d =
+            (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
+        d.asyncExec(() -> {
+            try {
+                String workDir = getDefaultWorkingDirectory();
+                org.eclipse.swt.widgets.Shell shell = getViewSite().getShell();
+                switch (cmd) {
+                    case "/new":     handleNewSession(); break;
+                    case "/clear":   model.clear(); break;
+                    case "/stop":    if (cliManager.isRunning()) cliManager.stop(); break;
+                    case "/help":
+                        bridge.sendToWebview("system_message", "{\"text\":"
+                            + JsonBuilder.jsonString(com.anthropic.eclipse.claude.views.widgets
+                                .SlashCommandHandler.formatHelp()) + "}");
+                        break;
+                    case "/history":
+                    case "/resume":
+                        openHistoryDialog(shell, workDir);
+                        break;
+                    case "/rules":
+                        new com.anthropic.eclipse.claude.views.RulesDialog(shell, workDir).open(); break;
+                    case "/mcp":
+                        new com.anthropic.eclipse.claude.views.McpServersDialog(shell, workDir).open(); break;
+                    case "/hooks":
+                        new com.anthropic.eclipse.claude.views.HooksDialog(shell, workDir).open(); break;
+                    case "/memory":
+                        new com.anthropic.eclipse.claude.views.MemoryDialog(shell, workDir).open(); break;
+                    case "/skills":
+                        new com.anthropic.eclipse.claude.views.SkillsDialog(shell).open(); break;
+                    case "/cost":
+                    case "/model":
+                        // V2 doesn't yet have dedicated UIs for these —
+                        // surface a toast so the user knows it's a known
+                        // command but not wired up.
+                        bridge.sendToWebview("toast", "{\"message\":"
+                            + JsonBuilder.jsonString(cmd + " is not yet wired in V2 — use the CLI.") + "}");
+                        break;
+                    default:
+                        Activator.logInfo("[Webview] unhandled local slash: " + cmd);
+                }
+            } catch (Exception e) {
+                Activator.logError("[Webview] runLocalSlashCommand failed", e);
+            }
+        });
     }
 
     /**
