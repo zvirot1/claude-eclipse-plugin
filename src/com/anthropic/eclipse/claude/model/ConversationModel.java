@@ -365,6 +365,22 @@ public class ConversationModel implements ICliMessageListener {
      * Must be called on a fresh (empty) model — does NOT clear existing messages first.
      */
     public void loadHistory(List<MessageBlock> historicalBlocks) {
+        // SWT-based view: cap at 200 displayed bubbles (Win32 32767px child-Y limit).
+        loadHistory(historicalBlocks, 200);
+    }
+
+    /**
+     * Load historical messages with an explicit display cap. Pass
+     * {@link Integer#MAX_VALUE} (or any large value) to render every block
+     * — appropriate for the webview-based V2 view, which uses Chromium
+     * scroll and isn't subject to the SWT/Win32 32767px child-Y limit.
+     *
+     * <p>{@code displayLimit} controls only how many of the OLDEST blocks
+     * get skipped from the listener replay; ALL blocks are still added to
+     * the underlying messages list so context, token counts, and
+     * {@code --resume} on the CLI see the full transcript.
+     */
+    public void loadHistory(List<MessageBlock> historicalBlocks, int displayLimit) {
         synchronized (messages) {
             // Keep ALL blocks in the model — the CLI's --resume needs the full
             // JSONL transcript on disk (unaffected by us), and the SessionInfo
@@ -372,21 +388,13 @@ public class ConversationModel implements ICliMessageListener {
             messages.addAll(historicalBlocks);
         }
 
-        // Hard cap on widgets rendered into the chat view. SWT/Win32 clamps
-        // child Y coordinates at Short.MAX_VALUE (32767px); past that, all
-        // late bubbles overlap at Y=32767 and become invisible. On the user's
-        // 388-bubble session the cumulative height was 45,179px so roughly
-        // the last 76% of bubbles got clamped (the user reported "I send a
-        // message and don't see it"). The fix: render only the LAST N
-        // bubbles. The trimmed older bubbles are still in the model and
-        // still in the JSONL file — CLI resume sees them, context is
-        // preserved. The user just doesn't see them in the chat view.
-        //
-        // 200 was chosen because 200 × ~120px (typical bubble height) ≈
-        // 24,000px — comfortably below the 32,767 limit even for sessions
-        // with longer-than-average bubbles. If the user wants a higher cap
-        // they can override via the HISTORY_DISPLAY_LIMIT preference.
-        int displayLimit = 200;
+        // Hard cap on widgets rendered into the chat view (V1 only). SWT/Win32
+        // clamps child Y coordinates at Short.MAX_VALUE (32767px); past that,
+        // all late bubbles overlap at Y=32767 and become invisible. On the
+        // user's 388-bubble session the cumulative height was 45,179px so
+        // roughly the last 76% of bubbles got clamped. The fix for V1: render
+        // only the LAST N bubbles. V2 (webview) doesn't need this — Chromium
+        // handles arbitrary scroll content — so V2 passes Integer.MAX_VALUE.
         int total = historicalBlocks.size();
         int skip = Math.max(0, total - displayLimit);
         int displayed = total - skip;

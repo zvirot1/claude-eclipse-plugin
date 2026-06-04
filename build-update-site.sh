@@ -65,7 +65,7 @@ echo "[3/5] Packaging plugin JAR..."
 PLUGIN_JAR="build/${PLUGIN_ID}_${VERSION}.jar"
 mkdir -p build
 rm -f "$PLUGIN_JAR"
-jar cfm "$PLUGIN_JAR" META-INF/MANIFEST.MF -C bin . -C . plugin.xml icons
+jar cfm "$PLUGIN_JAR" META-INF/MANIFEST.MF -C bin . -C . plugin.xml icons webview
 echo "  -> $PLUGIN_JAR ($(stat -c%s "$PLUGIN_JAR") bytes)"
 
 # ==================== Step 4: Build Feature JAR ====================

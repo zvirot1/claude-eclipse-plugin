@@ -8,6 +8,7 @@ import org.eclipse.ui.handlers.HandlerUtil;
 import org.eclipse.ui.texteditor.ITextEditor;
 import com.anthropic.eclipse.claude.views.ClaudeChatView;
 import com.anthropic.eclipse.claude.views.ClaudeConversationView;
+import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 public class HandlerUtils {
 
@@ -51,7 +52,11 @@ public class HandlerUtils {
     }
 
     /**
-     * Show and get the new ClaudeConversationView.
+     * Show and get the legacy SWT ClaudeConversationView. Still used by
+     * code-aware handlers (Send Selection, Explain Code, Review Code,
+     * Refactor Code, Run CLI on File, Resume Session, New Session) because
+     * they call into the legacy view's Java API which V2 hasn't yet
+     * re-exposed.
      */
     public static ClaudeConversationView getConversationView(IWorkbenchPage page) {
         try {
@@ -61,5 +66,28 @@ public class HandlerUtils {
             e.printStackTrace();
         }
         return null;
+    }
+
+    /**
+     * Open the default Claude Code conversation view. As of the webview
+     * migration this is the V2 (browser-based) view, which the main entry
+     * points — Ctrl+Shift+C, toolbar button, "Claude Code > Open Claude
+     * Code Panel" menu — all use. The legacy SWT view is still reachable
+     * via {@link #getConversationView(IWorkbenchPage)} for the code-aware
+     * handlers and via Show View > Other > Claude AI for direct opening.
+     */
+    public static void openPrimaryView(IWorkbenchPage page) {
+        try {
+            page.showView(ClaudeConversationViewV2.ID);
+        } catch (PartInitException e) {
+            e.printStackTrace();
+            // Fall back to the legacy view if V2 fails to instantiate
+            // (e.g. Edge WebView2 unavailable on this machine).
+            try {
+                page.showView(ClaudeConversationView.ID);
+            } catch (PartInitException e2) {
+                e2.printStackTrace();
+            }
+        }
     }
 }
