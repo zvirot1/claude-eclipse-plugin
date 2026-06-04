@@ -2755,9 +2755,14 @@ public class ClaudeConversationView extends ViewPart implements IConversationLis
      *  spurious SWT.Selection-triggered shifts during view-driven layout. */
     private volatile long lastProgrammaticScrollAtMs = 0;
     private static final int PROGRAMMATIC_SCROLL_GUARD_MS = 1500;
-    private static final int SCROLL_TRIGGER_PX = 200;
+    // 400px gives the user enough warning that they're near the edge
+    // without firing shifts when they're casually scrolling mid-list.
+    private static final int SCROLL_TRIGGER_PX = 400;
     private static final int SCROLL_SHIFT_DEBOUNCE_MS = 3000;
-    private static final int SCROLL_SHIFT_STEP = 50;
+    // 25 bubbles per shift means ~half the widget-creation cost vs 50.
+    // The user can still reach end-to-end of a 388-bubble session in
+    // ~8 shifts, which feels fine when each shift is ~1.5s instead of 3s.
+    private static final int SCROLL_SHIFT_STEP = 25;
     // The shift only fires after the user STOPS scrolling for this long.
     // 500ms feels responsive without firing while the user is still
     // dragging the scrollbar / spinning the wheel.
