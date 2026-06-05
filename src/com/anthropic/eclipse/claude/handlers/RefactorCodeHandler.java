@@ -6,12 +6,10 @@ import org.eclipse.ui.*;
 import org.eclipse.jface.dialogs.InputDialog;
 import org.eclipse.jface.window.Window;
 
-import com.anthropic.eclipse.claude.views.ClaudeConversationView;
 import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 /**
  * Sends selected code to Claude for refactoring via the interactive CLI.
- * Prefers the V2 webview; falls back to the legacy SWT view.
  */
 public class RefactorCodeHandler extends AbstractHandler {
 
@@ -44,15 +42,9 @@ public class RefactorCodeHandler extends AbstractHandler {
         String instruction = dialog.getValue();
         String prompt = instruction + "\n\nFile: " + filename;
 
-        // Prefer V2 (webview). Fall back to V1 if V2 unavailable.
-        ClaudeConversationViewV2 v2 = HandlerUtils.getConversationViewV2(window.getActivePage());
-        if (v2 != null) {
-            v2.sendCode(prompt, selectedText);
-            return null;
-        }
-        ClaudeConversationView v1 = HandlerUtils.getConversationView(window.getActivePage());
-        if (v1 != null) {
-            v1.sendCode(prompt, selectedText);
+        ClaudeConversationViewV2 view = HandlerUtils.getConversationViewV2(window.getActivePage());
+        if (view != null) {
+            view.sendCode(prompt, selectedText);
         }
         return null;
     }
