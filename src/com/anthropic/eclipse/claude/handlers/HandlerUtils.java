@@ -6,8 +6,6 @@ import org.eclipse.jface.viewers.ISelection;
 import org.eclipse.ui.*;
 import org.eclipse.ui.handlers.HandlerUtil;
 import org.eclipse.ui.texteditor.ITextEditor;
-import com.anthropic.eclipse.claude.views.ClaudeChatView;
-import com.anthropic.eclipse.claude.views.ClaudeConversationView;
 import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 public class HandlerUtils {
@@ -41,64 +39,29 @@ public class HandlerUtils {
         return "unknown";
     }
 
-    public static ClaudeChatView getChatView(IWorkbenchPage page) {
-        try {
-            IViewPart view = page.showView(ClaudeChatView.ID);
-            if (view instanceof ClaudeChatView) return (ClaudeChatView) view;
-        } catch (PartInitException e) {
-            e.printStackTrace();
-        }
-        return null;
-    }
-
     /**
-     * Show and get the legacy SWT ClaudeConversationView. Still used by
-     * code-aware handlers (Send Selection, Explain Code, Review Code,
-     * Refactor Code, Run CLI on File, Resume Session, New Session) because
-     * they call into the legacy view's Java API which V2 hasn't yet
-     * re-exposed.
-     */
-    public static ClaudeConversationView getConversationView(IWorkbenchPage page) {
-        try {
-            IViewPart view = page.showView(ClaudeConversationView.ID);
-            if (view instanceof ClaudeConversationView) return (ClaudeConversationView) view;
-        } catch (PartInitException e) {
-            e.printStackTrace();
-        }
-        return null;
-    }
-
-    /**
-     * Open the default Claude Code conversation view. As of the webview
-     * migration this is the V2 (browser-based) view, which the main entry
-     * points — Ctrl+Shift+C, toolbar button, "Claude Code > Open Claude
-     * Code Panel" menu — all use. The legacy SWT view is still reachable
-     * via {@link #getConversationView(IWorkbenchPage)} for the code-aware
-     * handlers and via Show View > Other > Claude AI for direct opening.
+     * Open the default Claude Code conversation view (V2 webview). This is
+     * the primary entry point used by Ctrl+Shift+C, the toolbar button,
+     * and the "Claude Code &gt; Open Claude Code Panel" menu item.
      */
     public static void openPrimaryView(IWorkbenchPage page) {
         try {
             page.showView(ClaudeConversationViewV2.ID);
         } catch (PartInitException e) {
             e.printStackTrace();
-            // Fall back to the legacy view if V2 fails to instantiate
-            // (e.g. Edge WebView2 unavailable on this machine).
-            try {
-                page.showView(ClaudeConversationView.ID);
-            } catch (PartInitException e2) {
-                e2.printStackTrace();
-            }
         }
     }
 
     /**
-     * Show and get the V2 (webview) Claude Code conversation view —
-     * called by the code-aware handlers (Send Selection, Explain Code,
-     * Review Code, Refactor Code, Run CLI on File, etc.) so their
-     * commands target the same chat the user sees as the default. If
-     * V2 fails (Edge WebView2 unavailable), falls back to V1 by
-     * returning null so the caller can call
-     * {@link #getConversationView(IWorkbenchPage)} as a backup.
+     * Show and return the Claude Code conversation view (V2 webview).
+     * Called by the code-aware handlers (Send Selection, Explain Code,
+     * Review Code, Refactor Code, Run CLI on File, Resume Session, New
+     * Session) so their commands target the same chat the user sees as
+     * the default.
+     *
+     * @return the view, or {@code null} if it fails to instantiate (e.g.
+     *     Edge WebView2 unavailable on this machine — extremely rare on
+     *     supported Windows installs).
      */
     public static ClaudeConversationViewV2 getConversationViewV2(IWorkbenchPage page) {
         try {

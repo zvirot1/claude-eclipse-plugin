@@ -504,7 +504,6 @@
         bridge.on('toast', function(data) {
             if (data && data.message) showToast(data.message);
         });
-        bridge.on('selection_indicator', handleSelectionIndicator);
         bridge.on('paste_from_clipboard', handlePasteFromClipboard);
         bridge.on('active_file_changed', handleActiveFileChanged);
         bridge.on('attach_active_file_changed', handleAttachActiveFileChanged);
@@ -531,25 +530,6 @@
             document.body.classList.add('light');
         } else {
             document.body.classList.remove('light');
-        }
-    }
-
-    // ==================== Selection Indicator ====================
-
-    function handleSelectionIndicator(data) {
-        var badge = document.getElementById('selection-badge');
-        if (!badge) {
-            badge = document.createElement('div');
-            badge.id = 'selection-badge';
-            badge.className = 'selection-badge';
-            var inputArea = document.querySelector('.input-area');
-            if (inputArea) inputArea.parentNode.insertBefore(badge, inputArea);
-        }
-        if (data.lineCount > 0) {
-            badge.textContent = data.lineCount + ' lines in ' + data.fileName;
-            badge.classList.remove('hidden');
-        } else {
-            badge.classList.add('hidden');
         }
     }
 

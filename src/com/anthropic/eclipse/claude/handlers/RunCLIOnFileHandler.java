@@ -5,12 +5,10 @@ import org.eclipse.ui.*;
 import org.eclipse.core.resources.*;
 import org.eclipse.swt.widgets.Display;
 
-import com.anthropic.eclipse.claude.views.ClaudeConversationView;
 import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 /**
  * Runs Claude Code CLI on the currently open file.
- * Prefers the V2 webview; falls back to the legacy SWT view.
  */
 public class RunCLIOnFileHandler extends AbstractHandler {
 
@@ -56,15 +54,9 @@ public class RunCLIOnFileHandler extends AbstractHandler {
                 code = "";
             }
 
-            // Prefer V2 (webview). Fall back to V1 if V2 unavailable.
-            ClaudeConversationViewV2 v2 = HandlerUtils.getConversationViewV2(page);
-            if (v2 != null) {
-                v2.sendCode(prompt, code);
-                return null;
-            }
-            ClaudeConversationView v1 = HandlerUtils.getConversationView(page);
-            if (v1 != null) {
-                v1.sendCode(prompt, code);
+            ClaudeConversationViewV2 view = HandlerUtils.getConversationViewV2(page);
+            if (view != null) {
+                view.sendCode(prompt, code);
             }
         }
         return null;

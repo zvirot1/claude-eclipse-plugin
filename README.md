@@ -223,9 +223,22 @@ ConversationModel  ─ stateful: message history, streaming block, auto-retry,
                     silent-empty detection, hook-error surfacing
        │ (IConversationListener)
        ▼
-ClaudeConversationView  ─ SWT UI: chat bubbles, input, attach chips,
-                         active-file pin chip, diff viewers, permission prompts
+ClaudeConversationViewV2 ─ Eclipse ViewPart hosting an SWT.Browser (Edge WebView2
+                          on Windows, WebKit elsewhere). Java↔JS bridge via
+                          WebviewBridge — Java events become JSON messages
+                          consumed by webview/js/app.js. The webview renders
+                          chat bubbles, code blocks (Prism syntax-highlighting),
+                          tool-call widgets, attach chips, the active-file pin
+                          chip, permission banners, and the input area.
 ```
+
+Rendering layer (`webview/`):
+- `webview/index.html`      — page shell
+- `webview/css/styles.css`  — light/dark themes
+- `webview/js/app.js`       — message rendering, slash commands, @ mentions,
+                              file/image attachments, drag-drop, Ctrl+V paste
+- `webview/js/bridge.js`    — Java↔JS dispatch
+- `webview/lib/prism*.js`   — code syntax highlighting
 
 Stream-json messages are fanned out by type:
 - `system` → `SystemInit` (subtype=init) **or** `SystemNotification` (hooks/compact)
