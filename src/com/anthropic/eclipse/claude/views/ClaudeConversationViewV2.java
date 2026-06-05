@@ -1470,11 +1470,34 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             Map<String, Object> data = JsonParser.parseObject(payload);
             String editId = JsonParser.getString(data, "editId");
             if (editId == null || editDecisionManager == null) return;
-            // applyToEditor=false: the CLI has already written the file to
-            // disk AND revertOpenEditor has refreshed the editor buffer.
-            // Calling document.set() a second time (which the V1
-            // single-arg acceptEdit does) would mark the buffer dirty
-            // (asterisk) without changing content — pure UI noise.
+
+            // Plan-mode path: the file was reverted to the pre-edit state
+            // by revertPlanModeEdit. Accept means "actually apply the
+            // proposal now" — write the modified content to disk and
+            // refresh the editor.
+            if (planModeRevertedEditIds.remove(editId)) {
+                com.anthropic.eclipse.claude.diff.EditDecisionManager.PendingEdit edit =
+                        editDecisionManager.getEdit(editId);
+                if (edit != null && edit.getModifiedContent() != null) {
+                    try {
+                        java.nio.file.Files.writeString(
+                                java.nio.file.Paths.get(editId),
+                                edit.getModifiedContent(),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        Activator.logInfo("[Webview/Plan] applied proposed content: " + editId
+                                + " (" + edit.getModifiedContent().length() + " bytes)");
+                        refreshSingleFileAsync(editId);
+                    } catch (Exception e) {
+                        Activator.logError("[Webview/Plan] write proposed failed", e);
+                    }
+                }
+            }
+
+            // applyToEditor=false: at this point the file on disk holds the
+            // intended final content (CLI wrote it for non-plan modes, or
+            // we just wrote it for plan mode above) and revertOpenEditor
+            // already refreshed the editor buffer. Calling document.set()
+            // a second time would mark the buffer dirty (asterisk).
             editDecisionManager.acceptEdit(editId, false);
             bridge.sendToWebview("toast",
                 "{\"message\":" + JsonBuilder.jsonString("Edit accepted: "
@@ -1485,31 +1508,64 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
     }
 
     /** Reject the edit — restore the file to its pre-edit state from the
-     *  CheckpointManager snapshot and refresh the editor. */
+     *  per-edit snapshot we captured in {@link #preStageEdit} and refresh
+     *  the editor. Uses the EditDecisionManager's stored
+     *  {@code originalContent} (captured fresh at the start of THIS
+     *  edit) instead of {@link com.anthropic.eclipse.claude.diff.CheckpointManager#revert},
+     *  which keeps a session-wide baseline and would revert all edits at
+     *  once (bug seen by users testing multi-edit Reject).
+     */
     private void handleRejectEdit(String payload) {
         try {
             Map<String, Object> data = JsonParser.parseObject(payload);
             String editId = JsonParser.getString(data, "editId");
             if (editId == null || editDecisionManager == null) return;
-            // Revert restores the snapshotted content on disk.
-            try {
-                Activator.getDefault().getCheckpointManager().revert(editId);
-            } catch (Exception e) {
-                Activator.logWarning("[Webview/Edit] revert from snapshot failed: " + e.getMessage());
+
+            // Plan-mode path: the file is ALREADY at the pre-edit state
+            // because revertPlanModeEdit ran immediately after the tool
+            // completed. Reject becomes pure UI cleanup — no file I/O.
+            if (planModeRevertedEditIds.remove(editId)) {
+                editDecisionManager.rejectEdit(editId);
+                bridge.sendToWebview("toast",
+                    "{\"message\":" + JsonBuilder.jsonString("Proposal discarded: "
+                        + java.nio.file.Paths.get(editId).getFileName()) + "}");
+                Activator.logInfo("[Webview/Plan] discarded proposal: " + editId);
+                return;
+            }
+
+            // Default-mode path: restore from THIS edit's captured original
+            // content. preStageEdit reads the file fresh and stores it as
+            // PendingEdit.originalContent, so this revert undoes only the
+            // latest edit — earlier accepted edits remain on disk.
+            com.anthropic.eclipse.claude.diff.EditDecisionManager.PendingEdit edit =
+                editDecisionManager.getEdit(editId);
+            if (edit != null && edit.getOriginalContent() != null) {
+                try {
+                    java.nio.file.Files.writeString(
+                        java.nio.file.Paths.get(editId),
+                        edit.getOriginalContent(),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                    Activator.logInfo("[Webview/Edit] reverted to per-edit snapshot: " + editId
+                        + " (" + edit.getOriginalContent().length() + " bytes)");
+                } catch (Exception e) {
+                    Activator.logWarning("[Webview/Edit] per-edit revert write failed: "
+                        + e.getMessage());
+                }
+            } else {
+                // Fallback: try the legacy session-wide baseline. Better
+                // than a no-op if the EditDecisionManager state was lost.
+                try {
+                    Activator.getDefault().getCheckpointManager().revert(editId);
+                    Activator.logInfo("[Webview/Edit] fallback to CheckpointManager baseline for: "
+                        + editId);
+                } catch (Exception e) {
+                    Activator.logWarning("[Webview/Edit] fallback revert failed: " + e.getMessage());
+                }
             }
             editDecisionManager.rejectEdit(editId);
-            // Refresh the file in Eclipse so the editor reflects the revert.
-            try {
-                org.eclipse.core.resources.IWorkspaceRoot root =
-                    org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot();
-                org.eclipse.core.resources.IFile[] files = root.findFilesForLocationURI(
-                    java.nio.file.Paths.get(editId).toUri());
-                for (org.eclipse.core.resources.IFile f : files) {
-                    if (f != null && f.exists()) {
-                        f.refreshLocal(org.eclipse.core.resources.IResource.DEPTH_ZERO, null);
-                    }
-                }
-            } catch (Exception ignored) {}
+            // Refresh Eclipse's view of the file AND replace the open
+            // editor buffer with the reverted disk content.
+            refreshSingleFileAsync(editId);
             bridge.sendToWebview("toast",
                 "{\"message\":" + JsonBuilder.jsonString("Edit reverted: "
                     + java.nio.file.Paths.get(editId).getFileName()) + "}");
@@ -2513,6 +2569,20 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
     private final java.util.Set<String> preStagedEditToolIds =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /**
+     * Files that were reverted by the V2 Plan-mode enforcer after the
+     * CLI wrote them. The CLI's "plan" permission mode is "soft" — it
+     * tells Claude to research-only but doesn't actually block
+     * Edit/Write/MultiEdit at the tool-execution layer. We compensate
+     * by immediately restoring the file from the per-edit snapshot in
+     * onToolCallCompleted when currentMode=="plan", so the disk stays
+     * pristine until the user explicitly clicks Accept on the staging
+     * widget (which writes the proposed content). Matches VS Code /
+     * IntelliJ Plan mode UX where the file is a preview only.
+     */
+    private final java.util.Set<String> planModeRevertedEditIds =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     @Override
     public void onToolCallInputComplete(MessageBlock block, MessageBlock.ToolCallSegment toolCall) {
         // BEFORE the tool runs: snapshot the target file so we can show
@@ -2681,10 +2751,61 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 && ("Edit".equals(tn) || "Write".equals(tn) || "MultiEdit".equals(tn))) {
             handleEditToolCompleted(toolCall);
             String path = extractFilePath(toolCall.getInput());
+            // Plan-mode enforcement: the CLI's "plan" permission_mode
+            // doesn't actually block Edit/Write — we have to revert the
+            // file ourselves so it stays a preview until the user clicks
+            // Accept. Skip files outside the project (Claude's internal
+            // .claude/plans/*.md output files) so the user still sees
+            // what Claude planned.
+            if ("plan".equals(currentMode) && path != null && !isPlanScratchFile(path)) {
+                revertPlanModeEdit(path, toolCall.getToolId());
+            }
             if (path != null && !path.isEmpty()) {
                 refreshSingleFileAsync(path);
             }
         }
+    }
+
+    /**
+     * In Plan mode, write the pre-edit content (from this edit's
+     * snapshot captured by {@link #preStageEdit}) back to disk so the
+     * file stays pristine until the user clicks Accept on the staging
+     * widget. The widget already shows the proposed diff; Accept now
+     * becomes "Apply the proposal", Reject becomes "Discard the
+     * proposal". Matches VS Code Plan mode where files are preview-only.
+     */
+    private void revertPlanModeEdit(String filePath, String toolId) {
+        if (editDecisionManager == null) return;
+        try {
+            com.anthropic.eclipse.claude.diff.EditDecisionManager.PendingEdit edit =
+                    editDecisionManager.getEdit(filePath);
+            if (edit == null || edit.getOriginalContent() == null) {
+                Activator.logWarning("[Webview/Plan] no per-edit snapshot for " + filePath
+                        + " — cannot enforce plan-mode preview");
+                return;
+            }
+            java.nio.file.Files.writeString(
+                    java.nio.file.Paths.get(filePath),
+                    edit.getOriginalContent(),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            planModeRevertedEditIds.add(filePath);
+            Activator.logInfo("[Webview/Plan] reverted to preview state: " + filePath
+                    + " (" + edit.getOriginalContent().length() + " bytes) toolId=" + toolId);
+        } catch (Exception e) {
+            Activator.logError("[Webview/Plan] revert failed for " + filePath, e);
+        }
+    }
+
+    /**
+     * Return true for Claude's internal plan-output files (under
+     * {@code ~/.claude/plans/}) — these are the plan-summary {@code .md}
+     * documents Claude writes to describe the plan to the user, and we
+     * should NOT revert them (the user wants to read them).
+     */
+    private static boolean isPlanScratchFile(String filePath) {
+        if (filePath == null) return false;
+        String norm = filePath.replace('\\', '/');
+        return norm.contains("/.claude/plans/");
     }
 
     /**
