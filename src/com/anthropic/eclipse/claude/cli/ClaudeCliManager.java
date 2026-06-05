@@ -222,6 +222,27 @@ public class ClaudeCliManager {
         try {
             List<String> command = buildCommand(config);
 
+            // Log the flag set (NOT the full values — system prompt can be
+            // large) so we can confirm which options were applied: model,
+            // permission-mode, effort, resume, and whether a project-context
+            // system-prompt supplement was attached.
+            try {
+                StringBuilder flags = new StringBuilder("[CLI/Start] flags:");
+                for (int fi = 0; fi < command.size(); fi++) {
+                    String tok = command.get(fi);
+                    if (tok.startsWith("--")) {
+                        flags.append(' ').append(tok);
+                        // Show the value for short flags, mask long ones.
+                        if (fi + 1 < command.size() && !command.get(fi + 1).startsWith("--")) {
+                            String val = command.get(fi + 1);
+                            flags.append('=').append(val.length() > 40
+                                ? "<" + val.length() + " chars>" : val);
+                        }
+                    }
+                }
+                Activator.logInfo(flags.toString());
+            } catch (Exception ignored) {}
+
             ProcessBuilder pb = new ProcessBuilder(command);
             pb.directory(new File(config.getWorkingDirectory()));
             pb.environment().put("FORCE_COLOR", "0");  // No ANSI colors

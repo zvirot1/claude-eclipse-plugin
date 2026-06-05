@@ -433,16 +433,20 @@ html, body {
 }
 
 /* ==================== Selection Badge ==================== */
-.selection-badge {
-    padding: 4px 10px;
-    font-size: 0.8em;
-    color: var(--claude-orange);
+/* Calm "no visible activity for Xs" banner shown above the input when a
+   turn has been silent past the inactivity window. Informational, not an
+   error — Claude is still connected. */
+.no-activity-banner {
+    display: none;
+    padding: 6px 12px;
+    font-size: 0.82em;
+    line-height: 1.4;
+    color: var(--text-secondary, #888);
     background: var(--bg-secondary);
     border: 1px solid var(--border-subtle);
-    border-radius: 4px;
+    border-radius: 6px;
     margin: 4px 12px 0;
 }
-.selection-badge.hidden { display: none; }
 
 /* ==================== Edit Staged Widget ==================== */
 .edit-staged-widget {
