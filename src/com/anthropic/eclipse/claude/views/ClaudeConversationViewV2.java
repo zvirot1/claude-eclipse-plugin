@@ -299,6 +299,76 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         }
     }
 
+    /**
+     * Like {@link #buildActiveFilePinContext} but ignores the
+     * ATTACH_ACTIVE_FILE preference — used by prompt-template slash
+     * commands (/explain, /fix, …) that operate on "the current file",
+     * so they work even when the active-file pin is toggled off.
+     */
+    private String buildActiveFileContextForce() {
+        try {
+            org.eclipse.core.resources.IFile file = getActiveFileFromEditor();
+            if (file == null || file.getLocation() == null) return null;
+            String path = file.getLocation().toOSString();
+            String content = readFileBounded(java.nio.file.Paths.get(path), 200);
+            if (content == null) return null;
+            int MAX = 64 * 1024;
+            String note = "";
+            if (content.length() > MAX) {
+                content = content.substring(0, MAX);
+                note = "\n... (truncated to 64KB)";
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("<file path=\"").append(path).append("\" pinned=\"active-editor\">\n");
+            sb.append(content).append(note);
+            if (!content.endsWith("\n")) sb.append("\n");
+            sb.append("</file>\n\n");
+            return sb.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Expand a prompt-template slash command (/explain, /fix, /test,
+     * /refactor, /commit, /review-pr) into a real natural-language
+     * instruction. These are NOT built-in Claude CLI commands — forwarding
+     * the literal "/explain" makes the CLI return nothing ("Unknown
+     * skill"). Returns the expanded prompt, or {@code null} if the command
+     * isn't a known template (caller then forwards verbatim, e.g.
+     * /compact which IS a real CLI built-in). Any trailing args the user
+     * typed are appended.
+     */
+    private static String expandPromptTemplate(String fullCommand) {
+        if (fullCommand == null) return null;
+        String[] parts = fullCommand.trim().split("\\s+", 2);
+        String cmd = parts[0].toLowerCase();
+        String extra = (parts.length > 1 && !parts[1].isBlank())
+                ? "\n\nAdditional instructions: " + parts[1].trim() : "";
+        switch (cmd) {
+            case "/explain":
+                return "Please explain what the currently open file (or the selected code) does, "
+                        + "step by step, in clear terms." + extra;
+            case "/fix":
+                return "Please review the currently open file for bugs and fix them. "
+                        + "Explain each problem you found and the fix you applied." + extra;
+            case "/test":
+                return "Please generate thorough unit tests for the currently open file, "
+                        + "covering edge cases." + extra;
+            case "/refactor":
+                return "Please refactor the currently open file to improve readability and "
+                        + "maintainability while preserving its behavior. Explain your changes." + extra;
+            case "/commit":
+                return "Please generate a clear, conventional git commit message describing the "
+                        + "current changes in this repository." + extra;
+            case "/review-pr":
+                return "Please review the recent changes / current pull request for bugs, "
+                        + "performance issues, security concerns, and best-practice violations." + extra;
+            default:
+                return null;
+        }
+    }
+
     private static String readFileBounded(java.nio.file.Path nio, long timeoutMs) {
         java.util.concurrent.CompletableFuture<String> fut = java.util.concurrent.CompletableFuture
                 .supplyAsync(() -> {
@@ -685,6 +755,19 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                     && com.anthropic.eclipse.claude.views.widgets.SlashCommandHandler
                         .isLocalCommand(message)) {
                 runLocalSlashCommand(message.trim());
+                return;
+            }
+
+            // Prompt-template slash commands (/explain, /fix, /test,
+            // /refactor, /commit, /review-pr) typed manually + Enter. These
+            // aren't CLI built-ins — expand them into real instructions and
+            // route through handleExecuteSlashCommand so the same expansion +
+            // active-file-context logic applies. (Picker selections already
+            // go through execute_slash_command.)
+            if (message != null && message.startsWith("/")
+                    && expandPromptTemplate(message) != null) {
+                handleExecuteSlashCommand(
+                    "{\"command\":" + JsonBuilder.jsonString(message.trim()) + "}");
                 return;
             }
 
@@ -1270,11 +1353,26 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 runLocalSlashCommand(fullCommand);
                 return;
             }
-            // CLI-forwarded slash command
+            // CLI-forwarded slash command. Expand prompt-template commands
+            // (/explain, /fix, …) into real instructions — the CLI has no
+            // built-in skill for them, so forwarding "/explain" verbatim
+            // returns nothing. /compact and any unknown command are
+            // forwarded as-is.
             if (!cliManager.isRunning()) autoStartCli();
             if (cliManager.isRunning()) {
-                model.addUserMessage(fullCommand);
-                cliManager.sendMessage(fullCommand);
+                String expanded = expandPromptTemplate(fullCommand);
+                if (expanded != null) {
+                    // Bubble shows the readable instruction; CLI gets the
+                    // instruction + the active file so "the current file"
+                    // resolves even if the pin is off.
+                    model.addUserMessage(expanded);
+                    String ctx = buildActiveFileContextForce();
+                    String forCli = (ctx != null && !ctx.isEmpty()) ? ctx + expanded : expanded;
+                    cliManager.sendMessage(forCli);
+                } else {
+                    model.addUserMessage(fullCommand);
+                    cliManager.sendMessage(fullCommand);
+                }
             }
         } catch (Exception e) {
             Activator.logError("[Webview] execute_slash_command failed", e);
