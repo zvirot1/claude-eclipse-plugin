@@ -3,7 +3,6 @@ package com.anthropic.eclipse.claude.handlers;
 import org.eclipse.core.commands.*;
 import org.eclipse.ui.*;
 
-import com.anthropic.eclipse.claude.views.ClaudeConversationView;
 import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 import org.eclipse.swt.widgets.Display;
@@ -25,15 +24,9 @@ public class ExplainCodeHandler extends AbstractHandler {
         }
 
         String prompt = "Please explain what this code does, step by step:";
-        // Prefer V2 (webview). Fall back to V1 if V2 unavailable.
-        ClaudeConversationViewV2 v2 = HandlerUtils.getConversationViewV2(window.getActivePage());
-        if (v2 != null) {
-            v2.sendCode(prompt, selectedText);
-            return null;
-        }
-        ClaudeConversationView v1 = HandlerUtils.getConversationView(window.getActivePage());
-        if (v1 != null) {
-            v1.sendCode(prompt, selectedText);
+        ClaudeConversationViewV2 view = HandlerUtils.getConversationViewV2(window.getActivePage());
+        if (view != null) {
+            view.sendCode(prompt, selectedText);
         }
         return null;
     }

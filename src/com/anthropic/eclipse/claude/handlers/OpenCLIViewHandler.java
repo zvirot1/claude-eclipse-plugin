@@ -2,10 +2,10 @@ package com.anthropic.eclipse.claude.handlers;
 
 import org.eclipse.core.commands.*;
 import org.eclipse.ui.*;
-import com.anthropic.eclipse.claude.views.ClaudeConversationView;
+import com.anthropic.eclipse.claude.views.ClaudeConversationViewV2;
 
 /**
- * Opens the Claude Code conversation view.
+ * Opens the Claude Code conversation view (V2 webview).
  */
 public class OpenCLIViewHandler extends AbstractHandler {
 
@@ -14,7 +14,7 @@ public class OpenCLIViewHandler extends AbstractHandler {
         IWorkbenchWindow window = HandlerUtils.getActiveWindow(event);
         if (window == null) return null;
         try {
-            window.getActivePage().showView(ClaudeConversationView.ID);
+            window.getActivePage().showView(ClaudeConversationViewV2.ID);
         } catch (PartInitException e) {
             e.printStackTrace();
         }

@@ -240,7 +240,7 @@ public class Activator extends AbstractUIPlugin {
     }
 
     /**
-     * Set the active ConversationModel. Called by ClaudeConversationView when it
+     * Set the active ConversationModel. Called by ClaudeConversationViewV2 when it
      * creates or destroys its model. Notifies any registered model-change listeners.
      */
     public void setConversationModel(ConversationModel model) {
