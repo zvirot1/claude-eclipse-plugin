@@ -76,6 +76,25 @@ public class CliProcessConfig {
         return b.build();
     }
 
+    /**
+     * Create a new config with a different model, preserving every other
+     * setting and adding --resume so the session memory carries over.
+     * Used for hot-swapping the model mid-conversation without losing
+     * context (mirrors {@link #withModeAndEffort}).
+     *
+     * @param newModel        new model id (e.g. "opus", "sonnet", "haiku",
+     *                        or a full model name) — null leaves unchanged
+     * @param resumeSessionId session ID to resume — non-null to preserve memory
+     */
+    public CliProcessConfig withModel(String newModel, String resumeSessionId) {
+        Builder b = toBuilder();
+        if (newModel != null) b.model(newModel);
+        if (resumeSessionId != null && !resumeSessionId.isEmpty()) {
+            b.resumeSessionId(resumeSessionId);
+        }
+        return b.build();
+    }
+
     /** Copy this config into a fresh Builder. */
     public Builder toBuilder() {
         Builder b = new Builder(cliPath, workingDirectory)

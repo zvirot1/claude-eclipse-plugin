@@ -521,6 +521,9 @@
         bridge.on('edit_staged', handleEditStaged);
         bridge.on('attachments_updated', handleAttachmentsUpdated);
         bridge.on('attachments_cleared', handleAttachmentsCleared);
+        bridge.on('no_activity_warning', handleNoActivityWarning);
+        bridge.on('no_activity_cleared', handleNoActivityCleared);
+        bridge.on('generation_stopped', handleGenerationStopped);
     }
 
     // ==================== Theme & RTL ====================
@@ -834,8 +837,47 @@
                 reconnectBtn.classList.remove('hidden');
                 setStreamingState(false);
                 removeLoadingIndicator();
+                // If Java sent a crash diagnosis (exit code + likely cause),
+                // surface it as a system bubble so the user understands WHY
+                // the CLI terminated and can click Reconnect.
+                if (data.diagnosis) {
+                    handleSystemMessage({ text: data.diagnosis });
+                }
                 break;
         }
+    }
+
+    // ==================== No-activity banner ====================
+
+    function handleNoActivityWarning(data) {
+        // Show a single calm banner above the input; replace if already shown.
+        var existing = document.getElementById('no-activity-banner');
+        if (!existing) {
+            existing = document.createElement('div');
+            existing.id = 'no-activity-banner';
+            existing.className = 'no-activity-banner';
+            var inputArea = document.getElementById('input-area');
+            if (inputArea && inputArea.parentNode) {
+                inputArea.parentNode.insertBefore(existing, inputArea);
+            } else {
+                messagesContainer.appendChild(existing);
+            }
+        }
+        existing.textContent = (data && data.message) ? data.message : 'No visible activity.';
+        existing.style.display = 'block';
+    }
+
+    function handleNoActivityCleared() {
+        var existing = document.getElementById('no-activity-banner');
+        if (existing) existing.style.display = 'none';
+    }
+
+    function handleGenerationStopped() {
+        // Soft-cancel acknowledged by Java — reset the streaming UI.
+        setStreamingState(false);
+        removeThinkingIndicator();
+        removeLoadingIndicator();
+        handleNoActivityCleared();
     }
 
     function handleBusyStateChanged(data) {
