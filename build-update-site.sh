@@ -176,7 +176,7 @@ artifact.repository.factory.order = artifacts.xml.xz,artifacts.xml,!
 EOF
 
 # Package zip
-ZIP_NAME="claude-eclipse-plugin-update-site-${ECLIPSE_TARGET}-${TIMESTAMP}.zip"
+ZIP_NAME="claude-eclipse-plugin-V2-webview-update-site-${ECLIPSE_TARGET}-${TIMESTAMP}.zip"
 rm -f "$ZIP_NAME"
 (cd "$SITE_DIR" && jar cMf "../../$ZIP_NAME" .)
 
