@@ -554,7 +554,7 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 handleSendMessage(payload);
                 break;
             case "stop_generation":
-                if (cliManager.isRunning()) cliManager.stop();
+                interruptCurrentQuery();
                 break;
             case "new_session":
                 handleNewSession();
@@ -671,6 +671,23 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         try {
             Map<String, Object> data = JsonParser.parseObject(payload);
             String message = JsonParser.getString(data, "message");
+
+            // Route LOCAL slash commands (/model, /new, /clear, /cost, /help,
+            // /rules, /mcp, /hooks, /memory, /skills, /history, /resume,
+            // /stop) to the local handler instead of forwarding to the CLI.
+            // Without this, commands like "/model haiku" reach the CLI which
+            // rejects them as "Unknown skill: model". This path catches BOTH
+            // manually-typed commands AND the sub-option picker (which sends
+            // e.g. "/model haiku" through send_message). CLI-forwarded slash
+            // commands (/compact, /commit, …) are NOT local, so they fall
+            // through and reach the CLI as before.
+            if (message != null && message.startsWith("/")
+                    && com.anthropic.eclipse.claude.views.widgets.SlashCommandHandler
+                        .isLocalCommand(message)) {
+                runLocalSlashCommand(message.trim());
+                return;
+            }
+
             // Images (from clipboard paste, drag-drop, or attach menu) —
             // base64-encoded PNG/JPG bytes that the CLI can ingest via the
             // rich user_input NDJSON variant.
@@ -1280,7 +1297,7 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 switch (cmd) {
                     case "/new":     handleNewSession(); break;
                     case "/clear":   model.clear(); break;
-                    case "/stop":    if (cliManager.isRunning()) cliManager.stop(); break;
+                    case "/stop":    interruptCurrentQuery(); break;
                     case "/help":
                         bridge.sendToWebview("system_message", "{\"text\":"
                             + JsonBuilder.jsonString(com.anthropic.eclipse.claude.views.widgets
@@ -1316,14 +1333,22 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                         break;
                     }
                     case "/model": {
-                        SessionInfo info = (model != null) ? model.getSessionInfo() : null;
-                        String cur = (info != null && info.getModel() != null)
-                            ? info.getModel() : "(unknown)";
-                        bridge.sendToWebview("system_message",
-                            "{\"text\":" + JsonBuilder.jsonString(
-                                "Current model: " + cur
-                                + "\n\nTo switch models, edit Window > Preferences > Claude AI > Model "
-                                + "and start a new conversation.") + "}");
+                        String arg = (parts.length > 1) ? parts[1].trim() : "";
+                        if (arg.isEmpty()) {
+                            // No arg: show current model + available choices.
+                            SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+                            String cur = (info != null && info.getModel() != null)
+                                ? info.getModel() : "(unknown)";
+                            bridge.sendToWebview("system_message",
+                                "{\"text\":" + JsonBuilder.jsonString(
+                                    "Current model: " + cur
+                                    + "\n\nAvailable: opus, sonnet, haiku"
+                                    + "\nUsage: /model sonnet   (switches the running session in place)") + "}");
+                        } else {
+                            // Hot-swap the model on the running CLI, preserving
+                            // session memory via --resume.
+                            hotSwapModel(arg);
+                        }
                         break;
                     }
                     default:
@@ -1729,6 +1754,340 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         } catch (Exception e) {
             Activator.logWarning("[Webview] hotSwapCliForModeOrEffort failed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Switch the model on the running CLI in place, preserving session
+     * memory via {@code --resume}. Invoked by {@code /model <name>}.
+     * Accepts an alias ("opus" / "sonnet" / "haiku") or a full model id;
+     * normalizes via {@link #mapModelName}. Persists the choice to
+     * preferences so future sessions inherit it. If the CLI isn't running
+     * yet, just persists — the next start picks it up.
+     */
+    private void hotSwapModel(String requestedModel) {
+        if (requestedModel == null || requestedModel.isBlank()) return;
+        String mapped = mapModelName(requestedModel);
+        if (mapped == null) mapped = requestedModel.trim();
+
+        // Persist so new conversations start with the same model.
+        try {
+            IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+            prefs.setValue(PreferenceConstants.MODEL, mapped);
+        } catch (Exception ignored) {}
+
+        final String finalMapped = mapped;
+        try {
+            if (cliManager == null) return;
+            ClaudeCliManager.ProcessState state = cliManager.getState();
+            if (state != ClaudeCliManager.ProcessState.RUNNING
+                    && state != ClaudeCliManager.ProcessState.STARTING) {
+                // Not running — preference is set; next start uses it.
+                bridge.sendToWebview("system_message", "{\"text\":"
+                    + JsonBuilder.jsonString("Model set to " + finalMapped
+                        + ". It will apply on the next session start.") + "}");
+                return;
+            }
+            CliProcessConfig oldConfig = cliManager.getConfig();
+            if (oldConfig == null) return;
+
+            String sessionId = null;
+            try {
+                SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+                if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+                    sessionId = info.getSessionId();
+                }
+            } catch (Exception ignored) {}
+
+            CliProcessConfig newConfig = oldConfig.withModel(finalMapped, sessionId);
+            cliManager.restartWithConfig(newConfig);
+            bridge.sendToWebview("system_message", "{\"text\":"
+                + JsonBuilder.jsonString("Switched model to " + finalMapped
+                    + " — conversation memory preserved.") + "}");
+            Activator.logInfo("[Webview/Model] hot-swapped to " + finalMapped
+                + " resume=" + sessionId);
+        } catch (Exception e) {
+            Activator.logWarning("[Webview/Model] hotSwapModel failed: " + e.getMessage());
+            bridge.sendToWebview("error", "{\"message\":"
+                + JsonBuilder.jsonString("Failed to switch model: " + e.getMessage()) + "}");
+        }
+    }
+
+    /**
+     * Soft-cancel the in-flight query: send an interrupt that lets the CLI
+     * stop the current turn WITHOUT killing the process, preserving session
+     * memory via {@code --resume}. Mirrors V1's {@code handleStop}. Falls
+     * back to a hard stop only if interrupt isn't possible. The send button
+     * is reset in JS via the {@code generation_stopped} event.
+     */
+    private void interruptCurrentQuery() {
+        try {
+            cancelStreamingTimeout();
+            if (cliManager == null || !cliManager.isRunning()) return;
+            String sessionId = null;
+            try {
+                SessionInfo info = (model != null) ? model.getSessionInfo() : null;
+                if (info != null && info.getSessionId() != null && !info.getSessionId().isEmpty()) {
+                    sessionId = info.getSessionId();
+                }
+            } catch (Exception ignored) {}
+            cliManager.interruptCurrentQuery(sessionId);
+            bridge.sendToWebview("generation_stopped", "{}");
+            Activator.logInfo("[Webview] interruptCurrentQuery resume=" + sessionId);
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] interruptCurrentQuery failed: " + e.getMessage());
+            // Last resort: hard stop.
+            try { if (cliManager != null) cliManager.stop(); } catch (Exception ignored) {}
+        }
+    }
+
+    // ====================== No-activity timeout banner ======================
+
+    /** Inactivity window before the calm "no visible activity" banner shows. */
+    private static final long STREAMING_TIMEOUT_MS = 120_000L;
+    private volatile long lastStreamActivityMs = 0L;
+    private volatile boolean streamingActive = false;
+    /** True once we've shown the no-activity banner; lets us dismiss it. */
+    private volatile boolean noActivityBannerShown = false;
+
+    /**
+     * Called from streaming listener callbacks whenever activity arrives.
+     * Resets the inactivity timer; dismisses any showing banner; starts the
+     * periodic check if not already running. Thread-safe (callbacks may
+     * arrive on the NDJSON reader thread). Mirrors V1's touchStreamActivity.
+     */
+    private void touchStreamActivity() {
+        lastStreamActivityMs = System.currentTimeMillis();
+        if (noActivityBannerShown) {
+            noActivityBannerShown = false;
+            bridge.sendToWebview("no_activity_cleared", "{}");
+        }
+        if (!streamingActive) {
+            streamingActive = true;
+            Display display = (browser != null && !browser.isDisposed())
+                    ? browser.getDisplay() : Display.getDefault();
+            if (display != null && !display.isDisposed()) {
+                display.asyncExec(() -> {
+                    if (!display.isDisposed() && streamingActive) {
+                        display.timerExec((int) STREAMING_TIMEOUT_MS, this::checkStreamingTimeout);
+                    }
+                });
+            }
+        }
+    }
+
+    /** Stop the inactivity timer and dismiss any banner (turn ended/cancelled). */
+    private void cancelStreamingTimeout() {
+        streamingActive = false;
+        if (noActivityBannerShown) {
+            noActivityBannerShown = false;
+            try { bridge.sendToWebview("no_activity_cleared", "{}"); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Periodic check on the SWT thread. While a tool is actively running we
+     * extend the window (long builds have silent periods). Otherwise, if no
+     * activity for the full window, show a calm informational banner (NOT an
+     * error — Claude is still connected, possibly reasoning or batching).
+     * Reschedules so the banner is dismissed the moment activity returns.
+     */
+    private void checkStreamingTimeout() {
+        if (!streamingActive) return;
+        try {
+            if (model != null && model.hasRunningToolCalls()) {
+                Display d = (browser != null && !browser.isDisposed())
+                        ? browser.getDisplay() : Display.getDefault();
+                if (d != null && !d.isDisposed()) {
+                    d.timerExec((int) STREAMING_TIMEOUT_MS, this::checkStreamingTimeout);
+                }
+                return;
+            }
+            long elapsed = System.currentTimeMillis() - lastStreamActivityMs;
+            if (elapsed >= STREAMING_TIMEOUT_MS) {
+                long mins = elapsed / 60_000L;
+                String human = (mins > 0) ? (mins + " min" + (mins == 1 ? "" : "s"))
+                                          : ((elapsed / 1000L) + "s");
+                String msg = "⏱ No visible activity for " + human + "."
+                        + " Claude is still connected; it may be reasoning or building a long result."
+                        + " Keep waiting, or click ■ stop to cancel.";
+                noActivityBannerShown = true;
+                bridge.sendToWebview("no_activity_warning",
+                        "{\"message\":" + JsonBuilder.jsonString(msg) + "}");
+            }
+            // Keep checking so we can dismiss the banner when activity resumes.
+            Display d = (browser != null && !browser.isDisposed())
+                    ? browser.getDisplay() : Display.getDefault();
+            if (d != null && !d.isDisposed()) {
+                d.timerExec((int) STREAMING_TIMEOUT_MS, this::checkStreamingTimeout);
+            }
+        } catch (Exception e) {
+            Activator.logWarning("[Webview] checkStreamingTimeout failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Translate a CLI exit code into a human-readable hint. Mirrors V1's
+     * diagnoseCrash so the crash banner explains likely causes.
+     */
+    private static String diagnoseCrash(int exitCode) {
+        switch (exitCode) {
+            case 0:   return "Session ended normally.";
+            case 1:   return "Check your API key / Bedrock credentials in Preferences > Claude AI.";
+            case 2:   return "Invalid arguments — try starting a new session.";
+            case 127: return "CLI not found. Check the CLI path in Preferences.";
+            case 130: return "Interrupted (Ctrl+C).";
+            default:  return exitCode > 0
+                ? "Unexpected exit. Check the Error Log for details."
+                : "Unknown cause — check the Error Log.";
+        }
+    }
+
+    /**
+     * Detect project structure (any language/framework) and return a system
+     * prompt supplement that helps Claude place files in the correct
+     * directories. Ported verbatim from V1. Returns null on any error or if
+     * the working dir isn't a directory.
+     */
+    private String detectProjectContext(String workDir) {
+        try {
+            java.io.File projectDir = new java.io.File(workDir);
+            if (!projectDir.isDirectory()) return null;
+
+            StringBuilder context = new StringBuilder();
+            context.append("You are working inside a project at: ").append(workDir).append("\n");
+
+            boolean hasClasspath = new java.io.File(projectDir, ".classpath").exists();
+            boolean hasPom = new java.io.File(projectDir, "pom.xml").exists();
+            boolean hasGradleGroovy = new java.io.File(projectDir, "build.gradle").exists();
+            boolean hasGradleKotlin = new java.io.File(projectDir, "build.gradle.kts").exists();
+            boolean hasPackageJson = new java.io.File(projectDir, "package.json").exists();
+            boolean hasTsConfig = new java.io.File(projectDir, "tsconfig.json").exists();
+            boolean hasPyProjectToml = new java.io.File(projectDir, "pyproject.toml").exists();
+            boolean hasSetupPy = new java.io.File(projectDir, "setup.py").exists();
+            boolean hasRequirementsTxt = new java.io.File(projectDir, "requirements.txt").exists();
+            boolean hasGoMod = new java.io.File(projectDir, "go.mod").exists();
+            boolean hasCargoToml = new java.io.File(projectDir, "Cargo.toml").exists();
+            boolean hasCMakeLists = new java.io.File(projectDir, "CMakeLists.txt").exists();
+            boolean hasMakefile = new java.io.File(projectDir, "Makefile").exists();
+
+            boolean hasDotNet = false;
+            String[] rootFiles = projectDir.list();
+            if (rootFiles != null) {
+                for (String f : rootFiles) {
+                    if (f.endsWith(".csproj") || f.endsWith(".sln") || f.endsWith(".fsproj")) {
+                        hasDotNet = true; break;
+                    }
+                }
+            }
+
+            if (hasPom || hasGradleGroovy || hasGradleKotlin || hasClasspath) {
+                context.append("Project type: Java/JVM.\n");
+                if (hasPom) {
+                    context.append("Build system: Maven (pom.xml). Convention: source in "
+                        + "'src/main/java/<package>/', tests in 'src/test/java/<package>/', "
+                        + "resources in 'src/main/resources/'.\n");
+                } else if (hasGradleGroovy || hasGradleKotlin) {
+                    context.append("Build system: Gradle. Convention: source in "
+                        + "'src/main/java/<package>/' (or kotlin), tests in 'src/test/java/<package>/'.\n");
+                } else if (hasClasspath) {
+                    java.util.List<String> sourceDirs = parseClasspathSourceDirs(projectDir);
+                    if (!sourceDirs.isEmpty()) {
+                        context.append("Source directories (from .classpath): ")
+                            .append(String.join(", ", sourceDirs))
+                            .append(". Place source files in '").append(sourceDirs.get(0))
+                            .append("/<package>/'.\n");
+                    }
+                }
+                context.append("IMPORTANT: Never create .java/.kt files at the project root. "
+                    + "Always use the correct source directory with package structure.\n");
+            }
+            if (hasPackageJson) {
+                context.append("Project type: Node.js");
+                if (hasTsConfig) context.append(" + TypeScript");
+                context.append(". ");
+                boolean hasSrcDir = new java.io.File(projectDir, "src").isDirectory();
+                boolean hasAppDir = new java.io.File(projectDir, "app").isDirectory();
+                if (hasSrcDir) context.append("Source files go in 'src/'.");
+                else if (hasAppDir) context.append("Next.js/Remix app — source in 'app/'.");
+                context.append(" Do NOT create source files at the root unless config.\n");
+            }
+            if (hasPyProjectToml || hasSetupPy || hasRequirementsTxt) {
+                context.append("Project type: Python. ");
+                boolean hasSrcDir = new java.io.File(projectDir, "src").isDirectory();
+                if (hasSrcDir) context.append("src-layout: modules in 'src/<package>/'. ");
+                context.append("Tests in 'tests/'. New modules go in the package dir, not root.\n");
+            }
+            if (hasGoMod) {
+                context.append("Project type: Go. Executables in 'cmd/<name>/', "
+                    + "libraries in 'internal/' or 'pkg/'. Tests use '_test.go'.\n");
+            }
+            if (hasCargoToml) {
+                context.append("Project type: Rust. Source in 'src/' (main.rs / lib.rs), tests in 'tests/'.\n");
+            }
+            if (hasCMakeLists || hasMakefile) {
+                context.append("Project type: C/C++. Source (.c/.cpp) in 'src/', headers in 'include/'.\n");
+            }
+            if (hasDotNet) {
+                context.append("Project type: .NET/C#. Follow the namespace-to-folder mapping.\n");
+            }
+
+            // Top-level structure (skip noise dirs).
+            if (rootFiles != null) {
+                java.util.List<String> entries = new java.util.ArrayList<>();
+                for (String entry : rootFiles) {
+                    if (entry.startsWith(".")) continue;
+                    java.io.File f = new java.io.File(projectDir, entry);
+                    if (f.isDirectory()) {
+                        if (!"node_modules".equals(entry) && !"bin".equals(entry)
+                                && !"build".equals(entry) && !"target".equals(entry)
+                                && !"dist".equals(entry) && !"out".equals(entry)
+                                && !"__pycache__".equals(entry) && !"venv".equals(entry)
+                                && !"env".equals(entry)) {
+                            entries.add(entry + "/");
+                        }
+                    } else if (entry.endsWith(".json") || entry.endsWith(".xml")
+                            || entry.endsWith(".toml") || entry.endsWith(".gradle")
+                            || entry.equals("Makefile") || entry.equals("README.md")) {
+                        entries.add(entry);
+                    }
+                }
+                if (!entries.isEmpty()) {
+                    context.append("Top-level structure: ").append(String.join(", ", entries)).append("\n");
+                }
+            }
+            context.append("RULE: Follow existing project conventions; never create source files "
+                + "at the project root unless it's a config/build file.\n");
+            return context.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Parse {@code kind="src"} path entries from an Eclipse .classpath file. */
+    private java.util.List<String> parseClasspathSourceDirs(java.io.File projectDir) {
+        java.util.List<String> sourceDirs = new java.util.ArrayList<>();
+        try {
+            java.io.File dotClasspath = new java.io.File(projectDir, ".classpath");
+            if (!dotClasspath.exists()) return sourceDirs;
+            String xml = new String(java.nio.file.Files.readAllBytes(dotClasspath.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            int idx = 0;
+            while ((idx = xml.indexOf("kind=\"src\"", idx)) >= 0) {
+                int pathStart = xml.indexOf("path=\"", idx);
+                if (pathStart >= 0 && pathStart < idx + 80) {
+                    pathStart += 6;
+                    int pathEnd = xml.indexOf("\"", pathStart);
+                    if (pathEnd > pathStart) {
+                        String srcPath = xml.substring(pathStart, pathEnd);
+                        if (!srcPath.isEmpty() && !srcPath.startsWith("/")) {
+                            sourceDirs.add(srcPath);
+                        }
+                    }
+                }
+                idx++;
+            }
+        } catch (Exception ignored) {}
+        return sourceDirs;
     }
 
     /**
@@ -2283,6 +2642,12 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 .effort(currentEffort)
                 .resumeSessionId(sessionId);
             if (maxTurns > 0) builder.maxTurns(maxTurns);
+            try {
+                String projectContext = detectProjectContext(workDir);
+                if (projectContext != null && !projectContext.isBlank()) {
+                    builder.appendSystemPrompt(projectContext);
+                }
+            } catch (Exception ignored) {}
             cliManager.start(builder.build());
         } catch (Exception e) {
             Activator.logWarning("[Webview] CLI start with --resume failed: " + e.getMessage());
@@ -2542,17 +2907,20 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
 
     @Override
     public void onAssistantMessageStarted(MessageBlock block) {
+        touchStreamActivity();
         bridge.sendToWebview("assistant_message_started", JsonBuilder.buildMessageBlockJson(block));
     }
 
     @Override
     public void onStreamingTextAppended(MessageBlock block, String delta) {
+        touchStreamActivity();
         bridge.sendToWebview("streaming_text_appended",
             "{\"delta\":" + JsonBuilder.jsonString(delta) + "}");
     }
 
     @Override
     public void onToolCallStarted(MessageBlock block, MessageBlock.ToolCallSegment toolCall) {
+        touchStreamActivity();
         Activator.logInfo("[Webview/Tool] STARTED  toolId=" + toolCall.getToolId()
             + " name=" + toolCall.getToolName());
         bridge.sendToWebview("tool_call_started", JsonBuilder.buildToolCallJson(toolCall));
@@ -3030,6 +3398,7 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
 
     @Override
     public void onResultReceived(UsageInfo usage) {
+        cancelStreamingTimeout();
         Activator.logInfo("[Webview/Turn] result_received "
             + "tokens=" + usage.formatTokens()
             + " cost=" + usage.formatCost()
@@ -3137,6 +3506,10 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
 
     @Override
     public void onStateChanged(ClaudeCliManager.ProcessState oldState, ClaudeCliManager.ProcessState newState) {
+        // Any state change ends the active turn — stop the inactivity timer.
+        if (newState != ClaudeCliManager.ProcessState.RUNNING) {
+            cancelStreamingTimeout();
+        }
         String state;
         switch (newState) {
             case RUNNING:   state = "connected";    break;
@@ -3146,6 +3519,22 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             case STOPPING:
             case STOPPED:
             default:        state = "disconnected"; break;
+        }
+        // On a crash (ERROR), include the exit code + a human-readable
+        // diagnosis so the webview can show a richer "CLI terminated"
+        // banner with a Reconnect button (V1's showRestartBanner parity).
+        if (newState == ClaudeCliManager.ProcessState.ERROR) {
+            int exitCode = -1;
+            try { exitCode = cliManager.getLastExitCode(); } catch (Exception ignored) {}
+            String diagnosis = diagnoseCrash(exitCode);
+            String banner = "⚠ Claude CLI terminated"
+                    + (exitCode >= 0 ? " (exit " + exitCode + ")" : "") + ". " + diagnosis;
+            bridge.sendToWebview("cli_state_changed",
+                "{\"state\":\"error\""
+                + ",\"exitCode\":" + exitCode
+                + ",\"diagnosis\":" + JsonBuilder.jsonString(banner) + "}");
+            Activator.logWarning("[Webview] CLI crashed: " + banner);
+            return;
         }
         bridge.sendToWebview("cli_state_changed", "{\"state\":\"" + state + "\"}");
     }
@@ -3197,6 +3586,15 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 .permissionMode(cliPermissionModeFor(currentMode))
                 .effort(currentEffort);
             if (maxTurns > 0) builder.maxTurns(maxTurns);
+            // Project-context supplement: tell Claude where to place files
+            // based on the detected build system (Maven/Gradle/npm/etc.).
+            // Helps in workspaces without a CLAUDE.md. Best-effort.
+            try {
+                String projectContext = detectProjectContext(workDir);
+                if (projectContext != null && !projectContext.isBlank()) {
+                    builder.appendSystemPrompt(projectContext);
+                }
+            } catch (Exception ignored) {}
             cliManager.start(builder.build());
         } catch (ClaudeCliManager.CliException e) {
             bridge.sendToWebview("error", "{\"message\":"
