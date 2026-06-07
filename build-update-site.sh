@@ -10,9 +10,15 @@ PROJECT_DIR="$(pwd)"
 # ==================== Configuration ====================
 TIMESTAMP="${1:-$(date +%Y%m%d%H%M)}"
 VERSION="1.0.0.${TIMESTAMP}"
-ECLIPSE_TARGET="4.32"
+ECLIPSE_TARGET="4.23"
 PLUGIN_ID="com.anthropic.eclipse.claude"
 FEATURE_ID="${PLUGIN_ID}.feature"
+# No local Eclipse 4.23 install — compile against the oldest available
+# platform (2024-06 / SWT 3.126) which is the closest to 4.23 (SWT 3.118).
+# Bytecode targets Java 11 (see javac -source/-target below) and the
+# MANIFEST has no bundle-version upper bounds, so the artifact still loads
+# on a genuine 4.23 runtime. SWT.EDGE exists since 4.19, with a SWT.NONE
+# fallback at runtime.
 ECLIPSE_PLUGINS_DIR="C:/eclipse2024-06/eclipse/plugins"
 
 echo "Building version: ${VERSION}"

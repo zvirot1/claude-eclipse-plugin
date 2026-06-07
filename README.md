@@ -49,7 +49,7 @@ To update: **Help → About → Installation Details → Uninstall** the old ver
 
 ### Prerequisites
 
-- **Eclipse 4.32+** (Java 17 or 21)
+- **Eclipse 4.23+** (Java 11, 17, or 21). On 4.23 the chat view needs the **Edge WebView2 runtime** installed (bundled with Windows 11 and current Windows 10).
 - **Claude Code CLI** installed and authenticated:
   ```
   npm install -g @anthropic-ai/claude-code
@@ -196,7 +196,9 @@ The repo's release builds package a P2 update site ZIP with `features/`, `plugin
 ### Branches
 
 - **`eclipse-4.38`** — Eclipse 2025-12 / Java 21 (default)
+- **`eclipse-4.34`** — Eclipse 2024-12 / Java 21
 - **`eclipse-4.32`** — Eclipse 2024-06 / Java 17
+- **`eclipse-4.23`** — Eclipse 2021-12 / Java 11+ (oldest supported; requires Edge WebView2 runtime on Windows for the chat view)
 - **`main`** — historical baseline
 
 Cherry-pick fixes between them with `git cherry-pick`.
