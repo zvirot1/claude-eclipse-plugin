@@ -280,21 +280,27 @@
         permissionAcceptBtn.addEventListener('click', function () {
             if (state.pendingPermission) {
                 bridge.sendToJava('accept_permission', state.pendingPermission);
-                hidePermissionBanner();
+                state.pendingPermission = null;
+                showNextPermission();   // show the next queued request, if any
             }
         });
 
         permissionRejectBtn.addEventListener('click', function () {
             if (state.pendingPermission) {
                 bridge.sendToJava('reject_permission', state.pendingPermission);
-                hidePermissionBanner();
+                state.pendingPermission = null;
+                showNextPermission();
             }
         });
 
         permissionAlwaysBtn.addEventListener('click', function () {
             if (state.pendingPermission) {
                 bridge.sendToJava('always_allow_permission', state.pendingPermission);
-                hidePermissionBanner();
+                state.pendingPermission = null;
+                // Java will blanket-resolve other queued requests for this
+                // tool and fire permission_resolved for each; showNextPermission
+                // surfaces anything left (e.g. a different tool).
+                showNextPermission();
             }
         });
 
@@ -474,6 +480,7 @@
         bridge.on('assistant_message_completed', handleAssistantMessageCompleted);
         bridge.on('result_received', handleResultReceived);
         bridge.on('permission_requested', handlePermissionRequested);
+        bridge.on('permission_resolved', handlePermissionResolved);
         bridge.on('extended_thinking_started', handleExtendedThinkingStarted);
         bridge.on('extended_thinking_ended', handleExtendedThinkingEnded);
         bridge.on('error', handleError);
@@ -1215,20 +1222,64 @@
         state.lastFinalAssistantEl = null; // consume so the next turn's footer is fresh
     }
 
-    function handlePermissionRequested(data) {
-        state.pendingPermission = {
-            toolUseId: data.toolUseId || null,
-            requestId: data.requestId || null
-        };
+    // Queue of permission requests waiting to be shown. The model can fire
+    // several tools at once (e.g. parallel Bash calls) → multiple
+    // control_requests arrive before the user answers any. Previously the
+    // 2nd request overwrote the 1st (single state.pendingPermission), so the
+    // 1st was never answered and its tool hung "Running" forever. Now we
+    // queue them and show one banner at a time.
+    var permissionQueue = [];
 
-        permissionToolName.textContent = data.toolName || 'Tool Permission';
-        permissionDescription.textContent = data.description || 'Claude wants to use a tool.';
+    function handlePermissionRequested(data) {
+        var req = {
+            toolUseId: data.toolUseId || null,
+            requestId: data.requestId || null,
+            toolName: data.toolName || 'Tool Permission',
+            description: data.description || 'Claude wants to use a tool.'
+        };
+        // De-dupe: ignore if we already have this exact request queued/showing.
+        var dup = (state.pendingPermission
+                    && state.pendingPermission.requestId === req.requestId
+                    && state.pendingPermission.toolUseId === req.toolUseId);
+        for (var i = 0; !dup && i < permissionQueue.length; i++) {
+            if (permissionQueue[i].requestId === req.requestId
+                && permissionQueue[i].toolUseId === req.toolUseId) dup = true;
+        }
+        if (dup) return;
+
+        permissionQueue.push(req);
+        if (!state.pendingPermission) showNextPermission();
+    }
+
+    function showNextPermission() {
+        var req = permissionQueue.shift();
+        if (!req) { hidePermissionBanner(); return; }
+        state.pendingPermission = req;
+        permissionToolName.textContent = req.toolName;
+        permissionDescription.textContent = req.description;
         permissionBanner.classList.remove('hidden');
-        // Trigger pulse animation to draw attention
         permissionBanner.classList.remove('pulse');
         void permissionBanner.offsetWidth; // force reflow
         permissionBanner.classList.add('pulse');
         scrollToBottom();
+    }
+
+    // Java resolved a pending request out-of-band (e.g. "Always Allow <tool>"
+    // blanket-approved every queued request for that tool). Drop it from the
+    // queue / dismiss its banner so the user isn't asked again.
+    function handlePermissionResolved(data) {
+        if (!data) return;
+        permissionQueue = permissionQueue.filter(function (r) {
+            return !((data.requestId && r.requestId === data.requestId)
+                  || (data.toolUseId && r.toolUseId === data.toolUseId));
+        });
+        var cur = state.pendingPermission;
+        if (cur && ((data.requestId && cur.requestId === data.requestId)
+                 || (data.toolUseId && cur.toolUseId === data.toolUseId))) {
+            // The currently-shown banner was resolved externally — advance.
+            state.pendingPermission = null;
+            showNextPermission();
+        }
     }
 
     function handleExtendedThinkingStarted() {
