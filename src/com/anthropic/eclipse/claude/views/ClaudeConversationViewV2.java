@@ -86,6 +86,18 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
     private static final java.util.Map<String, java.util.List<MessageBlock>> PENDING_FORKS =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Parallel to {@link #PENDING_FORKS}: the ORIGINAL session id of the
+     *  conversation being forked, keyed by the new view's secondaryId. The
+     *  new tab resumes this id with --fork-session so it inherits the full
+     *  base context (and a clean JSONL transcript for display). May be
+     *  absent if the source conversation had no session id yet. */
+    private static final java.util.Map<String, String> PENDING_FORK_RESUME =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Set just before {@link #resumeSession(String, boolean)} starts the CLI
+     *  so the builder adds --fork-session for this one launch. */
+    private volatile boolean pendingForkSession = false;
+
     /** Sticky session id — preserved across CLI restarts so a failed
      *  CLI resume on the next launch doesn't lose the view's session. */
     private volatile String stickySessionId;
@@ -617,6 +629,16 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         Activator.logInfo("[Webview] msg from JS: " + type);
         switch (type) {
             case "webview_ready":
+                // Idempotent: SWT.EDGE can fire webview_ready more than once
+                // (page reloads, BrowserFunction re-registration), and the
+                // ProgressListener.completed path may have already pushed the
+                // initial state. Running pushInitialState twice for a fork
+                // tab re-rendered the resumed prefix a second time. Guard so
+                // the initial push (and fork consumption) happens exactly once.
+                if (webviewReady) {
+                    Activator.logInfo("[Webview] webview_ready ignored (already initialized)");
+                    break;
+                }
                 webviewReady = true;
                 pushInitialState();
                 break;
@@ -1235,6 +1257,17 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             // Stash the prefix for the new view's createPartControl to pick up.
             final String secondaryId = "fork-" + System.nanoTime();
             PENDING_FORKS.put(secondaryId, forked);
+            // Also stash the ORIGINAL session id so the new tab can resume it
+            // with --fork-session — that gives the branch the FULL base
+            // conversation in the CLI's memory (the in-memory prefix replay
+            // alone left the CLI empty → "fork forgets the base").
+            try {
+                SessionInfo srcInfo = (model != null) ? model.getSessionInfo() : null;
+                String srcSessionId = (srcInfo != null) ? srcInfo.getSessionId() : null;
+                if (srcSessionId != null && !srcSessionId.isEmpty()) {
+                    PENDING_FORK_RESUME.put(secondaryId, srcSessionId);
+                }
+            } catch (Exception ignored) {}
 
             org.eclipse.swt.widgets.Display d =
                 (browser != null) ? browser.getDisplay() : org.eclipse.swt.widgets.Display.getDefault();
@@ -1243,6 +1276,7 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                     org.eclipse.ui.IWorkbenchPage page = getSite().getPage();
                     if (page == null) {
                         PENDING_FORKS.remove(secondaryId);
+                        PENDING_FORK_RESUME.remove(secondaryId);
                         return;
                     }
                     // Open the new view (Eclipse picks initial placement),
@@ -1252,10 +1286,10 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                     tryRelocateWithRetry(newView, 0);
 
                     bridge.sendToWebview("toast", "{\"message\":"
-                        + JsonBuilder.jsonString("⑂ Forked conversation in new tab ("
-                            + forked.size() + " messages kept)") + "}");
+                        + JsonBuilder.jsonString("⑂ Forked conversation in new tab") + "}");
                 } catch (Exception e) {
                     PENDING_FORKS.remove(secondaryId);
+                    PENDING_FORK_RESUME.remove(secondaryId);
                     Activator.logError("[Webview/Fork] failed to open new tab", e);
                 }
             });
@@ -1277,19 +1311,36 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             String secondaryId = getViewSite().getSecondaryId();
             if (secondaryId == null) return false;
             java.util.List<MessageBlock> forked = PENDING_FORKS.remove(secondaryId);
+            String srcSessionId = PENDING_FORK_RESUME.remove(secondaryId);
             if (forked == null || forked.isEmpty()) return false;
-            Activator.logInfo("[Webview/Fork] new tab consuming prefix of "
-                + forked.size() + " messages (secondaryId=" + secondaryId + ")");
-            // Reset the tab title so the fork can get its own generated
-            // title from the prefix's first user message.
+
+            // Reset the tab title so the fork gets its own generated title.
             partNameSet = false;
             try { setPartName("Claude Code (Fork)"); } catch (Exception ignored) {}
+
+            // PREFERRED PATH: if we know the source session id, resume it with
+            // --fork-session. This gives the branch the FULL base conversation
+            // in the CLI's memory AND renders the clean, deduplicated JSONL
+            // transcript (no double-rendered last message). Fixes both the
+            // "fork forgets the base" and the duplicated-message bugs.
+            if (srcSessionId != null && !srcSessionId.isEmpty()) {
+                Activator.logInfo("[Webview/Fork] new tab forking session " + srcSessionId
+                    + " via --resume --fork-session (secondaryId=" + secondaryId + ")");
+                resumeSession(srcSessionId, true);
+                return true;
+            }
+
+            // FALLBACK (source had no session id yet): replay the in-memory
+            // prefix and start a fresh CLI. The branch won't have CLI-side
+            // memory, but at least the UI shows the prefix.
+            Activator.logInfo("[Webview/Fork] new tab consuming in-memory prefix of "
+                + forked.size() + " messages (no source session id; secondaryId="
+                + secondaryId + ")");
             try {
                 model.loadHistory(forked, Integer.MAX_VALUE);
             } catch (Exception e) {
                 Activator.logError("[Webview/Fork] loadHistory failed", e);
             }
-            // Start a fresh CLI — this is a brand new conversation.
             autoStartCli();
             return true;
         } catch (Exception e) {
@@ -2642,6 +2693,21 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
      * CLI process with --resume so subsequent turns preserve memory.
      */
     private void resumeSession(String sessionId) {
+        resumeSession(sessionId, false);
+    }
+
+    /**
+     * Resume a session. When {@code forkSession} is true, the CLI is started
+     * with {@code --resume <id> --fork-session} — it loads the original
+     * session's full context but writes to a NEW session id, so the original
+     * is untouched. Used by fork-from-message: the branched tab thus has the
+     * complete base conversation in the CLI's memory (fixes "fork forgets the
+     * base") and the displayed transcript comes from the clean, deduplicated
+     * JSONL (fixes the duplicated last message that the in-memory prefix
+     * replay produced).
+     */
+    private void resumeSession(String sessionId, boolean forkSession) {
+        this.pendingForkSession = forkSession;
         try { cliManager.stop(); } catch (Exception ignored) {}
 
         // Tell the webview we're starting fresh so it clears the bubble list.
@@ -2688,8 +2754,14 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         // onAssistantMessageCompleted) — our V2 listener picks those up and
         // pushes them to the webview via the bridge. NB: getMessages()
         // returns an unmodifiable defensive copy, so we cannot add directly.
+        //
+        // The CLI does NOT re-emit the resumed conversation on --resume (or
+        // --fork-session) — verified empirically — so we always pre-render
+        // the JSONL transcript for display. JsonlHistoryLoader deduplicates,
+        // so the prefix shows exactly once.
         java.util.List<MessageBlock> history = JsonlHistoryLoader.load(sessionId);
-        Activator.logInfo("[Webview] resumeSession " + sessionId + " loading " + history.size() + " blocks");
+        Activator.logInfo("[Webview] resumeSession " + sessionId + " loading " + history.size()
+            + " blocks (forkSession=" + forkSession + ")");
         try {
             // V2 uses Chromium scroll; no SWT 32767px limit, so render
             // ALL blocks (Integer.MAX_VALUE = no cap).
@@ -2739,6 +2811,11 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 .permissionMode(cliPermissionModeFor(currentMode))
                 .effort(currentEffort)
                 .resumeSessionId(sessionId);
+            if (pendingForkSession) {
+                builder.forkSession(true);
+                Activator.logInfo("[Webview/Fork] resuming " + sessionId
+                    + " with --fork-session (branch into new session id)");
+            }
             if (maxTurns > 0) builder.maxTurns(maxTurns);
             try {
                 String projectContext = detectProjectContext(workDir);
@@ -2747,6 +2824,7 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 }
             } catch (Exception ignored) {}
             cliManager.start(builder.build());
+            pendingForkSession = false; // consumed
         } catch (Exception e) {
             Activator.logWarning("[Webview] CLI start with --resume failed: " + e.getMessage());
             bridge.sendToWebview("error", "{\"message\":"

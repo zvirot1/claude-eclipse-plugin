@@ -13,6 +13,7 @@ public class CliProcessConfig {
     private final String sessionId;           // null for new session
     private final boolean continueSession;    // --continue flag
     private final String resumeSessionId;     // --resume <id>
+    private final boolean forkSession;        // --fork-session (resume into a NEW session id)
     private final String[] allowedTools;      // --allowedTools
     private final String appendSystemPrompt;  // --append-system-prompt
     private final int maxTurns;               // --max-turns, 0 for unlimited
@@ -27,6 +28,7 @@ public class CliProcessConfig {
         this.sessionId = builder.sessionId;
         this.continueSession = builder.continueSession;
         this.resumeSessionId = builder.resumeSessionId;
+        this.forkSession = builder.forkSession;
         this.allowedTools = builder.allowedTools;
         this.appendSystemPrompt = builder.appendSystemPrompt;
         this.maxTurns = builder.maxTurns;
@@ -41,6 +43,7 @@ public class CliProcessConfig {
     public String getSessionId() { return sessionId; }
     public boolean isContinueSession() { return continueSession; }
     public String getResumeSessionId() { return resumeSessionId; }
+    public boolean isForkSession() { return forkSession; }
     public String[] getAllowedTools() { return allowedTools; }
     public String getAppendSystemPrompt() { return appendSystemPrompt; }
     public int getMaxTurns() { return maxTurns; }
@@ -108,6 +111,7 @@ public class CliProcessConfig {
         if (sessionId != null) b.sessionId(sessionId);
         if (resumeSessionId != null) b.resumeSessionId(resumeSessionId);
         if (continueSession) b.continueSession(true);
+        if (forkSession) b.forkSession(true);
         return b;
     }
 
@@ -122,6 +126,7 @@ public class CliProcessConfig {
         private String sessionId;
         private boolean continueSession;
         private String resumeSessionId;
+        private boolean forkSession;
         private String[] allowedTools;
         private String appendSystemPrompt;
         private int maxTurns;
@@ -155,6 +160,14 @@ public class CliProcessConfig {
 
         public Builder resumeSessionId(String resumeSessionId) {
             this.resumeSessionId = resumeSessionId;
+            return this;
+        }
+
+        /** When true (with resumeSessionId set), the CLI resumes the
+         *  session's history but writes to a NEW session id (--fork-session),
+         *  so the original session is not modified. Used by fork-from-message. */
+        public Builder forkSession(boolean forkSession) {
+            this.forkSession = forkSession;
             return this;
         }
 
