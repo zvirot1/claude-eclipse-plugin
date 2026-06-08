@@ -122,6 +122,27 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
     private final java.util.concurrent.ConcurrentHashMap<String, Object> pendingToolInputs =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Holder for a still-unanswered tool permission request, so that a
+     *  single "Always Allow" can resolve EVERY pending request for the same
+     *  tool. Without this, when the model fires several tools at once (e.g.
+     *  two parallel Bash calls), answering one left the others blocked in the
+     *  CLI forever — the tool box stayed "Running". Keyed by requestKey
+     *  (requestId, or toolUseId for the legacy format). */
+    private static final class PendingPerm {
+        final String requestId;
+        final String toolUseId;
+        final String toolName;
+        final Object toolInput;
+        PendingPerm(String requestId, String toolUseId, String toolName, Object toolInput) {
+            this.requestId = requestId;
+            this.toolUseId = toolUseId;
+            this.toolName = toolName;
+            this.toolInput = toolInput;
+        }
+    }
+    private final java.util.concurrent.ConcurrentHashMap<String, PendingPerm> pendingPerms =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     /** Listener for editor activation/closing — fires {@link #pushActiveFileToWebview()}. */
     private org.eclipse.ui.IPartListener2 activeFilePartListener;
     /** Last active file path pushed to the webview — used to dedup. */
@@ -1800,6 +1821,12 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
             // Recover the original toolInput we stashed during onPermissionRequested.
             String key = (requestId != null && !requestId.isEmpty()) ? requestId : toolUseId;
             Object toolInput = (key != null) ? pendingToolInputs.remove(key) : null;
+            PendingPerm answered = (key != null) ? pendingPerms.remove(key) : null;
+            // toolName may be absent in the JS payload — recover it from the
+            // tracked request so "Always Allow" knows which tool to blanket-approve.
+            if ((toolName == null || toolName.isEmpty()) && answered != null) {
+                toolName = answered.toolName;
+            }
 
             // Send the response to the CLI — without this the tool stays
             // "Running" forever waiting on permission.
@@ -1818,6 +1845,35 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                         prefs.setValue(PreferenceConstants.AUTO_APPROVE_TOOLS, current + "," + toolName);
                     }
                 } catch (Exception ignored) {}
+
+                // CRITICAL: resolve EVERY other still-pending request for the
+                // SAME tool. When the model fires parallel tool calls (e.g.
+                // two Bash commands), the CLI sends a control_request for each.
+                // Answering only the one the user clicked leaves the others
+                // blocked in the CLI forever (tool box stuck "Running"). The
+                // auto-approve preference only helps FUTURE requests, not the
+                // ones already in flight — so we approve them explicitly here.
+                final String approvedTool = toolName;
+                int resolved = 0;
+                for (java.util.Map.Entry<String, PendingPerm> e :
+                        new java.util.ArrayList<>(pendingPerms.entrySet())) {
+                    PendingPerm p = e.getValue();
+                    if (p != null && approvedTool.equalsIgnoreCase(p.toolName)) {
+                        sendPermissionResponse(p.requestId, p.toolUseId, true, p.toolInput);
+                        pendingPerms.remove(e.getKey());
+                        if (p.requestId != null) pendingToolInputs.remove(p.requestId);
+                        if (p.toolUseId != null) pendingToolInputs.remove(p.toolUseId);
+                        // Tell the webview to dismiss that request's banner.
+                        bridge.sendToWebview("permission_resolved",
+                            "{\"requestId\":" + JsonBuilder.jsonString(p.requestId)
+                            + ",\"toolUseId\":" + JsonBuilder.jsonString(p.toolUseId) + "}");
+                        resolved++;
+                    }
+                }
+                if (resolved > 0) {
+                    Activator.logInfo("[Webview] Always-Allow " + approvedTool
+                        + " also auto-resolved " + resolved + " other pending request(s)");
+                }
             }
         } catch (Exception e) {
             Activator.logError("[Webview] permission response failed: " + e.getMessage(), e);
@@ -3594,6 +3650,11 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
         if (key != null && toolInput != null) {
             pendingToolInputs.put(key, toolInput);
         }
+        // Track the full request so a later "Always Allow <tool>" can resolve
+        // EVERY still-pending request for that tool (parallel tool calls).
+        if (key != null) {
+            pendingPerms.put(key, new PendingPerm(requestId, toolUseId, toolName, toolInput));
+        }
 
         // Auto-approve via preference: if the tool is in the AUTO_APPROVE_TOOLS
         // list, respond immediately and skip showing the banner. Mirrors V1.
@@ -3604,7 +3665,7 @@ public class ClaudeConversationViewV2 extends ViewPart implements IConversationL
                 for (String tool : autoApprove.split(",")) {
                     if (tool.trim().equalsIgnoreCase(toolName)) {
                         sendPermissionResponse(requestId, toolUseId, true, toolInput);
-                        if (key != null) pendingToolInputs.remove(key);
+                        if (key != null) { pendingToolInputs.remove(key); pendingPerms.remove(key); }
                         return;
                     }
                 }
