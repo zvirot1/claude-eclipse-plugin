@@ -628,6 +628,12 @@ public class ClaudeCliManager {
         if (config.getResumeSessionId() != null && !config.getResumeSessionId().isEmpty()) {
             command.add("--resume");
             command.add(config.getResumeSessionId());
+            // --fork-session: resume the transcript but write to a NEW session
+            // id so the original session is left untouched. Used by
+            // fork-from-message so the branched tab has the full base context.
+            if (config.isForkSession()) {
+                command.add("--fork-session");
+            }
         }
         if (config.getAllowedTools() != null && config.getAllowedTools().length > 0) {
             command.add("--allowedTools");
